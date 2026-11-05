@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::core::{implement, Interface, Ref, Result, HRESULT};
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, S_OK};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, FILETIME, S_OK};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -16,6 +16,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::System::Variant::VT_BLOB;
 
 use crate::encode::packet;
@@ -93,6 +94,8 @@ impl Processes {
             }
             let _ = CloseHandle(snapshot);
         }
+        let started = processes.keys().filter_map(|&pid| Some((pid, started(pid)?))).collect();
+        unlink_reused(&mut processes, &started);
         Self(processes)
     }
 
@@ -117,6 +120,31 @@ impl Processes {
             self.0.iter().filter(|(pid, (parent, _))| named(pid) && !named(parent)).map(|(&pid, _)| pid).collect();
         roots.sort_unstable();
         roots
+    }
+}
+
+/// Cuts every link to a parent that started after its child: the real parent exited and windows
+/// gave its id to a later, unrelated process. Processes whose start time can't be read keep their link.
+fn unlink_reused(processes: &mut HashMap<u32, (u32, String)>, started: &HashMap<u32, u64>) {
+    for (pid, (parent, _)) in processes.iter_mut() {
+        if let (Some(child), Some(adult)) = (started.get(pid), started.get(parent)) {
+            if adult > child {
+                *parent = 0;
+            }
+        }
+    }
+}
+
+/// When `pid` started, in 100 ns ticks. Limited query access is all this asks for, the same
+/// a task manager uses, so it never reads another process's memory.
+fn started(pid: u32) -> Option<u64> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+        let read = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        let _ = CloseHandle(process);
+        read.ok()?;
+        Some((created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64)
     }
 }
 
@@ -795,6 +823,22 @@ mod tests {
         let trees = assign(&sources, &running, &[11, 21, 31, 41, 40, 10, 50, 99], 50);
         // steam is the game's parent, so neither its own lane nor the rest may take its tree
         assert_eq!(trees, vec![vec![20], vec![11, 40], vec![30], vec![], vec![MIC]]);
+    }
+
+    #[test]
+    fn a_reused_parent_id_stops_pulling_its_new_owner_into_the_game_tree() {
+        // the game's launcher (20) exited and chrome now has its id, younger than the game it "parents"
+        let mut running = processes(&[(1, 0, "explorer.exe"), (20, 1, "chrome.exe"), (21, 20, "game.exe")]).0;
+        unlink_reused(&mut running, &HashMap::from([(1, 5), (20, 300), (21, 200)]));
+        let trees = assign(&[Source::Process(21), Source::Rest], &Processes(running), &[20, 21], 7);
+        assert_eq!(trees, vec![vec![21], vec![20]]);
+    }
+
+    #[test]
+    fn a_parent_older_than_its_child_keeps_the_link() {
+        let mut running = processes(&[(1, 0, "explorer.exe"), (20, 1, "steam.exe"), (21, 20, "game.exe")]).0;
+        unlink_reused(&mut running, &HashMap::from([(1, 5), (20, 100), (21, 200)]));
+        assert_eq!(running[&21].0, 20);
     }
 
     #[test]
