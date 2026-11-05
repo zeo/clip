@@ -3,9 +3,18 @@
 version = 4
 
 [[package]]
+name = "hdrkit"
+version = "0.1.0"
+source = "git+https://github.com/zeo/hdrkit?rev=9bbd4515d361803a6aaff68460d7dc4c973d9b1a#9bbd4515d361803a6aaff68460d7dc4c973d9b1a"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "memory"
 version = "0.1.0"
 dependencies = [
+ "hdrkit",
  "windows",
  "windows-core",
 ]

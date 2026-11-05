@@ -1,7 +1,7 @@
 mod audio;
 mod capture;
 mod encode;
-mod hdr;
+use hdrkit as hdr;
 mod ring;
 mod save;
 mod sync;
