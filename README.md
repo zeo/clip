@@ -32,7 +32,9 @@ Each source gets its own AAC track (192 kbps) on the video's clock:
 - one track per `--app EXE`
 - `mic`, with `--mic`
 
-A process tree belongs to one track only, so nothing is heard twice.
+A process belongs to one track only, so nothing is heard twice. With no `voice` or `--app` track, `others` is a single capture of everything outside the game, so it also records Windows system sounds and the launcher that started the game.
+
+Windows only gives a per-app capture the app's own sound and that of its direct children. memory opens a capture on every process that holds an audio session and isn't already a direct child of one it captures. That is how a game four processes below its launcher, like Fortnite under the Epic Games Launcher, still reaches a track.
 
 ## tests
 
@@ -44,8 +46,9 @@ A process tree belongs to one track only, so nothing is heard twice.
 
 - AMD (AMF) and Intel (QSV) encoders are untested. The only GPU here is NVIDIA, so the software encoder and WARP stand in for them.
 - An app muted or turned down in the Windows volume mixer is muted in its track as well, because process loopback taps the stream after per-app volume.
-- Windows system sounds belong to no app process, so no track records them.
-- A launcher that started the game, Steam for example, is left out of `others`, since recording its process tree would record the game a second time.
+- With a `voice` or `--app` track running, Windows system sounds are left out: their audio session reports no process, so there is nothing to open a per-app capture on.
+- In that case a launcher that is the game's direct parent, Steam for example, is also left out of `others`, since capturing it would record the game a second time. So is the process that started memory.
+- Per-app capture reaching only direct children was measured on Windows build 26340. Microsoft's documentation says "child processes" without saying how deep. On a build that captured whole trees, a process with sound two levels below another one would be heard twice.
 - Sync is measured to one display refresh, 8 ms at 120 Hz, since a flash only reaches the clip on the frame it was shown.
 - The test click peaks at -72 dBFS. With headphones and the volume near maximum it may still be faintly audible.
 - Mastering values in HDR10 files are whatever the display driver reports.

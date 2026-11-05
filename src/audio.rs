@@ -46,6 +46,8 @@ pub enum Source {
     Named(Vec<String>),
     /// every app playing sound that no other lane claims, mixed into one track
     Rest,
+    /// everything outside one process tree as a single feed, system sounds and the game's launcher included
+    Except(u32),
     Microphone,
 }
 
@@ -61,9 +63,13 @@ pub fn lanes(game: Option<u32>, apps: &[String], mic: bool) -> Vec<Lane> {
     if let Some(pid) = game {
         lanes.push(Lane { name: "game".into(), source: Source::Process(pid) });
     }
-    lanes.push(Lane { name: if game.is_some() { "others" } else { "desktop" }.into(), source: Source::Rest });
     let discord: Vec<String> = DISCORD.map(String::from).into();
-    if !Processes::snapshot().roots(&discord).is_empty() {
+    let voice = !Processes::snapshot().roots(&discord).is_empty();
+    // exclude mode carves out only one tree, so it can stand in for the rest only when no other lane claims one
+    let rest =
+        if voice || !apps.is_empty() { Source::Rest } else { Source::Except(game.unwrap_or_else(std::process::id)) };
+    lanes.push(Lane { name: if game.is_some() { "others" } else { "desktop" }.into(), source: rest });
+    if voice {
         lanes.push(Lane { name: "voice".into(), source: Source::Named(discord) });
     }
     for app in apps {
@@ -104,15 +110,6 @@ impl Processes {
         std::iter::successors(self.0.get(&pid).map(|p| p.0), |p| self.0.get(p).map(|p| p.0)).take(64)
     }
 
-    fn within(&self, pid: u32, trees: &[u32]) -> bool {
-        trees.contains(&pid) || self.ancestors(pid).any(|a| trees.contains(&a))
-    }
-
-    /// Whether recording `pid`'s tree would also pick up one of `trees`, or the other way round.
-    fn overlaps(&self, pid: u32, trees: &[u32]) -> bool {
-        self.within(pid, trees) || trees.iter().any(|&t| self.ancestors(t).any(|a| a == pid))
-    }
-
     /// The topmost process of every tree of `names`, so a multi-process app is recorded once.
     fn roots(&self, names: &[String]) -> Vec<u32> {
         let named = |pid: &u32| self.0.get(pid).is_some_and(|(_, name)| names.contains(name));
@@ -148,41 +145,62 @@ fn started(pid: u32) -> Option<u64> {
     }
 }
 
-/// The process trees each lane records. A tree goes to the first lane that wants it, and the rest
-/// lane takes every app holding an audio session whose tree touches no other lane; include-tree
-/// capture can't carve a claimed child out, so such a parent is left out rather than leak the game.
+/// The processes each lane opens a feed on. Include capture takes a process and its direct children
+/// only (on build 26340 a grandchild's sound never reaches it), so a lane gets a feed on its roots and
+/// on every process of its own holding an audio session, unless the parent is already a feed of that
+/// lane. Each process belongs to the first lane with a root among it and its ancestors, and the rest
+/// lane gets the others. A feed whose direct child belongs elsewhere is skipped rather than leak it.
 fn assign(sources: &[Source], processes: &Processes, sessions: &[u32], own: u32) -> Vec<Vec<u32>> {
-    let mut claimed = vec![own];
-    let mut trees: Vec<Vec<u32>> = Vec::new();
-    for source in sources {
-        let mut tree = match source {
+    let roots: Vec<Vec<u32>> = sources
+        .iter()
+        .map(|source| match source {
             Source::Process(pid) if processes.0.contains_key(pid) => vec![*pid],
             Source::Named(names) => processes.roots(names),
-            Source::Microphone => vec![MIC],
             _ => Vec::new(),
-        };
-        if !matches!(source, Source::Microphone) {
-            // only a lane asked for by pid may take this process, as the sync test does
-            let taken = if matches!(source, Source::Process(_)) { &claimed[1..] } else { &claimed[..] };
-            tree.retain(|&pid| !processes.overlaps(pid, taken));
-            claimed.extend(&tree);
-        }
-        trees.push(tree);
-    }
-    let mut rest: Vec<u32> = sessions
-        .iter()
-        .copied()
-        .filter(|&pid| pid != MIC && processes.0.contains_key(&pid) && !processes.overlaps(pid, &claimed))
+        })
         .collect();
-    rest.sort_unstable();
-    rest.dedup();
-    let topmost: Vec<u32> =
-        rest.iter().copied().filter(|&pid| !processes.ancestors(pid).any(|a| rest.contains(&a))).collect();
-    for (tree, source) in trees.iter_mut().zip(sources) {
-        if matches!(source, Source::Rest) {
-            tree.clone_from(&topmost);
+    let rest = sources.iter().position(|source| matches!(source, Source::Rest));
+    let owner: HashMap<u32, Option<usize>> = processes
+        .0
+        .keys()
+        .map(|&pid| {
+            let line: Vec<u32> = std::iter::once(pid).chain(processes.ancestors(pid)).collect();
+            // memory's own sound stays out of every lane but one asked for by its pid, as the sync test does
+            let mine = line.contains(&own);
+            let lane = (0..sources.len()).find(|&i| {
+                (!mine || matches!(sources[i], Source::Process(_))) && roots[i].iter().any(|r| line.contains(r))
+            });
+            (pid, lane.or(rest.filter(|_| !mine)))
+        })
+        .collect();
+    let mut wanted: Vec<u32> = roots.concat();
+    wanted.extend(sessions.iter().filter(|pid| owner.contains_key(pid)));
+    wanted.sort_unstable();
+    wanted.dedup();
+    wanted.sort_by_key(|&pid| processes.ancestors(pid).count());
+    let mut trees: Vec<Vec<u32>> = sources
+        .iter()
+        .map(|source| match source {
+            Source::Microphone => vec![MIC],
+            Source::Except(pid) => vec![*pid],
+            _ => Vec::new(),
+        })
+        .collect();
+    // an exclude feed carves out its target's direct children and no deeper, so the lane rooted there keeps
+    // to its root and leaves grandchildren to the exclude feed rather than record them twice
+    let excepted = sources.iter().find_map(|source| if let Source::Except(pid) = source { Some(*pid) } else { None });
+    for pid in wanted {
+        let Some(lane) = owner[&pid] else { continue };
+        if excepted.is_some_and(|x| roots[lane].contains(&x) && !roots[lane].contains(&pid)) {
+            continue;
+        }
+        let covered = trees[lane].contains(&processes.0[&pid].0);
+        let leaks = processes.0.iter().any(|(child, (parent, _))| *parent == pid && owner[child] != Some(lane));
+        if !covered && !leaks {
+            trees[lane].push(pid);
         }
     }
+    trees.iter_mut().for_each(|tree| tree.sort_unstable());
     trees
 }
 
@@ -345,7 +363,8 @@ impl Input {
                     let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
                     (devices.GetDefaultAudioEndpoint(eCapture, eConsole)?.Activate(CLSCTX_ALL, None)?, false)
                 }
-                _ => (process(pid)?, true),
+                Source::Except(_) => (process(pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE)?, true),
+                _ => (process(pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE)?, true),
             };
             // the engine converts to our format, so every lane feeds the encoder as is
             let flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
@@ -470,15 +489,15 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
 
 impl IAgileObject_Impl for Activated_Impl {}
 
-/// An audio client on one process tree's output (Windows build 20348 and later).
-unsafe fn process(pid: u32) -> Result<IAudioClient> {
+/// An audio client on one process tree's output, or on everything but it (Windows build 20348 and later).
+unsafe fn process(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Result<IAudioClient> {
     unsafe {
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
                 ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                     TargetProcessId: pid,
-                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                    ProcessLoopbackMode: mode,
                 },
             },
         };
@@ -821,8 +840,44 @@ mod tests {
             Source::Microphone,
         ];
         let trees = assign(&sources, &running, &[11, 21, 31, 41, 40, 10, 50, 99], 50);
-        // steam is the game's parent, so neither its own lane nor the rest may take its tree
-        assert_eq!(trees, vec![vec![20], vec![11, 40], vec![30], vec![], vec![MIC]]);
+        // steam is the game's parent, so its lane can't record steam itself, only the web helper under it
+        assert_eq!(trees, vec![vec![20], vec![40], vec![30], vec![11], vec![MIC]]);
+    }
+
+    // fortnite as it runs here: epic's launcher holds a session four levels above the game
+    fn fortnite() -> Processes {
+        processes(&[
+            (1, 0, "explorer.exe"),
+            (9, 1, "epicgameslauncher.exe"),
+            (10, 9, "fortnitebootstrapper.exe"),
+            (11, 10, "fortnitelauncher.exe"),
+            (12, 11, "fortniteclient-win64-shipping_eac_eos.exe"),
+            (13, 12, "fortniteclient-win64-shipping.exe"),
+            (14, 13, "crashreporter.exe"),
+            (15, 14, "crashreporter.exe"),
+        ])
+    }
+
+    #[test]
+    fn a_sound_two_levels_below_a_feed_gets_its_own_feed() {
+        assert_eq!(assign(&[Source::Rest], &fortnite(), &[9, 13], 7), vec![vec![9, 13]]);
+        // a direct child is already in its parent's feed
+        assert_eq!(assign(&[Source::Rest], &fortnite(), &[9, 10, 13, 14], 7), vec![vec![9, 13]]);
+    }
+
+    #[test]
+    fn a_launcher_above_the_game_s_parent_is_recorded_and_the_game_s_grandchild_stays_in_its_lane() {
+        let trees = assign(&[Source::Process(13), Source::Rest], &fortnite(), &[9, 13, 15], 7);
+        assert_eq!(trees, vec![vec![13, 15], vec![9]]);
+        // the game's direct parent can't be recorded without the game
+        assert_eq!(assign(&[Source::Process(13), Source::Rest], &fortnite(), &[12], 7), vec![vec![13], vec![]]);
+    }
+
+    #[test]
+    fn memory_s_parent_stays_out_but_its_grandparent_is_recorded() {
+        let running =
+            processes(&[(1, 0, "explorer.exe"), (2, 1, "terminal.exe"), (3, 2, "shell.exe"), (50, 3, "memory.exe")]);
+        assert_eq!(assign(&[Source::Rest], &running, &[1, 2, 3, 50], 50), vec![vec![1]]);
     }
 
     #[test]
@@ -846,6 +901,16 @@ mod tests {
         let running = processes(&[(1, 0, "explorer.exe"), (50, 1, "memory.exe")]);
         let sources = [Source::Named(vec!["memory.exe".into()]), Source::Process(50), Source::Rest];
         assert_eq!(assign(&sources, &running, &[50], 50), vec![vec![], vec![50], vec![]]);
+    }
+
+    #[test]
+    fn an_except_lane_keeps_its_one_feed_whatever_else_runs() {
+        let running = processes(&[(1, 0, "explorer.exe"), (10, 1, "steam.exe"), (20, 10, "game.exe")]);
+        let trees = assign(&[Source::Process(20), Source::Except(20)], &running, &[10, 20], 7);
+        assert_eq!(trees, vec![vec![20], vec![20]]);
+        let trees = assign(&[Source::Process(13), Source::Except(13)], &fortnite(), &[9, 13, 15], 7);
+        assert_eq!(trees, vec![vec![13], vec![13]]);
+        assert_eq!(assign(&[Source::Except(20)], &processes(&[]), &[], 7), vec![vec![20]]);
     }
 
     #[test]
