@@ -47,7 +47,7 @@ A process tree belongs to one track only, so nothing is heard twice.
 - Windows system sounds belong to no app process, so no track records them.
 - A launcher that started the game, Steam for example, is left out of `others`, since recording its process tree would record the game a second time.
 - Sync is measured to one display refresh, 8 ms at 120 Hz, since a flash only reaches the clip on the frame it was shown.
-- The -72 dBFS test click could only be heard with the volume at maximum in a silent room.
+- The test click peaks at -72 dBFS. With headphones and the volume near maximum it may still be faintly audible.
 - Mastering values in HDR10 files are whatever the display driver reports.
 - Switching HDR mid recording is covered by the self-test, which swaps the display state on synthetic frames. It hasn't been tested by toggling a real display.
 
