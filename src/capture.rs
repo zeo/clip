@@ -20,7 +20,7 @@ use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDe
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
 use crate::encode::{Codec, Encoder, Format};
-use crate::hdr::{Display, Pq, Tonemap};
+use crate::hdr::{Display, Filter, Pq, Scaler, Tonemap};
 use crate::ring::{Clock, Ring, SECOND};
 
 #[derive(Clone)]
@@ -256,22 +256,28 @@ impl Converter {
     }
 }
 
-/// Everything between a captured frame and the encoder. On an HDR display FP16 frames are
-/// tonemapped for h.264 or written straight to P010 for hdr10; otherwise the video processor
-/// turns BGRA into NV12.
+/// Everything between a captured frame and the encoder: our own resampling to the encode size, then
+/// on an HDR display FP16 frames are tonemapped for h.264 or written straight to P010 for hdr10, and
+/// otherwise the video processor turns BGRA into NV12 one to one.
 pub enum Pipeline {
-    Sdr(Option<Tonemap>, Converter),
-    Hdr10(Pq, (u32, u32)),
+    Sdr(Option<Tonemap>, Scaler, Converter, (u32, u32)),
+    Hdr10(Scaler, Pq, (u32, u32)),
 }
 
 impl Pipeline {
-    pub fn new(gpu: &Gpu, display: Display, input: (u32, u32), format: Format) -> Result<Self> {
+    pub fn new(gpu: &Gpu, display: Display, format: Format, filter: Filter) -> Result<Self> {
         let output = (format.width, format.height);
         Ok(match format.codec {
-            Codec::Hdr10 => Pipeline::Hdr10(Pq::new(&gpu.device, output, IN_FLIGHT)?, output),
+            Codec::Hdr10 => Pipeline::Hdr10(
+                Scaler::new(&gpu.device, filter, output, DXGI_FORMAT_R16G16B16A16_FLOAT)?,
+                Pq::new(&gpu.device, output, IN_FLIGHT)?,
+                output,
+            ),
             Codec::H264 => Pipeline::Sdr(
                 display.hdr.then(|| Tonemap::new(&gpu.device, display)).transpose()?,
-                Converter::new(gpu, input, output, format.fps)?,
+                Scaler::new(&gpu.device, filter, output, DXGI_FORMAT_B8G8R8A8_UNORM)?,
+                Converter::new(gpu, output, output, format.fps)?,
+                output,
             ),
         })
     }
@@ -279,9 +285,17 @@ impl Pipeline {
     /// Letterboxes the `content` region of `frame` into the next encoder surface and returns it.
     pub fn convert(&mut self, frame: &ID3D11Texture2D, content: (u32, u32), fps: u32) -> Result<ID3D11Texture2D> {
         match self {
-            Pipeline::Hdr10(pq, output) => pq.convert(frame, content, letterbox(content, *output)),
-            Pipeline::Sdr(Some(tonemap), converter) => converter.convert(&tonemap.apply(frame)?, content, fps),
-            Pipeline::Sdr(None, converter) => converter.convert(frame, content, fps),
+            Pipeline::Hdr10(scaler, pq, output) => {
+                let scaled = scaler.apply(frame, content, letterbox(content, *output))?;
+                pq.convert(&scaled, *output, RECT { left: 0, top: 0, right: output.0 as i32, bottom: output.1 as i32 })
+            }
+            Pipeline::Sdr(tonemap, scaler, converter, output) => {
+                let frame = match tonemap {
+                    Some(tonemap) => tonemap.apply(frame)?,
+                    None => frame.clone(),
+                };
+                converter.convert(&scaler.apply(&frame, content, letterbox(content, *output))?, *output, fps)
+            }
         }
     }
 }

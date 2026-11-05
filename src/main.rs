@@ -29,7 +29,7 @@ use ring::{Clock, Ring, SECOND};
 
 const USAGE: &str = "\
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
-               [--fps N] [--mbps N] [--height N] [--software] [--hdr10] [--mic] [--app EXE]... [--out FILE]
+               [--fps N] [--mbps N] [--height N] [--scale FILTER] [--software] [--hdr10] [--mic] [--app EXE]... [--out FILE]
 memory sync
 memory encoders
 memory self-test [--live]";
@@ -108,6 +108,12 @@ fn record_clip<T: Send + 'static>(
     let fps = number(args, "--fps", 60)?.clamp(10, 240);
     let mbps = number(args, "--mbps", 20)?.clamp(1, 200);
     let max_height = number(args, "--height", 1080)?;
+    let filter = match flag(args, "--scale") {
+        Some(name) => {
+            hdr::Filter::named(name).ok_or(format!("--scale takes bilinear, area, bicubic or lanczos, got {name}"))?
+        }
+        None => hdr::Filter::Area,
+    };
     let gpu = capture::gpu().map_err(|e| format!("no usable gpu: {e}"))?;
     let software = args.iter().any(|a| a == "--software");
     let display = hdr::display(target.monitor()).map_err(|e| format!("can't read the display: {e}"))?;
@@ -125,11 +131,11 @@ fn record_clip<T: Send + 'static>(
     let (width, height) = capture::output_size(size, max_height);
     let format = Format { width, height, fps, bitrate: mbps * 1_000_000, codec };
     println!("{}, {}", describe(size), describe_display(display, codec));
-    println!("-> {width}x{height} at {fps} fps, {mbps} Mbps, {}", choice.name);
+    println!("-> {width}x{height} at {fps} fps, {mbps} Mbps, {filter:?} scaling, {}", choice.name);
     println!("audio: {}", lanes.iter().map(|lane| lane.name.as_str()).collect::<Vec<_>>().join(", "));
 
     let pipeline =
-        capture::Pipeline::new(&gpu, display, size, format).map_err(|e| format!("can't convert frames: {e}"))?;
+        capture::Pipeline::new(&gpu, display, format, filter).map_err(|e| format!("can't convert frames: {e}"))?;
     let encoder =
         encode::Encoder::open(&choice, &gpu.device, format).map_err(|e| format!("can't open the encoder: {e}"))?;
     let span = buffer as i64 * SECOND;
@@ -245,6 +251,13 @@ fn self_test() -> Result<()> {
             println!("FAIL transfer: {}", e.message())
         }
     }
+    match check_scale(&gpu) {
+        Ok(report) => println!("ok   scale: {report}"),
+        Err(e) => {
+            failures += 1;
+            println!("FAIL scale: {}", e.message())
+        }
+    }
     let lanes = [tone(440.0).map_err(at("audio lane"))?, tone(660.0).map_err(at("audio lane"))?];
     for (case, codec, hdr) in
         [("sdr", Codec::H264, false), ("tonemap", Codec::H264, true), ("hdr10", Codec::Hdr10, true)]
@@ -260,7 +273,8 @@ fn self_test() -> Result<()> {
             let path = dir.join(format!("{case}-{kind}.mp4"));
             let outcome = (|| -> Result<(Streams, Option<i64>)> {
                 let display = if hdr { TEST_DISPLAY } else { SDR_DISPLAY };
-                let mut pipeline = capture::Pipeline::new(&gpu, display, (800, 600), format).map_err(at("pipeline"))?;
+                let mut pipeline =
+                    capture::Pipeline::new(&gpu, display, format, hdr::Filter::Area).map_err(at("pipeline"))?;
                 let mut encoder = encode::Encoder::open(&choice, &gpu.device, format).map_err(at("open"))?;
                 let mut ring = Ring::new(10 * SECOND);
                 for i in 0..frames {
@@ -330,6 +344,38 @@ fn composed(srgb: u8, display: Display) -> f32 {
     let v = srgb as f32 / 255.0;
     let linear = if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
     linear * display.sdr_white / hdr::SCRGB_WHITE
+}
+
+/// Every filter must hand a frame back unchanged at 1:1, and area must average a 4:1 downscale of
+/// one white column in four to a flat quarter grey with no aliasing.
+fn check_scale(gpu: &capture::Gpu) -> Result<String> {
+    let source = pattern(&gpu.device, 64, 64, 0, false)?;
+    let (original, _) = read_texture(gpu, &source)?;
+    let full = RECT { left: 0, top: 0, right: 64, bottom: 64 };
+    let mut report = Vec::new();
+    let mut good = true;
+    for filter in [hdr::Filter::Bilinear, hdr::Filter::Area, hdr::Filter::Bicubic, hdr::Filter::Lanczos] {
+        let mut scaler = hdr::Scaler::new(&gpu.device, filter, (64, 64), DXGI_FORMAT_B8G8R8A8_UNORM)?;
+        let (copy, _) = read_texture(gpu, &scaler.apply(&source, (64, 64), full)?)?;
+        let off = original.iter().zip(&copy).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        good &= off <= 1;
+        report.push(format!("{filter:?} 1:1 off by {off}"));
+    }
+    let stripes: Vec<u8> = (0..64 * 256).flat_map(|i| if i % 4 == 0 { [255; 4] } else { [0, 0, 0, 255] }).collect();
+    let stripes = upload(&gpu.device, 256, 64, DXGI_FORMAT_B8G8R8A8_UNORM, &stripes)?;
+    let mut scaler = hdr::Scaler::new(&gpu.device, hdr::Filter::Area, (64, 16), DXGI_FORMAT_B8G8R8A8_UNORM)?;
+    let quarter = RECT { left: 0, top: 0, right: 64, bottom: 16 };
+    let (bytes, pitch) = read_texture(gpu, &scaler.apply(&stripes, (256, 64), quarter)?)?;
+    let blue: Vec<u8> = (0..16).flat_map(|y| (0..64).map(move |x| y * pitch + x * 4)).map(|i| bytes[i]).collect();
+    let (low, high) = (blue.iter().min().copied().unwrap_or(0), blue.iter().max().copied().unwrap_or(255));
+    good &= low >= 63 && high <= 65;
+    report.push(format!("area 4:1 stripes -> {low}..{high} (want 64)"));
+    let report = report.join(", ");
+    if good {
+        Ok(report)
+    } else {
+        Err(windows::core::Error::new(E_SELF_TEST, report))
+    }
 }
 
 /// Runs the hdr pattern through the tonemap and the PQ pass and reads back the values that matter:
@@ -425,6 +471,16 @@ fn pattern(device: &ID3D11Device, width: u32, height: u32, frame: u32, hdr: bool
         });
         (DXGI_FORMAT_B8G8R8A8_UNORM, pixels.collect())
     };
+    upload(device, width, height, format, &bytes)
+}
+
+fn upload(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    bytes: &[u8],
+) -> Result<ID3D11Texture2D> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,

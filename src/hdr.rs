@@ -172,6 +172,135 @@ float2 chroma(float4 position : SV_Position, float2 uv : TEXCOORD) : SV_Target {
 }
 "#;
 
+const RESAMPLE: &str = r#"
+Texture2D<float4> frame : register(t0);
+cbuffer Resample : register(b0) {
+    // render target position of the output's top left corner
+    float2 offset;
+    // source texels per output pixel on each axis
+    float2 scale;
+    // the axis this pass filters, the other passes straight through
+    float2 axis;
+    // source texels that hold content on each axis
+    float2 limit;
+};
+
+static const float PI = 3.14159265;
+
+// window half width in source texels when each output pixel covers k of them
+float radius(float k) {
+    if (FILTER == 0) return 1;
+    if (FILTER == 1) return k / 2 + 0.5;
+    if (FILTER == 2) return 2 * k;
+    return 3 * k;
+}
+
+// weight of the texel whose center sits d source texels from the sample point
+float weight(float d, float k) {
+    if (FILTER == 0) return max(0, 1 - abs(d));
+    // how much of the texel falls inside the output pixel's footprint
+    if (FILTER == 1) return max(0, min(d + 0.5, k / 2) - max(d - 0.5, -k / 2));
+    float x = abs(d) / k;
+    // catmull-rom
+    if (FILTER == 2) return x < 1 ? (1.5 * x - 2.5) * x * x + 1 : x < 2 ? ((-0.5 * x + 2.5) * x - 4) * x + 2 : 0;
+    if (x < 1e-4) return 1;
+    return x < 3 ? 3 * sin(PI * x) * sin(PI * x / 3) / (PI * PI * x * x) : 0;
+}
+
+float4 resample(float4 position : SV_Position) : SV_Target {
+    float2 s = (position.xy - offset) * scale;
+    float c = dot(s, axis);
+    // a kernel never gets narrower than a source texel, so upscaling stays smooth
+    float k = max(dot(scale, axis), 1);
+    float r = radius(k);
+    int2 across = int2(floor(s * (1 - axis)));
+    int last = int(dot(limit, axis)) - 1;
+    float4 sum = 0;
+    float total = 0;
+    [loop] for (int i = int(floor(c - r)); i <= int(ceil(c + r)); i++) {
+        float w = weight(i + 0.5 - c, k);
+        sum += w * frame.Load(int3(across + int2(axis) * clamp(i, 0, last), 0));
+        total += w;
+    }
+    return sum / total;
+}
+"#;
+
+/// How frames are resampled to the encode size. Every kernel but bilinear widens with the
+/// downscale ratio, so detail averages out instead of aliasing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    Bilinear,
+    Area,
+    Bicubic,
+    Lanczos,
+}
+
+impl Filter {
+    pub fn named(name: &str) -> Option<Self> {
+        [Filter::Bilinear, Filter::Area, Filter::Bicubic, Filter::Lanczos]
+            .into_iter()
+            .find(|f| format!("{f:?}").eq_ignore_ascii_case(name))
+    }
+}
+
+/// Resamples the content of a frame into a rect of a fixed size target, black around it, in two
+/// separable passes through a half way texture.
+pub struct Scaler {
+    program: Program,
+    pass: ID3D11Buffer,
+    output: (ID3D11Texture2D, ID3D11RenderTargetView),
+    middle: Option<(ID3D11Texture2D, ID3D11RenderTargetView, (u32, u32))>,
+}
+
+impl Scaler {
+    pub fn new(device: &ID3D11Device, filter: Filter, size: (u32, u32), format: DXGI_FORMAT) -> Result<Self> {
+        let program = Program::new(device, RESAMPLE, &[s!("resample")], &[(s!("FILTER"), filter as u8 as f32)])?;
+        let texture = texture(device, size, format)?;
+        let view = view(device, &texture, format)?;
+        let mut pass = None;
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: 32,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            ..Default::default()
+        };
+        unsafe { device.CreateBuffer(&desc, None, Some(&mut pass))? };
+        Ok(Self { program, pass: pass.ok_or(Error::from(E_FAIL))?, output: (texture, view), middle: None })
+    }
+
+    /// Scales the `content` region of `source` into `dest` of the output and returns the output.
+    pub fn apply(&mut self, source: &ID3D11Texture2D, content: (u32, u32), dest: RECT) -> Result<ID3D11Texture2D> {
+        let size = size(source);
+        let content = (content.0.clamp(1, size.0), content.1.clamp(1, size.1));
+        let extent = ((dest.right - dest.left).max(1) as u32, (dest.bottom - dest.top).max(1) as u32);
+        let between = (extent.0, content.1);
+        if self.middle.as_ref().is_none_or(|m| m.2 != between) {
+            let texture = texture(&self.program.device, between, DXGI_FORMAT_R16G16B16A16_FLOAT)?;
+            let view = view(&self.program.device, &texture, DXGI_FORMAT_R16G16B16A16_FLOAT)?;
+            self.middle = Some((texture, view, between));
+        }
+        let (middle, middle_view, _) = self.middle.as_ref().expect("created");
+        let limit = [content.0 as f32, content.1 as f32];
+        let across = [content.0 as f32 / extent.0 as f32, 1.0, 1.0, 0.0];
+        let down = [1.0, content.1 as f32 / extent.1 as f32, 0.0, 1.0];
+        let bind = |c: &ID3D11DeviceContext, offset: [f32; 2], scale_axis: [f32; 4]| unsafe {
+            let constants =
+                [offset[0], offset[1], scale_axis[0], scale_axis[1], scale_axis[2], scale_axis[3], limit[0], limit[1]];
+            c.UpdateSubresource(&self.pass, 0, None, constants.as_ptr() as _, 0, 0);
+            c.PSSetConstantBuffers(0, Some(&[Some(self.pass.clone())]));
+        };
+        self.program.draw(source, |c| bind(c, [0.0, 0.0], across), &[(0, middle_view, viewport(0, 0, between))])?;
+        let (output, view) = &self.output;
+        let clear = |c: &ID3D11DeviceContext| unsafe {
+            c.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0]);
+            bind(c, [dest.left as f32, dest.top as f32], down);
+        };
+        self.program.draw(middle, clear, &[(0, view, viewport(dest.left, dest.top, extent))])?;
+        Ok(output.clone())
+    }
+}
+
 /// Full viewport pixel shader passes from one texture, compiled at startup with the
 /// d3dcompiler that ships with windows.
 struct Program {
