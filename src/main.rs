@@ -4,6 +4,7 @@ mod encode;
 mod hdr;
 mod ring;
 mod save;
+mod sync;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -29,8 +30,9 @@ use ring::{Clock, Ring, SECOND};
 const USAGE: &str = "\
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
                [--fps N] [--mbps N] [--height N] [--software] [--hdr10] [--mic] [--app EXE]... [--out FILE]
+memory sync
 memory encoders
-memory self-test";
+memory self-test [--live]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,8 +41,12 @@ fn main() {
         .map_err(|e| e.to_string())
         .and_then(|()| match args.first().map(String::as_str) {
             Some("capture") => capture_command(&args[1..]),
+            Some("sync") => sync::run(&args[1..]),
             Some("encoders") => list_encoders().map_err(|e| e.to_string()),
-            Some("self-test") => self_test().map_err(|e| e.to_string()),
+            Some("self-test") => self_test().map_err(|e| e.to_string()).and_then(|()| match args.get(1) {
+                Some(live) if live == "--live" => sync::run(&args[2..]),
+                _ => Ok(()),
+            }),
             _ => Err(USAGE.into()),
         });
     if let Err(message) = result {
@@ -58,12 +64,7 @@ fn number(args: &[String], name: &str, default: u32) -> std::result::Result<u32,
 }
 
 fn capture_command(args: &[String]) -> std::result::Result<(), String> {
-    let buffer = number(args, "--buffer", 30)?;
     let duration = number(args, "--for", 10)?;
-    let fps = number(args, "--fps", 60)?.clamp(10, 240);
-    let mbps = number(args, "--mbps", 20)?.clamp(1, 200);
-    let max_height = number(args, "--height", 1080)?;
-    let out = PathBuf::from(flag(args, "--out").unwrap_or("clip.mp4"));
     let target = match (flag(args, "--window"), flag(args, "--monitor")) {
         (Some(text), _) => {
             Target::Window(find_window(text).ok_or(format!("no visible window titled like \"{text}\""))?)
@@ -73,9 +74,40 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
             let monitors = monitors();
             Target::Monitor(*monitors.get(n).ok_or(format!("monitor {n} not found, {} connected", monitors.len()))?)
         }
-        (None, None) => Target::Monitor(unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) }),
+        (None, None) => primary(),
     };
+    let game = match target {
+        Target::Window(window) => {
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+            Some(pid).filter(|&pid| pid != 0)
+        }
+        Target::Monitor(_) => None,
+    };
+    let apps: Vec<String> = args.windows(2).filter(|pair| pair[0] == "--app").map(|pair| pair[1].clone()).collect();
+    let lanes = audio::lanes(game, &apps, args.iter().any(|a| a == "--mic"));
+    let out = PathBuf::from(flag(args, "--out").unwrap_or("clip.mp4"));
+    record_clip(args, target, &lanes, &out, move |_| std::thread::sleep(Duration::from_secs(duration as u64)))?;
+    Ok(())
+}
 
+fn primary() -> Target {
+    Target::Monitor(unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) })
+}
+
+/// Records `target` and `lanes` while `work` runs, saves the clip to `out`, and returns what `work`
+/// returned with the clock time the clip starts at.
+fn record_clip<T: Send + 'static>(
+    args: &[String],
+    target: Target,
+    lanes: &[audio::Lane],
+    out: &std::path::Path,
+    work: impl FnOnce(Clock) -> T + Send + 'static,
+) -> std::result::Result<(T, i64), String> {
+    let buffer = number(args, "--buffer", 30)?;
+    let fps = number(args, "--fps", 60)?.clamp(10, 240);
+    let mbps = number(args, "--mbps", 20)?.clamp(1, 200);
+    let max_height = number(args, "--height", 1080)?;
     let gpu = capture::gpu().map_err(|e| format!("no usable gpu: {e}"))?;
     let software = args.iter().any(|a| a == "--software");
     let display = hdr::display(target.monitor()).map_err(|e| format!("can't read the display: {e}"))?;
@@ -94,38 +126,28 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
     let format = Format { width, height, fps, bitrate: mbps * 1_000_000, codec };
     println!("{}, {}", describe(size), describe_display(display, codec));
     println!("-> {width}x{height} at {fps} fps, {mbps} Mbps, {}", choice.name);
+    println!("audio: {}", lanes.iter().map(|lane| lane.name.as_str()).collect::<Vec<_>>().join(", "));
 
     let pipeline =
         capture::Pipeline::new(&gpu, display, size, format).map_err(|e| format!("can't convert frames: {e}"))?;
     let encoder =
         encode::Encoder::open(&choice, &gpu.device, format).map_err(|e| format!("can't open the encoder: {e}"))?;
-    let game = match target {
-        Target::Window(window) => {
-            let mut pid = 0;
-            unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
-            Some(pid).filter(|&pid| pid != 0)
-        }
-        Target::Monitor(_) => None,
-    };
-    let apps: Vec<String> = args.windows(2).filter(|pair| pair[0] == "--app").map(|pair| pair[1].clone()).collect();
-    let lanes = audio::lanes(game, &apps, args.iter().any(|a| a == "--mic"));
-    println!("audio: {}", lanes.iter().map(|lane| lane.name.as_str()).collect::<Vec<_>>().join(", "));
-
     let span = buffer as i64 * SECOND;
     let ring = Arc::new(Mutex::new(Ring::new(span)));
     let stop = Arc::new(AtomicBool::new(false));
     let clock = Clock::start();
-    let sound = audio::Recording::start(&lanes, span, clock, stop.clone()).map_err(|e| format!("audio failed: {e}"))?;
-    let timer = {
+    let sound = audio::Recording::start(lanes, span, clock, stop.clone()).map_err(|e| format!("audio failed: {e}"))?;
+    let worker = {
         let stop = stop.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(duration as u64));
+            let result = work(clock);
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            result
         })
     };
     let recorded = capture::record(source, pipeline, encoder, format, clock, &ring, &stop);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = timer.join();
+    let result = worker.join().map_err(|_| "the recording task panicked".to_string())?;
     let rings = sound.rings.clone();
     let heard = sound.finish();
     recorded.map_err(|e| format!("recording failed: {e}"))?;
@@ -134,15 +156,16 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
 
     let ring = ring.lock().expect("ring poisoned");
     let packets = ring.since(i64::MIN);
-    let seconds = (ring.end().unwrap_or(0) - packets.first().map_or(0, |p| p.pts)) as f64 / SECOND as f64;
-    save::write_mp4(&out, &packets, format, &audio).map_err(|e| format!("saving failed: {e}"))?;
+    let start = packets.first().map_or(0, |p| p.pts);
+    let seconds = (ring.end().unwrap_or(0) - start) as f64 / SECOND as f64;
+    save::write_mp4(out, &packets, format, &audio).map_err(|e| format!("saving failed: {e}"))?;
     println!(
         "saved {seconds:.1} s, {} frames, {:.1} MB to {}",
         packets.len(),
         ring.bytes() as f64 / 1e6,
         out.display()
     );
-    Ok(())
+    Ok((result, start))
 }
 
 fn describe(size: (u32, u32)) -> String {
@@ -235,7 +258,7 @@ fn self_test() -> Result<()> {
         for choice in choices {
             let kind = if choice.hardware { "hardware" } else { "software" };
             let path = dir.join(format!("{case}-{kind}.mp4"));
-            let outcome = (|| -> Result<Vec<(u32, bool, i64)>> {
+            let outcome = (|| -> Result<(Streams, Option<i64>)> {
                 let display = if hdr { TEST_DISPLAY } else { SDR_DISPLAY };
                 let mut pipeline = capture::Pipeline::new(&gpu, display, (800, 600), format).map_err(at("pipeline"))?;
                 let mut encoder = encode::Encoder::open(&choice, &gpu.device, format).map_err(at("open"))?;
@@ -251,25 +274,29 @@ fn self_test() -> Result<()> {
                 }
                 encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
                 save::write_mp4(&path, &ring.since(i64::MIN), format, &lanes).map_err(at("save"))?;
-                read_back(&path).map_err(at("read back"))
+                let streams = read_back(&path).map_err(at("read back"))?;
+                Ok((streams, sync::onsets(&path).map_err(at("read sound back"))?.1.first().copied()))
             })();
             let end = format.time(frames - 1);
             // a clip's audio may stop up to two aac frames short of the last video frame
             let heard = |(count, _, last): &(u32, bool, i64)| *count >= 90 && end - last <= SECOND / 20;
-            match outcome.as_deref() {
-                Ok([(count, true, last), sound @ ..])
+            // the tone starts one second in, and the clip has to play it right there
+            let on_time = |onset: Option<i64>| onset.is_some_and(|t| (t - SECOND).abs() < SECOND / 1000);
+            match outcome.as_ref().map(|(streams, onset)| (streams.as_slice(), *onset)) {
+                Ok(([(count, true, last), sound @ ..], onset))
                     if *count as i64 == frames
                         && *last == end
                         && sound.len() == lanes.len()
-                        && sound.iter().all(heard) =>
+                        && sound.iter().all(heard)
+                        && on_time(onset) =>
                 {
                     let packets: Vec<u32> = sound.iter().map(|s| s.0).collect();
                     println!("ok   {case} {kind} {}: {count} frames, aac packets {packets:?}", choice.name)
                 }
-                Ok(streams) => {
+                Ok((streams, onset)) => {
                     failures += 1;
                     println!(
-                        "FAIL {case} {kind} {}: want {frames} frames and {} audio tracks, got {streams:?}",
+                        "FAIL {case} {kind} {}: want {frames} frames, {} audio tracks and the tone at 1 s, got {streams:?}, tone at {onset:?}",
                         choice.name,
                         lanes.len()
                     )
@@ -428,10 +455,11 @@ fn half(value: f32) -> u16 {
     ((exponent.clamp(1, 30) as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
 }
 
-/// Frame count, whether the first frame is a keyframe, and the last frame's timestamp.
+type Streams = Vec<(u32, bool, i64)>;
+
 /// Every stream's sample count, whether it starts on a keyframe, and its last timestamp: the video
 /// stream first, then the audio streams in file order.
-fn read_back(path: &std::path::Path) -> Result<Vec<(u32, bool, i64)>> {
+fn read_back(path: &std::path::Path) -> Result<Streams> {
     unsafe {
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
         reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, true)?;
@@ -465,14 +493,20 @@ fn read_back(path: &std::path::Path) -> Result<Vec<(u32, bool, i64)>> {
     }
 }
 
-/// Two seconds of a sine tone through the aac encoder in 10 ms chunks, as a capture lane delivers them.
+/// A second of silence then a second of sine tone through the aac encoder in 10 ms chunks, as a capture lane delivers them.
 fn tone(hz: f32) -> Result<Vec<Arc<ring::Packet>>> {
     let mut aac = audio::Aac::new()?;
     let mut ring = Ring::new(10 * SECOND);
     let chunk = audio::RATE / 100;
     for start in (0..2 * audio::RATE).step_by(chunk as usize) {
         let pcm: Vec<u8> = (start..start + chunk)
-            .map(|n| ((n as f32 * hz * std::f32::consts::TAU / audio::RATE as f32).sin() * 8000.0) as i16)
+            .map(|n| {
+                if n < audio::RATE {
+                    0
+                } else {
+                    ((n as f32 * hz * std::f32::consts::TAU / audio::RATE as f32).sin() * 8000.0) as i16
+                }
+            })
             .flat_map(|v| [v, v])
             .flat_map(i16::to_le_bytes)
             .collect();

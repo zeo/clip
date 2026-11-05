@@ -21,7 +21,7 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 
 use crate::encode::{Codec, Encoder, Format};
 use crate::hdr::{Display, Pq, Tonemap};
-use crate::ring::{Clock, Ring};
+use crate::ring::{Clock, Ring, SECOND};
 
 #[derive(Clone)]
 pub struct Gpu {
@@ -96,7 +96,7 @@ impl Source {
             let _ = session.SetIsBorderRequired(false);
             let _ = session.SetIsCursorCaptureEnabled(true);
             // windows 11 24h2 and later stop compositing frames faster than we encode them
-            let _ = session.SetMinUpdateInterval(TimeSpan { Duration: crate::ring::SECOND / fps as i64 });
+            let _ = session.SetMinUpdateInterval(TimeSpan { Duration: SECOND / fps as i64 });
             session.StartCapture()?;
             Ok(Self { pool, session, device, size, pixels })
         }
@@ -106,15 +106,10 @@ impl Source {
         (self.size.Width as u32, self.size.Height as u32)
     }
 
-    /// The newest frame since the last call, older queued frames go straight back to the pool.
+    /// The oldest queued frame, and the pool follows the content size when it changes.
     pub fn next(&mut self) -> Option<Direct3D11CaptureFrame> {
-        let mut latest: Option<Direct3D11CaptureFrame> = None;
-        while let Ok(frame) = self.pool.TryGetNextFrame() {
-            if let Some(older) = latest.replace(frame) {
-                let _ = older.Close();
-            }
-        }
-        if let Some(content) = latest.as_ref().and_then(|f| f.ContentSize().ok()) {
+        let frame = self.pool.TryGetNextFrame().ok()?;
+        if let Ok(content) = frame.ContentSize() {
             if content != self.size
                 && content.Width > 0
                 && content.Height > 0
@@ -123,7 +118,7 @@ impl Source {
                 self.size = content;
             }
         }
-        latest
+        Some(frame)
     }
 }
 
@@ -309,7 +304,8 @@ pub fn output_size(source: (u32, u32), max_height: u32) -> (u32, u32) {
 }
 
 /// Captures `target` into `ring` at a constant frame rate until `stop` is set.
-/// When the source sends nothing new the last frame repeats, so every clip is constant frame rate.
+/// Each frame shows from the slot nearest the moment the compositor drew it, and when the source
+/// sends nothing new the last frame repeats, so every clip is constant frame rate.
 pub fn record(
     mut source: Source,
     mut pipeline: Pipeline,
@@ -321,15 +317,31 @@ pub fn record(
 ) -> Result<()> {
     let period = Duration::from_nanos(1_000_000_000 / format.fps as u64);
     let started = clock.started;
+    let slot = |frame: &Direct3D11CaptureFrame| -> Result<i64> {
+        let drawn = clock.at(frame.SystemRelativeTime()?.Duration);
+        Ok((drawn * format.fps as i64 + SECOND / 2).div_euclid(SECOND))
+    };
     // setup took a moment, so the first frame lands where the clock already is
     let mut tick = (started.elapsed().as_nanos() / period.as_nanos()) as u64;
+    let mut held = None;
     let mut last = None;
     while !stop.load(Ordering::Relaxed) {
-        let due = started + period * tick as u32;
+        // wake half a slot late so every frame drawn nearer this slot than the next has arrived
+        let due = started + period * tick as u32 + period / 2;
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
         }
-        if let Some(frame) = source.next() {
+        let mut newest = None;
+        while let Some(frame) = held.take().or_else(|| source.next()) {
+            if slot(&frame)? > tick as i64 {
+                held = Some(frame);
+                break;
+            }
+            if let Some(older) = newest.replace(frame) {
+                let _ = older.Close();
+            }
+        }
+        if let Some(frame) = newest {
             let content = frame.ContentSize()?;
             let content = (content.Width as u32, content.Height as u32);
             last = Some(pipeline.convert(&texture(&frame)?, content, format.fps)?);

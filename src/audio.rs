@@ -22,8 +22,8 @@ use crate::encode::packet;
 use crate::ring::{Clock, Packet, Ring, SECOND};
 
 pub const RATE: u32 = 48_000;
-const CHANNELS: u16 = 2;
-const BLOCK: usize = 2 * CHANNELS as usize;
+pub const CHANNELS: u16 = 2;
+pub const BLOCK: usize = 2 * CHANNELS as usize;
 // 192 kbps, the highest rate the in-box encoder offers
 const AAC_BYTES_PER_SECOND: u32 = 24_000;
 const AAC_FRAME: i64 = 1024 * SECOND / RATE as i64;
@@ -134,7 +134,9 @@ fn assign(sources: &[Source], processes: &Processes, sessions: &[u32], own: u32)
             _ => Vec::new(),
         };
         if !matches!(source, Source::Microphone) {
-            tree.retain(|&pid| !processes.overlaps(pid, &claimed));
+            // only a lane asked for by pid may take this process, as the sync test does
+            let taken = if matches!(source, Source::Process(_)) { &claimed[1..] } else { &claimed[..] };
+            tree.retain(|&pid| !processes.overlaps(pid, taken));
             claimed.extend(&tree);
         }
         trees.push(tree);
@@ -321,16 +323,7 @@ impl Input {
             let flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
                 | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
                 | if loopback { AUDCLNT_STREAMFLAGS_LOOPBACK } else { 0 };
-            let format = WAVEFORMATEX {
-                wFormatTag: WAVE_FORMAT_PCM as u16,
-                nChannels: CHANNELS,
-                nSamplesPerSec: RATE,
-                nAvgBytesPerSec: RATE * BLOCK as u32,
-                nBlockAlign: BLOCK as u16,
-                wBitsPerSample: 16,
-                cbSize: 0,
-            };
-            client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, DEVICE_BUFFER, 0, &format, None)?;
+            client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, DEVICE_BUFFER, 0, &wave(), None)?;
             let capture = client.GetService()?;
             client.Start()?;
             Ok(Self { client, capture })
@@ -655,7 +648,20 @@ impl Aac {
     }
 }
 
-fn audio_type(subtype: windows::core::GUID) -> Result<IMFMediaType> {
+/// 16 bit stereo pcm at `RATE`, the format every lane is captured and encoded in
+pub fn wave() -> WAVEFORMATEX {
+    WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM as u16,
+        nChannels: CHANNELS,
+        nSamplesPerSec: RATE,
+        nAvgBytesPerSec: RATE * BLOCK as u32,
+        nBlockAlign: BLOCK as u16,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    }
+}
+
+pub fn audio_type(subtype: windows::core::GUID) -> Result<IMFMediaType> {
     unsafe {
         let media = MFCreateMediaType()?;
         media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
@@ -789,6 +795,13 @@ mod tests {
         let trees = assign(&sources, &running, &[11, 21, 31, 41, 40, 10, 50, 99], 50);
         // steam is the game's parent, so neither its own lane nor the rest may take its tree
         assert_eq!(trees, vec![vec![20], vec![11, 40], vec![30], vec![], vec![MIC]]);
+    }
+
+    #[test]
+    fn only_a_pid_lane_takes_memory_itself() {
+        let running = processes(&[(1, 0, "explorer.exe"), (50, 1, "memory.exe")]);
+        let sources = [Source::Named(vec!["memory.exe".into()]), Source::Process(50), Source::Rest];
+        assert_eq!(assign(&sources, &running, &[50], 50), vec![vec![], vec![50], vec![]]);
     }
 
     #[test]
