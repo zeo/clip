@@ -301,6 +301,6 @@ mod tests {
         assert_eq!(u32::from_be_bytes([mdcv[16], mdcv[17], mdcv[18], mdcv[19]]), 10_000_000);
         assert_eq!(entry(b"clli"), [0x03, 0xE8, 0x01, 0x90]);
         assert_eq!(&child(traks[1].1, &[b"mdia", b"hdlr"])[24..], b"game\0");
-        assert_eq!(&child(traks[0].1, &[b"mdia", b"hdlr"])[24..], b"Handler ");
+        assert_eq!(&child(traks[0].1, &[b"mdia", b"hdlr"])[24..], b"Handler\0");
     }
 }
