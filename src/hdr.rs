@@ -56,9 +56,16 @@ fn sdr_white(device: &[u16; 32]) -> Option<f32> {
         GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count).ok().ok()?;
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
         let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-        QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut path_count, paths.as_mut_ptr(), &mut mode_count, modes.as_mut_ptr(), None)
-            .ok()
-            .ok()?;
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        )
+        .ok()
+        .ok()?;
         paths.truncate(path_count as usize);
         paths.iter().find_map(|path| {
             let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {

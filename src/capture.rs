@@ -80,11 +80,8 @@ pub struct Source {
 impl Source {
     /// `hdr` asks for scRGB FP16 frames, otherwise windows hands over 8 bit sRGB already clipped.
     pub fn start(gpu: &Gpu, target: Target, fps: u32, hdr: bool) -> Result<Self> {
-        let pixels = if hdr {
-            DirectXPixelFormat::R16G16B16A16Float
-        } else {
-            DirectXPixelFormat::B8G8R8A8UIntNormalized
-        };
+        let pixels =
+            if hdr { DirectXPixelFormat::R16G16B16A16Float } else { DirectXPixelFormat::B8G8R8A8UIntNormalized };
         unsafe {
             let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
             let item: GraphicsCaptureItem = match target {
@@ -206,7 +203,17 @@ impl Converter {
                 video.CreateVideoProcessorOutputView(&texture, &enumerator, &view_desc, Some(&mut view))?;
                 targets.push((texture, view.ok_or(windows::core::Error::from(E_FAIL))?));
             }
-            Ok(Self { device: gpu.device.clone(), video, context, enumerator, processor, input, output, targets, next: 0 })
+            Ok(Self {
+                device: gpu.device.clone(),
+                video,
+                context,
+                enumerator,
+                processor,
+                input,
+                output,
+                targets,
+                next: 0,
+            })
         }
     }
 

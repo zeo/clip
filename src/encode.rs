@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use windows::core::{Interface, Result, GUID};
 use windows::Win32::Foundation::{E_FAIL, LUID};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -220,7 +220,10 @@ impl Encoder {
             while self.credit == 0 {
                 if !self.pump(&mut out)? {
                     if started.elapsed() > STALL {
-                        return Err(windows::core::Error::new(MF_E_HW_MFT_FAILED_START_STREAMING, "encoder stopped asking for frames"));
+                        return Err(windows::core::Error::new(
+                            MF_E_HW_MFT_FAILED_START_STREAMING,
+                            "encoder stopped asking for frames",
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }

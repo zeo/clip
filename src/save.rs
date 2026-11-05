@@ -10,10 +10,10 @@ use crate::ring::Packet;
 /// Writes already encoded packets to an MP4 without re-encoding.
 /// The file appears under its final name only once it is complete.
 pub fn write_mp4(path: &Path, packets: &[Arc<Packet>], format: Format) -> Result<()> {
-    let first = packets.first().filter(|p| p.key).ok_or(windows::core::Error::new(
-        MF_E_INVALIDREQUEST,
-        "a clip has to start on a keyframe",
-    ))?;
+    let first = packets
+        .first()
+        .filter(|p| p.key)
+        .ok_or(windows::core::Error::new(MF_E_INVALIDREQUEST, "a clip has to start on a keyframe"))?;
     let partial = path.with_extension("mp4.part");
     let written = unsafe { write(&partial, packets, first, format) };
     if let Err(e) = written {

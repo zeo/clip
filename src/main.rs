@@ -64,7 +64,9 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
     let max_height = number(args, "--height", 1080)?;
     let out = PathBuf::from(flag(args, "--out").unwrap_or("clip.mp4"));
     let target = match (flag(args, "--window"), flag(args, "--monitor")) {
-        (Some(text), _) => Target::Window(find_window(text).ok_or(format!("no visible window titled like \"{text}\""))?),
+        (Some(text), _) => {
+            Target::Window(find_window(text).ok_or(format!("no visible window titled like \"{text}\""))?)
+        }
         (None, Some(n)) => {
             let n: usize = n.parse().map_err(|_| "--monitor needs a number".to_string())?;
             let monitors = monitors();
@@ -85,9 +87,8 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
         Some(choice) => (Codec::Hdr10, choice),
         None => (Codec::H264, pick(Codec::H264)?.ok_or("no h.264 encoder found")?),
     };
-    let size = capture::Source::start(&gpu, target, fps, display.hdr)
-        .map_err(|e| format!("capture failed: {e}"))?
-        .size();
+    let size =
+        capture::Source::start(&gpu, target, fps, display.hdr).map_err(|e| format!("capture failed: {e}"))?.size();
     let (width, height) = capture::output_size(size, max_height);
     let format = Format { width, height, fps, bitrate: mbps * 1_000_000, codec };
     println!("{}, {}", describe(size), describe_display(display, codec));
@@ -111,7 +112,12 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
     let packets = ring.since(i64::MIN);
     let seconds = (ring.end().unwrap_or(0) - packets.first().map_or(0, |p| p.pts)) as f64 / SECOND as f64;
     save::write_mp4(&out, &packets, format).map_err(|e| format!("saving failed: {e}"))?;
-    println!("saved {seconds:.1} s, {} frames, {:.1} MB to {}", packets.len(), ring.bytes() as f64 / 1e6, out.display());
+    println!(
+        "saved {seconds:.1} s, {} frames, {:.1} MB to {}",
+        packets.len(),
+        ring.bytes() as f64 / 1e6,
+        out.display()
+    );
     Ok(())
 }
 
@@ -190,7 +196,9 @@ fn self_test() -> Result<()> {
             println!("FAIL transfer: {}", e.message())
         }
     }
-    for (case, codec, hdr) in [("sdr", Codec::H264, false), ("tonemap", Codec::H264, true), ("hdr10", Codec::Hdr10, true)] {
+    for (case, codec, hdr) in
+        [("sdr", Codec::H264, false), ("tonemap", Codec::H264, true), ("hdr10", Codec::Hdr10, true)]
+    {
         let format = Format { width: 640, height: 360, fps: 30, bitrate: 4_000_000, codec };
         let frames = 2 * format.fps as i64;
         let choices = encode::encoders(codec, Some(gpu.adapter))?;
@@ -202,14 +210,17 @@ fn self_test() -> Result<()> {
             let path = dir.join(format!("{case}-{kind}.mp4"));
             let outcome = (|| -> Result<(u32, bool, i64)> {
                 let display = if hdr { TEST_DISPLAY } else { SDR_DISPLAY };
-                let mut pipeline =
-                    capture::Pipeline::new(&gpu, display, (800, 600), format).map_err(at("pipeline"))?;
+                let mut pipeline = capture::Pipeline::new(&gpu, display, (800, 600), format).map_err(at("pipeline"))?;
                 let mut encoder = encode::Encoder::open(&choice, &gpu.device, format).map_err(at("open"))?;
                 let mut ring = Ring::new(10 * SECOND);
                 for i in 0..frames {
                     let source = pattern(&gpu.device, 800, 600, i as u32, hdr).map_err(at("pattern"))?;
                     let frame = pipeline.convert(&source, (800, 600), format.fps).map_err(at("convert"))?;
-                    encoder.encode(&frame, format.time(i)).map_err(at("encode"))?.into_iter().for_each(|p| ring.push(p));
+                    encoder
+                        .encode(&frame, format.time(i))
+                        .map_err(at("encode"))?
+                        .into_iter()
+                        .for_each(|p| ring.push(p));
                 }
                 encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
                 save::write_mp4(&path, &ring.since(i64::MIN), format).map_err(at("save"))?;
@@ -221,7 +232,10 @@ fn self_test() -> Result<()> {
                 }
                 Ok((count, key, last)) => {
                     failures += 1;
-                    println!("FAIL {case} {kind} {}: {count} of {frames} frames, keyframe first {key}, last at {last}", choice.name)
+                    println!(
+                        "FAIL {case} {kind} {}: {count} of {frames} frames, keyframe first {key}, last at {last}",
+                        choice.name
+                    )
                 }
                 Err(e) => {
                     failures += 1;
