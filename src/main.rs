@@ -130,6 +130,10 @@ fn record_clip<T: Send + 'static>(
     let size = source.size();
     let (width, height) = capture::output_size(size, max_height);
     let format = Format { width, height, fps, bitrate: mbps * 1_000_000, codec };
+    let mastering = matches!(codec, Codec::Hdr10)
+        .then(|| hdr::mastering(target.monitor()))
+        .transpose()
+        .map_err(|e| format!("can't read the display: {e}"))?;
     println!("{}, {}", describe(size), describe_display(display, codec));
     println!("-> {width}x{height} at {fps} fps, {mbps} Mbps, {filter:?} scaling, {}", choice.name);
     println!("audio: {}", lanes.iter().map(|lane| lane.name.as_str()).collect::<Vec<_>>().join(", "));
@@ -164,7 +168,8 @@ fn record_clip<T: Send + 'static>(
     let packets = ring.since(i64::MIN);
     let start = packets.first().map_or(0, |p| p.pts);
     let seconds = (ring.end().unwrap_or(0) - start) as f64 / SECOND as f64;
-    save::write_mp4(out, &packets, format, &audio).map_err(|e| format!("saving failed: {e}"))?;
+    let names: Vec<&str> = lanes.iter().map(|lane| lane.name.as_str()).collect();
+    save::write_mp4(out, &packets, format, &audio, &names, mastering).map_err(|e| format!("saving failed: {e}"))?;
     println!(
         "saved {seconds:.1} s, {} frames, {:.1} MB to {}",
         packets.len(),
@@ -294,7 +299,9 @@ fn self_test() -> Result<()> {
                         .for_each(|p| ring.push(p));
                 }
                 encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
-                save::write_mp4(&path, &ring.since(i64::MIN), format, &lanes).map_err(at("save"))?;
+                let mastering = matches!(codec, Codec::Hdr10).then_some(TEST_PANEL);
+                save::write_mp4(&path, &ring.since(i64::MIN), format, &lanes, &["tone 440", "tone 660"], mastering)
+                    .map_err(at("save"))?;
                 let streams = read_back(&path).map_err(at("read back"))?;
                 Ok((streams, sync::onsets(&path).map_err(at("read sound back"))?.1.first().copied()))
             })();
@@ -345,6 +352,12 @@ const E_SELF_TEST: windows::core::HRESULT = windows::core::HRESULT(0x8000_4005_u
 const TEST_DISPLAY: Display = Display { hdr: true, sdr_white: 200.0, peak: 1000.0 };
 const SDR_DISPLAY: Display = Display { hdr: false, sdr_white: hdr::SCRGB_WHITE, peak: hdr::SCRGB_WHITE };
 const MID_GREY: u8 = 128;
+const TEST_PANEL: hdr::Mastering = hdr::Mastering {
+    primaries: [[0.68, 0.32], [0.265, 0.69], [0.15, 0.06], [0.3127, 0.329]],
+    min: 0.05,
+    max: TEST_DISPLAY.peak,
+    average: 400.0,
+};
 
 /// How the compositor stores an sRGB value on an HDR desktop: linear, scaled up to the sdr white level.
 fn composed(srgb: u8, display: Display) -> f32 {

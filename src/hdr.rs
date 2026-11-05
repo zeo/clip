@@ -22,6 +22,38 @@ pub struct Display {
 }
 
 pub fn display(monitor: HMONITOR) -> Result<Display> {
+    let desc = output(monitor)?;
+    let hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    let sdr_white = if hdr { sdr_white(&desc.DeviceName).unwrap_or(200.0) } else { SCRGB_WHITE };
+    let peak = if desc.MaxLuminance > 0.0 { desc.MaxLuminance } else { 1000.0 };
+    Ok(Display { hdr, sdr_white, peak: peak.max(sdr_white) })
+}
+
+/// What an hdr10 file states about the screen it was made on: the panel's own primaries, white
+/// point and luminance range, with that peak standing in for the content light level too.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mastering {
+    /// red, green, blue, then the white point, as CIE 1931 xy
+    pub primaries: [[f32; 2]; 4],
+    pub min: f32,
+    pub max: f32,
+    /// brightest frame average the panel holds, which stands in for MaxFALL
+    pub average: f32,
+}
+
+/// DCI-P3 with a D65 white, what HDR10 is usually mastered on, for drivers that report no primaries
+const P3_D65: [[f32; 2]; 4] = [[0.68, 0.32], [0.265, 0.69], [0.15, 0.06], [0.3127, 0.329]];
+
+pub fn mastering(monitor: HMONITOR) -> Result<Mastering> {
+    let desc = output(monitor)?;
+    let reported = [desc.RedPrimary, desc.GreenPrimary, desc.BluePrimary, desc.WhitePoint];
+    let primaries = if reported.iter().flatten().all(|&v| v > 0.0 && v < 1.0) { reported } else { P3_D65 };
+    let max = if desc.MaxLuminance > 0.0 { desc.MaxLuminance } else { 1000.0 };
+    let average = if desc.MaxFullFrameLuminance > 0.0 { desc.MaxFullFrameLuminance.min(max) } else { max };
+    Ok(Mastering { primaries, min: desc.MinLuminance.clamp(0.0, max), max, average })
+}
+
+fn output(monitor: HMONITOR) -> Result<DXGI_OUTPUT_DESC1> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
         let mut a = 0;
@@ -30,10 +62,7 @@ pub fn display(monitor: HMONITOR) -> Result<Display> {
             while let Ok(output) = adapter.EnumOutputs(o) {
                 let desc = output.cast::<IDXGIOutput6>()?.GetDesc1()?;
                 if desc.Monitor == monitor {
-                    let hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-                    let sdr_white = if hdr { sdr_white(&desc.DeviceName).unwrap_or(200.0) } else { SCRGB_WHITE };
-                    let peak = if desc.MaxLuminance > 0.0 { desc.MaxLuminance } else { 1000.0 };
-                    return Ok(Display { hdr, sdr_white, peak: peak.max(sdr_white) });
+                    return Ok(desc);
                 }
                 o += 1;
             }
