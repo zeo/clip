@@ -287,7 +287,7 @@ fn self_test() -> Result<()> {
                 let switched = if hdr { SDR_DISPLAY } else { TEST_DISPLAY };
                 for i in 0..frames {
                     if i == frames / 2 {
-                        pipeline.follow(switched).map_err(at("switch hdr"))?;
+                        pipeline.follow(switched);
                     }
                     let hdr = hdr != (i >= frames / 2);
                     let source = pattern(&gpu.device, 800, 600, i as u32, hdr).map_err(at("pattern"))?;

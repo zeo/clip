@@ -278,7 +278,6 @@ impl Converter {
 /// for hdr10 both formats go to P010, sdr frames with their white at the display's sdr white level.
 /// The display can switch hdr on or off mid recording, so each frame is converted by its own format.
 pub struct Pipeline {
-    device: ID3D11Device,
     scaler: Scaler,
     output: (u32, u32),
     encode: Encode,
@@ -307,24 +306,17 @@ impl Pipeline {
                 DXGI_FORMAT_B8G8R8A8_UNORM,
             ),
         };
-        Ok(Self {
-            device: gpu.device.clone(),
-            scaler: Scaler::new(&gpu.device, filter, output, middle)?,
-            output,
-            encode,
-            display,
-        })
+        Ok(Self { scaler: Scaler::new(&gpu.device, filter, output, middle)?, output, encode, display })
     }
 
     /// Takes on a new display state: the tonemap follows it, and hdr10 keeps the last hdr sdr white.
-    pub fn follow(&mut self, display: Display) -> Result<()> {
+    pub fn follow(&mut self, display: Display) {
         match &mut self.encode {
-            Encode::Sdr(tonemap, _) => *tonemap = Tonemap::new(&self.device, display)?,
+            Encode::Sdr(tonemap, _) => tonemap.follow(display),
             Encode::Hdr10(_, white) if display.hdr => *white = display.sdr_white,
             Encode::Hdr10(..) => {}
         }
         self.display = display;
-        Ok(())
     }
 
     /// Letterboxes the `content` region of `frame` into the next encoder surface and returns it.
@@ -398,7 +390,7 @@ pub fn record(
             if let Ok(now) = hdr::display(source.target.monitor()) {
                 if now != pipeline.display {
                     source.follow(now.hdr);
-                    pipeline.follow(now)?;
+                    pipeline.follow(now);
                 }
             }
         }
