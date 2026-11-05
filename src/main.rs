@@ -1,3 +1,6 @@
+#![windows_subsystem = "windows"]
+
+mod app;
 mod audio;
 mod capture;
 mod encode;
@@ -20,6 +23,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, MonitorFromPoint, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible};
 
 use capture::Target;
@@ -36,6 +40,11 @@ memory self-test [--live]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return app::run();
+    }
+    // the exe is a windows app so the tray never opens a console, so the command line borrows the caller's
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }
         .and_then(|()| unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) })
         .map_err(|e| e.to_string())
@@ -108,7 +117,7 @@ pub struct Options {
 }
 
 impl Options {
-    fn parse(args: &[String]) -> std::result::Result<Self, String> {
+    pub fn parse(args: &[String]) -> std::result::Result<Self, String> {
         Ok(Self {
             buffer: number(args, "--buffer", 30)?,
             fps: number(args, "--fps", 60)?,

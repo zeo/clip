@@ -2,7 +2,7 @@
 
 A game clipper for Windows 11 that keeps the last stretch of play in RAM and writes it out on demand. Nothing is injected into the game: video comes from Windows Graphics Capture and audio from per-process loopback, so anti-cheat has nothing to object to.
 
-Right now it is a command line recorder. The tray app, hotkeys, editor and game API auto-clips come later.
+Started with no arguments, it sits in the tray and keeps the last 30 seconds of the primary monitor, with desktop and Discord audio. Alt+F9, or save clip in the tray menu, writes them to `Videos\memory`, with a beep once the file is written. Settings, a clip library, the editor and game API auto-clips come later. The same exe is also a command line recorder:
 
 ```
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]

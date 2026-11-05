@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "memory",
+  "version": "0.1.0",
+  "identifier": "lt.rot.memory",
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.ico", "icons/icon.png"]
+  }
+}
