@@ -34,6 +34,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Ole",
     "Win32_System_Performance",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Variant",
@@ -46,7 +47,10 @@ windows = { version = "0.62.2", features = [
 hdrkit = { git = "https://github.com/zeo/hdrkit", rev = "caac5aa0a83ac4e0e6f58729189d29022ad26564" }
 # the implement macro expands to windows_core paths
 windows-core = "0.62.2"
-tauri = { version = "2.12", features = ["tray-icon"] }
+tauri = { version = "2.12", features = ["tray-icon", "protocol-asset"] }
+tauri-plugin-dialog = "2.8"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 [build-dependencies]
 tauri-build = { version = "2.7", features = [] }

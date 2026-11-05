@@ -3,8 +3,32 @@
   "productName": "memory",
   "version": "0.1.0",
   "identifier": "lt.rot.memory",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "web/dist"
+  },
   "app": {
-    "windows": []
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "memory",
+        "width": 1080,
+        "height": 700,
+        "minWidth": 760,
+        "minHeight": 480,
+        "decorations": false,
+        "resizable": true,
+        "center": true,
+        "backgroundColor": "#121315"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; media-src 'self' asset: http://asset.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'",
+      "assetProtocol": { "enable": true, "scope": [] }
+    }
   },
   "bundle": {
     "active": false,
