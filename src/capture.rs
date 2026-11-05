@@ -379,14 +379,20 @@ pub fn record(
     let mut tick = (started.elapsed().as_nanos() / period.as_nanos()) as u64;
     let mut held = None;
     let mut last = None;
+    let mut stalled: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
         // wake half a slot late so every frame drawn nearer this slot than the next has arrived
         let due = started + period * tick as u32 + period / 2;
-        if let Some(wait) = due.checked_duration_since(Instant::now()) {
-            std::thread::sleep(wait);
+        match due.checked_duration_since(Instant::now()) {
+            Some(wait) => std::thread::sleep(wait),
+            None if Instant::now() > due + period * 2 => stalled = Some(Instant::now()),
+            None => {}
         }
         // once a second, catch hdr being switched, the sdr brightness slider, or a window moving screens
-        if tick.is_multiple_of(format.fps as u64) {
+        // switching hdr stalls capture and the frames change a moment later, so for a second after a stall
+        // watch every tick
+        let after_stall = stalled.is_some_and(|at| at.elapsed() < Duration::from_secs(1));
+        if after_stall || tick.is_multiple_of(format.fps as u64) {
             if let Ok(now) = hdr::display(source.target.monitor()) {
                 if now != pipeline.display {
                     source.follow(now.hdr);
@@ -396,6 +402,11 @@ pub fn record(
         }
         let mut newest = None;
         while let Some(frame) = held.take().or_else(|| source.next()) {
+            // frames left in the old format were composed around an hdr switch, either side of it
+            if frame.Surface()?.Description()?.Format != source.pixels {
+                let _ = frame.Close();
+                continue;
+            }
             if slot(&frame)? > tick as i64 {
                 held = Some(frame);
                 break;
@@ -415,8 +426,9 @@ pub fn record(
             let mut ring = ring.lock().expect("ring poisoned");
             packets.into_iter().for_each(|p| ring.push(p));
         }
-        // after a stall, skip the missed ticks instead of bursting to catch up
-        tick = (tick + 1).max((started.elapsed().as_nanos() / period.as_nanos()) as u64);
+        // after a stall, repeat the last frame through the missed ticks, but never fall more than a second behind
+        let reached = (started.elapsed().as_nanos() / period.as_nanos()) as u64;
+        tick = (tick + 1).max(reached.saturating_sub(format.fps as u64));
     }
     let packets = encoder.finish()?;
     let mut ring = ring.lock().expect("ring poisoned");

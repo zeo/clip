@@ -20,7 +20,7 @@ memory self-test [--live]
 
 On an HDR display the capture is scRGB FP16. By default it is tonemapped to SDR with the shaders from [hdrkit](https://github.com/zeo/hdrkit): SDR content keeps its normal brightness at whatever the Windows SDR brightness slider is set to, and highlights roll off onto white at the panel's peak. `--hdr10` keeps HDR instead, as HEVC Main10 with PQ and BT.2020, and writes the panel's mastering values into the file. On an SDR display, or with no encoder that supports HEVC Main10, it records SDR.
 
-The display is read again every second. Switching HDR on or off, or moving the slider, carries into the clip being recorded.
+The display is read again every second, and on every frame for a second after capture stalls, which switching HDR does. Switching HDR on or off, or moving the slider, carries into the clip being recorded. Frames composed while the switch happens are dropped and the last good frame repeats in their place, so the clip keeps its frame rate.
 
 ## audio
 
@@ -52,7 +52,7 @@ Windows only gives a per-app capture the app's own sound and that of its direct 
 - Sync is measured to one display refresh, 8 ms at 120 Hz, since a flash only reaches the clip on the frame it was shown.
 - The test click peaks at -72 dBFS. With headphones and the volume near maximum it may still be faintly audible.
 - Mastering values in HDR10 files are whatever the display driver reports.
-- Switching HDR mid recording is covered by the self-test, which swaps the display state on synthetic frames. It hasn't been tested by toggling a real display.
+- Switching HDR was tested on a real display on build 26340 with an NVIDIA GPU. Each switch freezes the clip for about 0.4 s. After switching HDR on, Windows composes the first 8 frames or so (130 ms at 60 fps) with SDR white at 80 nits, so they come out at a third of their linear brightness, and for about 1.5 s the driver reports a lower peak, which makes highlights roll off a little early.
 
 ## license
 
