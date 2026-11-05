@@ -38,7 +38,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_WindowsAndMessaging",
 ] }
-hdrkit = { git = "https://github.com/zeo/hdrkit", rev = "9bbd4515d361803a6aaff68460d7dc4c973d9b1a" }
+hdrkit = { git = "https://github.com/zeo/hdrkit", rev = "389f9e7dfa7dfd2a05db019cf1b482ffe3527db8" }
 # the implement macro expands to windows_core paths
 windows-core = "0.62.2"
 
