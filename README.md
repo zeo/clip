@@ -52,7 +52,7 @@ Windows only gives a per-app capture the app's own sound and that of its direct 
 - Sync is measured to one display refresh, 8 ms at 120 Hz, since a flash only reaches the clip on the frame it was shown.
 - The test click peaks at -72 dBFS. With headphones and the volume near maximum it may still be faintly audible.
 - Mastering values in HDR10 files are whatever the display driver reports.
-- Switching HDR was tested on a real display on build 26340 with an NVIDIA GPU. Each switch freezes the clip for about 0.4 s. After switching HDR on, Windows composes the first 8 frames or so (130 ms at 60 fps) with SDR white at 80 nits, so they come out at a third of their linear brightness, and for about 1.5 s the driver reports a lower peak, which makes highlights roll off a little early.
+- Switching HDR was tested on a real display on build 26340 with an NVIDIA GPU. Each switch freezes the clip for about 0.4 s. After switching HDR on, Windows composes the first frames with SDR white at 80 nits, so they come out at a third of their linear brightness. That lasted from 0.13 s to 0.8 s across six switches at 60 and 120 fps, longer when a stall made the clip repeat one of those frames. For about 1.5 s the driver reports a lower peak, which makes highlights roll off a little early.
 
 ## license
 
