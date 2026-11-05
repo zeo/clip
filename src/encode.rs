@@ -1,0 +1,416 @@
+use std::mem::ManuallyDrop;
+use std::time::{Duration, Instant};
+
+use windows::core::{Interface, Result, GUID};
+use windows::Win32::Foundation::{E_FAIL, LUID};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Variant::VARIANT;
+
+use crate::ring::{Packet, SECOND};
+
+#[derive(Clone, Copy, Debug)]
+pub struct Format {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate: u32,
+}
+
+impl Format {
+    pub fn frame(&self) -> i64 {
+        SECOND / self.fps as i64
+    }
+
+    /// Exact timestamp of frame `tick`, so long recordings don't drift from rounding `frame()`
+    pub fn time(&self, tick: i64) -> i64 {
+        tick * SECOND / self.fps as i64
+    }
+}
+
+pub struct Choice {
+    activate: IMFActivate,
+    pub name: String,
+    pub hardware: bool,
+}
+
+/// H.264 encoders on this machine, hardware ones on `adapter` first, then the in-box software encoder.
+pub fn encoders(adapter: Option<LUID>) -> Result<Vec<Choice>> {
+    let mut found = Vec::new();
+    for hardware in [true, false] {
+        let flags = if hardware { MFT_ENUM_FLAG_HARDWARE } else { MFT_ENUM_FLAG_SYNCMFT };
+        let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
+        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+        let mut list = std::ptr::null_mut();
+        let mut count = 0;
+        unsafe {
+            let mut filter = None;
+            MFCreateAttributes(&mut filter, 1)?;
+            let filter = filter.expect("created");
+            if let (true, Some(luid)) = (hardware, adapter) {
+                let bytes = std::slice::from_raw_parts(&luid as *const LUID as *const u8, size_of::<LUID>());
+                filter.SetBlob(&MFT_ENUM_ADAPTER_LUID, bytes)?;
+            }
+            MFTEnum2(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                flags | MFT_ENUM_FLAG_SORTANDFILTER,
+                Some(&input),
+                Some(&output),
+                &filter,
+                &mut list,
+                &mut count,
+            )?;
+            if list.is_null() {
+                continue;
+            }
+            for slot in std::slice::from_raw_parts_mut(list, count as usize) {
+                let Some(activate) = slot.take() else { continue };
+                found.push(Choice { name: friendly_name(&activate), activate, hardware });
+            }
+            CoTaskMemFree(Some(list as _));
+        }
+    }
+    Ok(found)
+}
+
+fn friendly_name(activate: &IMFActivate) -> String {
+    let mut text = windows::core::PWSTR::null();
+    let mut len = 0;
+    unsafe {
+        if activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut text, &mut len).is_err() {
+            return "unknown encoder".into();
+        }
+        let name = text.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(text.0 as _));
+        name
+    }
+}
+
+pub struct Encoder {
+    transform: IMFTransform,
+    events: Option<IMFMediaEventGenerator>,
+    credit: u32,
+    provides_samples: bool,
+    output_size: u32,
+    gpu_input: bool,
+    staging: Option<ID3D11Texture2D>,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    format: Format,
+}
+
+// hardware encoders answer within a frame or two, this only trips on a wedged driver
+const STALL: Duration = Duration::from_secs(2);
+
+#[allow(non_upper_case_globals)] // the event names are the sdk's own constants
+impl Encoder {
+    pub fn open(choice: &Choice, device: &ID3D11Device, format: Format) -> Result<Self> {
+        unsafe {
+            let transform: IMFTransform = choice.activate.ActivateObject()?;
+            let attributes = transform.GetAttributes()?;
+            let events = if choice.hardware {
+                attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+                Some(transform.cast::<IMFMediaEventGenerator>()?)
+            } else {
+                None
+            };
+            let gpu_input = attributes.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) != 0;
+            if gpu_input {
+                let mut token = 0;
+                let mut manager = None;
+                MFCreateDXGIDeviceManager(&mut token, &mut manager)?;
+                let manager = manager.ok_or(windows::core::Error::from(E_FAIL))?;
+                manager.ResetDevice(device, token)?;
+                transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
+            }
+            let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
+
+            // vendors support different subsets, so each knob is best effort
+            if let Ok(codec) = transform.cast::<ICodecAPI>() {
+                let set = |api: GUID, value: VARIANT| {
+                    let _ = codec.SetValue(&api, &value);
+                };
+                set(CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
+                set(CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(format.bitrate));
+                set(CODECAPI_AVEncMPVGOPSize, VARIANT::from(format.fps));
+                set(CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
+                set(CODECAPI_AVLowLatencyMode, VARIANT::from(true));
+            }
+
+            let output = MFCreateMediaType()?;
+            output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            output.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate)?;
+            output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+            describe(&output, format)?;
+            transform.SetOutputType(0, &output, 0)?;
+
+            let input = (0..)
+                .map_while(|i| transform.GetInputAvailableType(0, i).ok())
+                .find(|t| t.GetGUID(&MF_MT_SUBTYPE).is_ok_and(|s| s == MFVideoFormat_NV12))
+                .ok_or(windows::core::Error::from(MF_E_INVALIDMEDIATYPE))?;
+            describe(&input, format)?;
+            transform.SetInputType(0, &input, 0)?;
+
+            let info = transform.GetOutputStreamInfo(0)?;
+            let provides = (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32;
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+
+            Ok(Self {
+                transform,
+                events,
+                credit: 0,
+                provides_samples: info.dwFlags & provides != 0,
+                output_size: info.cbSize.max(format.width * format.height * 3 / 2),
+                gpu_input,
+                staging: None,
+                device: device.clone(),
+                context: device.GetImmediateContext()?,
+                format,
+            })
+        }
+    }
+
+    pub fn encode(&mut self, texture: &ID3D11Texture2D, pts: i64) -> Result<Vec<Packet>> {
+        let sample = self.sample(texture)?;
+        unsafe {
+            sample.SetSampleTime(pts)?;
+            sample.SetSampleDuration(self.format.frame())?;
+        }
+        let mut out = Vec::new();
+        if self.events.is_some() {
+            let started = Instant::now();
+            while self.credit == 0 {
+                if !self.pump(&mut out)? {
+                    if started.elapsed() > STALL {
+                        return Err(windows::core::Error::new(MF_E_HW_MFT_FAILED_START_STREAMING, "encoder stopped asking for frames"));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            unsafe { self.transform.ProcessInput(0, &sample, 0)? };
+            self.credit -= 1;
+            while self.pump(&mut out)? {}
+        } else {
+            unsafe { self.transform.ProcessInput(0, &sample, 0)? };
+            while let Some(packet) = self.pull()? {
+                out.push(packet);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<Packet>> {
+        let mut out = Vec::new();
+        unsafe {
+            self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
+            self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
+        }
+        let Some(events) = self.events.clone() else {
+            while let Some(packet) = self.pull()? {
+                out.push(packet);
+            }
+            return Ok(out);
+        };
+        let started = Instant::now();
+        while started.elapsed() < STALL {
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => match MF_EVENT_TYPE(unsafe { event.GetType()? } as i32) {
+                    METransformHaveOutput => out.extend(self.pull()?),
+                    METransformDrainComplete => break,
+                    _ => {}
+                },
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => std::thread::sleep(Duration::from_millis(1)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Handles one pending async event. False when none was waiting.
+    fn pump(&mut self, out: &mut Vec<Packet>) -> Result<bool> {
+        let events = self.events.as_ref().expect("async encoder");
+        let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => event,
+            Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        match MF_EVENT_TYPE(unsafe { event.GetType()? } as i32) {
+            METransformNeedInput => self.credit += 1,
+            METransformHaveOutput => out.extend(self.pull()?),
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn pull(&mut self) -> Result<Option<Packet>> {
+        unsafe {
+            let provided = if self.provides_samples {
+                None
+            } else {
+                let sample = MFCreateSample()?;
+                sample.AddBuffer(&MFCreateMemoryBuffer(self.output_size)?)?;
+                Some(sample)
+            };
+            let mut buffer = [MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: ManuallyDrop::new(provided),
+                dwStatus: 0,
+                pEvents: ManuallyDrop::new(None),
+            }];
+            let mut status = 0;
+            let result = self.transform.ProcessOutput(0, &mut buffer, &mut status);
+            let sample = ManuallyDrop::take(&mut buffer[0].pSample);
+            drop(ManuallyDrop::take(&mut buffer[0].pEvents));
+            match result {
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
+                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    let renegotiated = self.transform.GetOutputAvailableType(0, 0)?;
+                    self.transform.SetOutputType(0, &renegotiated, 0)?;
+                    self.pull()
+                }
+                Err(e) => Err(e),
+                Ok(()) => sample.map(|s| packet(&s, self.format.frame())).transpose(),
+            }
+        }
+    }
+
+    fn sample(&mut self, texture: &ID3D11Texture2D) -> Result<IMFSample> {
+        unsafe {
+            let buffer = if self.gpu_input {
+                let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)?;
+                let length = buffer.cast::<IMF2DBuffer>()?.GetContiguousLength()?;
+                buffer.SetCurrentLength(length)?;
+                buffer
+            } else {
+                self.read_back(texture)?
+            };
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            Ok(sample)
+        }
+    }
+
+    /// Copies an NV12 texture into a packed system memory buffer for software encoders.
+    fn read_back(&mut self, texture: &ID3D11Texture2D) -> Result<IMFMediaBuffer> {
+        unsafe {
+            let staging = match &self.staging {
+                Some(staging) => staging.clone(),
+                None => {
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    texture.GetDesc(&mut desc);
+                    desc.Usage = D3D11_USAGE_STAGING;
+                    desc.BindFlags = 0;
+                    desc.MiscFlags = 0;
+                    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+                    let mut staging = None;
+                    self.device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+                    let staging = staging.ok_or(windows::core::Error::from(E_FAIL))?;
+                    self.staging = Some(staging.clone());
+                    staging
+                }
+            };
+            self.context.CopyResource(&staging, texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let (width, height) = (self.format.width as usize, self.format.height as usize);
+            let size = width * height * 3 / 2;
+            let buffer = MFCreateMemoryBuffer(size as u32)?;
+            let mut target = std::ptr::null_mut();
+            buffer.Lock(&mut target, None, None)?;
+            let source = mapped.pData as *const u8;
+            let pitch = mapped.RowPitch as usize;
+            // nv12: a full height luma plane, then a half height interleaved chroma plane
+            for row in 0..height + height / 2 {
+                std::ptr::copy_nonoverlapping(source.add(row * pitch), target.add(row * width), width);
+            }
+            buffer.Unlock()?;
+            self.context.Unmap(&staging, 0);
+            buffer.SetCurrentLength(size as u32)?;
+            Ok(buffer)
+        }
+    }
+}
+
+fn describe(media: &IMFMediaType, format: Format) -> Result<()> {
+    unsafe {
+        media.SetUINT64(&MF_MT_FRAME_SIZE, ((format.width as u64) << 32) | format.height as u64)?;
+        media.SetUINT64(&MF_MT_FRAME_RATE, ((format.fps as u64) << 32) | 1)?;
+        media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1 << 32) | 1)?;
+        media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        media.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+        media.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+        media.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+        media.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+    }
+    Ok(())
+}
+
+fn packet(sample: &IMFSample, frame: i64) -> Result<Packet> {
+    unsafe {
+        let buffer = sample.ConvertToContiguousBuffer()?;
+        let mut data = std::ptr::null_mut();
+        let mut length = 0;
+        buffer.Lock(&mut data, None, Some(&mut length))?;
+        let bytes = std::slice::from_raw_parts(data, length as usize).to_vec();
+        buffer.Unlock()?;
+        Ok(Packet {
+            pts: sample.GetSampleTime()?,
+            duration: sample.GetSampleDuration().unwrap_or(frame),
+            key: sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0,
+            data: bytes,
+        })
+    }
+}
+
+/// SPS and PPS NAL units, start codes included, from an Annex B access unit.
+pub fn parameter_sets(access_unit: &[u8]) -> Vec<u8> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= access_unit.len() {
+        if access_unit[i..i + 3] == [0, 0, 1] {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for (n, &start) in starts.iter().enumerate() {
+        let mut end = starts.get(n + 1).map_or(access_unit.len(), |&next| next - 3);
+        while n + 1 < starts.len() && end > start && access_unit[end - 1] == 0 {
+            end -= 1;
+        }
+        if start < end && matches!(access_unit[start] & 0x1f, 7 | 8) {
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&access_unit[start..end]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parameter_sets;
+
+    #[test]
+    fn keeps_only_sps_and_pps() {
+        let unit = [
+            0, 0, 0, 1, 0x09, 0xf0, // access unit delimiter
+            0, 0, 0, 1, 0x67, 1, 2, 3, // sps
+            0, 0, 1, 0x68, 4, 5, // pps, three byte start code
+            0, 0, 0, 1, 0x65, 9, 9, 9, // idr slice
+        ];
+        assert_eq!(parameter_sets(&unit), [0, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x68, 4, 5]);
+    }
+
+    #[test]
+    fn empty_without_parameter_sets() {
+        assert!(parameter_sets(&[0, 0, 1, 0x41, 7, 7]).is_empty());
+    }
+}
