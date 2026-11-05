@@ -4,10 +4,10 @@ use std::sync::Arc;
 use windows::core::{Result, HSTRING};
 use windows::Win32::Media::MediaFoundation::*;
 
-use crate::encode::{parameter_sets, Format};
+use crate::encode::{describe, parameter_sets, Format};
 use crate::ring::Packet;
 
-/// Writes already encoded H.264 packets to an MP4 without re-encoding.
+/// Writes already encoded packets to an MP4 without re-encoding.
 /// The file appears under its final name only once it is complete.
 pub fn write_mp4(path: &Path, packets: &[Arc<Packet>], format: Format) -> Result<()> {
     let first = packets.first().filter(|p| p.key).ok_or(windows::core::Error::new(
@@ -37,13 +37,10 @@ unsafe fn write(path: &Path, packets: &[Arc<Packet>], first: &Packet, format: Fo
 
         let video = MFCreateMediaType()?;
         video.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        video.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        video.SetGUID(&MF_MT_SUBTYPE, &format.codec.subtype())?;
         video.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate)?;
-        video.SetUINT64(&MF_MT_FRAME_SIZE, ((format.width as u64) << 32) | format.height as u64)?;
-        video.SetUINT64(&MF_MT_FRAME_RATE, ((format.fps as u64) << 32) | 1)?;
-        video.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1 << 32) | 1)?;
-        video.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        let headers = parameter_sets(&first.data);
+        describe(&video, format)?;
+        let headers = parameter_sets(format.codec, &first.data);
         if !headers.is_empty() {
             video.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &headers)?;
         }

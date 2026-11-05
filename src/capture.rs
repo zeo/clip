@@ -15,11 +15,12 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-use windows::Win32::Graphics::Gdi::HMONITOR;
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
-use crate::encode::{Choice, Encoder, Format};
+use crate::encode::{Choice, Codec, Encoder, Format};
+use crate::hdr::{Display, Pq, Tonemap};
 use crate::ring::Ring;
 
 #[derive(Clone)]
@@ -59,17 +60,31 @@ pub enum Target {
     Window(HWND),
 }
 
+impl Target {
+    pub fn monitor(self) -> HMONITOR {
+        match self {
+            Target::Monitor(monitor) => monitor,
+            Target::Window(window) => unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) },
+        }
+    }
+}
+
 pub struct Source {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     device: IDirect3DDevice,
     size: SizeInt32,
+    pixels: DirectXPixelFormat,
 }
 
-const PIXELS: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
-
 impl Source {
-    pub fn start(gpu: &Gpu, target: Target, fps: u32) -> Result<Self> {
+    /// `hdr` asks for scRGB FP16 frames, otherwise windows hands over 8 bit sRGB already clipped.
+    pub fn start(gpu: &Gpu, target: Target, fps: u32, hdr: bool) -> Result<Self> {
+        let pixels = if hdr {
+            DirectXPixelFormat::R16G16B16A16Float
+        } else {
+            DirectXPixelFormat::B8G8R8A8UIntNormalized
+        };
         unsafe {
             let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
             let item: GraphicsCaptureItem = match target {
@@ -79,14 +94,14 @@ impl Source {
             let device: IDirect3DDevice =
                 CreateDirect3D11DeviceFromDXGIDevice(&gpu.device.cast::<IDXGIDevice>()?)?.cast()?;
             let size = item.Size()?;
-            let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&device, PIXELS, 2, size)?;
+            let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&device, pixels, 2, size)?;
             let session = pool.CreateCaptureSession(&item)?;
             let _ = session.SetIsBorderRequired(false);
             let _ = session.SetIsCursorCaptureEnabled(true);
             // windows 11 24h2 and later stop compositing frames faster than we encode them
             let _ = session.SetMinUpdateInterval(TimeSpan { Duration: crate::ring::SECOND / fps as i64 });
             session.StartCapture()?;
-            Ok(Self { pool, session, device, size })
+            Ok(Self { pool, session, device, size, pixels })
         }
     }
 
@@ -106,7 +121,7 @@ impl Source {
             if content != self.size
                 && content.Width > 0
                 && content.Height > 0
-                && self.pool.Recreate(&self.device, PIXELS, 2, content).is_ok()
+                && self.pool.Recreate(&self.device, self.pixels, 2, content).is_ok()
             {
                 self.size = content;
             }
@@ -239,6 +254,36 @@ impl Converter {
     }
 }
 
+/// Everything between a captured frame and the encoder. On an HDR display FP16 frames are
+/// tonemapped for h.264 or written straight to P010 for hdr10; otherwise the video processor
+/// turns BGRA into NV12.
+pub enum Pipeline {
+    Sdr(Option<Tonemap>, Converter),
+    Hdr10(Pq, (u32, u32)),
+}
+
+impl Pipeline {
+    pub fn new(gpu: &Gpu, display: Display, input: (u32, u32), format: Format) -> Result<Self> {
+        let output = (format.width, format.height);
+        Ok(match format.codec {
+            Codec::Hdr10 => Pipeline::Hdr10(Pq::new(&gpu.device, output, IN_FLIGHT)?, output),
+            Codec::H264 => Pipeline::Sdr(
+                display.hdr.then(|| Tonemap::new(&gpu.device, display)).transpose()?,
+                Converter::new(gpu, input, output, format.fps)?,
+            ),
+        })
+    }
+
+    /// Letterboxes the `content` region of `frame` into the next encoder surface and returns it.
+    pub fn convert(&mut self, frame: &ID3D11Texture2D, content: (u32, u32), fps: u32) -> Result<ID3D11Texture2D> {
+        match self {
+            Pipeline::Hdr10(pq, output) => pq.convert(frame, content, letterbox(content, *output)),
+            Pipeline::Sdr(Some(tonemap), converter) => converter.convert(&tonemap.apply(frame)?, content, fps),
+            Pipeline::Sdr(None, converter) => converter.convert(frame, content, fps),
+        }
+    }
+}
+
 /// The largest centered rect with the content's aspect that fits the output, on even pixels for chroma.
 pub fn letterbox(content: (u32, u32), output: (u32, u32)) -> RECT {
     let scale = f64::min(output.0 as f64 / content.0 as f64, output.1 as f64 / content.1 as f64);
@@ -261,13 +306,14 @@ pub fn output_size(source: (u32, u32), max_height: u32) -> (u32, u32) {
 pub fn record(
     gpu: &Gpu,
     target: Target,
+    display: Display,
     choice: &Choice,
     format: Format,
     ring: &Arc<Mutex<Ring>>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let mut source = Source::start(gpu, target, format.fps)?;
-    let mut converter = Converter::new(gpu, source.size(), (format.width, format.height), format.fps)?;
+    let mut source = Source::start(gpu, target, format.fps, display.hdr)?;
+    let mut pipeline = Pipeline::new(gpu, display, source.size(), format)?;
     let mut encoder = Encoder::open(choice, &gpu.device, format)?;
     let period = Duration::from_nanos(1_000_000_000 / format.fps as u64);
     let started = Instant::now();
@@ -280,7 +326,8 @@ pub fn record(
         }
         if let Some(frame) = source.next() {
             let content = frame.ContentSize()?;
-            last = Some(converter.convert(&texture(&frame)?, (content.Width as u32, content.Height as u32), format.fps)?);
+            let content = (content.Width as u32, content.Height as u32);
+            last = Some(pipeline.convert(&texture(&frame)?, content, format.fps)?);
             let _ = frame.Close();
         }
         if let Some(texture) = &last {

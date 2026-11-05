@@ -1,5 +1,6 @@
 mod capture;
 mod encode;
+mod hdr;
 mod ring;
 mod save;
 
@@ -11,19 +12,22 @@ use std::time::Duration;
 use windows::core::{Result, BOOL, HSTRING};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_P010, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, MonitorFromPoint, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, IsWindowVisible};
 
 use capture::Target;
-use encode::Format;
+use encode::{Codec, Format};
+use hdr::Display;
 use ring::{Ring, SECOND};
 
 const USAGE: &str = "\
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
-               [--fps N] [--mbps N] [--height N] [--software] [--out FILE]
+               [--fps N] [--mbps N] [--height N] [--software] [--hdr10] [--out FILE]
 memory encoders
 memory self-test";
 
@@ -71,15 +75,23 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
 
     let gpu = capture::gpu().map_err(|e| format!("no usable gpu: {e}"))?;
     let software = args.iter().any(|a| a == "--software");
-    let choice = encode::encoders(Some(gpu.adapter))
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|c| c.hardware != software)
-        .ok_or("no h.264 encoder found")?;
-    let size = capture::Source::start(&gpu, target, fps).map_err(|e| format!("capture failed: {e}"))?.size();
+    let display = hdr::display(target.monitor()).map_err(|e| format!("can't read the display: {e}"))?;
+    let pick = |codec| -> std::result::Result<Option<encode::Choice>, String> {
+        let found = encode::encoders(codec, Some(gpu.adapter)).map_err(|e| e.to_string())?;
+        Ok(found.into_iter().find(|c| c.hardware != software))
+    };
+    let hdr10 = args.iter().any(|a| a == "--hdr10") && display.hdr;
+    let (codec, choice) = match hdr10.then(|| pick(Codec::Hdr10)).transpose()?.flatten() {
+        Some(choice) => (Codec::Hdr10, choice),
+        None => (Codec::H264, pick(Codec::H264)?.ok_or("no h.264 encoder found")?),
+    };
+    let size = capture::Source::start(&gpu, target, fps, display.hdr)
+        .map_err(|e| format!("capture failed: {e}"))?
+        .size();
     let (width, height) = capture::output_size(size, max_height);
-    let format = Format { width, height, fps, bitrate: mbps * 1_000_000 };
-    println!("{} -> {width}x{height} at {fps} fps, {mbps} Mbps, {}", describe(size), choice.name);
+    let format = Format { width, height, fps, bitrate: mbps * 1_000_000, codec };
+    println!("{}, {}", describe(size), describe_display(display, codec));
+    println!("-> {width}x{height} at {fps} fps, {mbps} Mbps, {}", choice.name);
 
     let ring = Arc::new(Mutex::new(Ring::new(buffer as i64 * SECOND)));
     let stop = Arc::new(AtomicBool::new(false));
@@ -90,7 +102,7 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         })
     };
-    let recorded = capture::record(&gpu, target, &choice, format, &ring, &stop);
+    let recorded = capture::record(&gpu, target, display, &choice, format, &ring, &stop);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = timer.join();
     recorded.map_err(|e| format!("recording failed: {e}"))?;
@@ -105,6 +117,17 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
 
 fn describe(size: (u32, u32)) -> String {
     format!("{}x{}", size.0, size.1)
+}
+
+fn describe_display(display: Display, codec: Codec) -> String {
+    match (display.hdr, codec) {
+        (false, _) => "sdr display".into(),
+        (true, Codec::H264) => format!(
+            "hdr display (sdr white {:.0} nits, peak {:.0} nits), tonemapped to sdr",
+            display.sdr_white, display.peak
+        ),
+        (true, Codec::Hdr10) => format!("hdr display (peak {:.0} nits), kept as hdr10", display.peak),
+    }
 }
 
 fn monitors() -> Vec<HMONITOR> {
@@ -144,55 +167,72 @@ fn find_window(text: &str) -> Option<HWND> {
 
 fn list_encoders() -> Result<()> {
     let gpu = capture::gpu()?;
-    for choice in encode::encoders(Some(gpu.adapter))? {
-        println!("{} {}", if choice.hardware { "hardware" } else { "software" }, choice.name);
+    for codec in [Codec::H264, Codec::Hdr10] {
+        for choice in encode::encoders(codec, Some(gpu.adapter))? {
+            let kind = if choice.hardware { "hardware" } else { "software" };
+            println!("{codec:?} {kind} {}", choice.name);
+        }
     }
     Ok(())
 }
 
 /// Runs synthetic frames through every stage after capture, on each encoder this machine has,
-/// and reads the saved file back.
+/// and reads the saved file back. Covers sdr, hdr tonemapped to sdr, and hdr10.
 fn self_test() -> Result<()> {
     let gpu = capture::gpu()?;
-    let format = Format { width: 640, height: 360, fps: 30, bitrate: 4_000_000 };
-    let frames = 2 * format.fps as i64;
     let dir = std::env::temp_dir().join(format!("memory-self-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
     let mut failures = 0;
-    for choice in encode::encoders(Some(gpu.adapter))? {
-        let kind = if choice.hardware { "hardware" } else { "software" };
-        let path = dir.join(format!("{kind}.mp4"));
-        let outcome = (|| -> Result<(u32, bool, i64)> {
-            let mut converter = capture::Converter::new(&gpu, (800, 600), (format.width, format.height), format.fps)
-                .map_err(at("converter"))?;
-            let mut encoder = encode::Encoder::open(&choice, &gpu.device, format).map_err(at("open"))?;
-            let mut ring = Ring::new(10 * SECOND);
-            for i in 0..frames {
-                let source = pattern(&gpu.device, 800, 600, i as u32).map_err(at("pattern"))?;
-                let nv12 = converter.convert(&source, (800, 600), format.fps).map_err(at("convert"))?;
-                encoder.encode(&nv12, format.time(i)).map_err(at("encode"))?.into_iter().for_each(|p| ring.push(p));
-            }
-            encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
-            save::write_mp4(&path, &ring.since(i64::MIN), format).map_err(at("save"))?;
-            read_back(&path).map_err(at("read back"))
-        })();
-        match outcome {
-            Ok((count, key, last)) if count as i64 == frames && key && last == format.time(frames - 1) => {
-                println!("ok   {kind} {}: {count} frames", choice.name)
-            }
-            Ok((count, key, last)) => {
-                failures += 1;
-                println!("FAIL {kind} {}: {count} of {frames} frames, keyframe first {key}, last at {last}", choice.name)
-            }
-            Err(e) => {
-                failures += 1;
-                println!("FAIL {kind} {}: {e}", choice.name)
+    match check_transfer(&gpu) {
+        Ok(report) => println!("ok   transfer: {report}"),
+        Err(e) => {
+            failures += 1;
+            println!("FAIL transfer: {}", e.message())
+        }
+    }
+    for (case, codec, hdr) in [("sdr", Codec::H264, false), ("tonemap", Codec::H264, true), ("hdr10", Codec::Hdr10, true)] {
+        let format = Format { width: 640, height: 360, fps: 30, bitrate: 4_000_000, codec };
+        let frames = 2 * format.fps as i64;
+        let choices = encode::encoders(codec, Some(gpu.adapter))?;
+        if choices.is_empty() {
+            println!("skip {case}: no {codec:?} encoder");
+        }
+        for choice in choices {
+            let kind = if choice.hardware { "hardware" } else { "software" };
+            let path = dir.join(format!("{case}-{kind}.mp4"));
+            let outcome = (|| -> Result<(u32, bool, i64)> {
+                let display = if hdr { TEST_DISPLAY } else { SDR_DISPLAY };
+                let mut pipeline =
+                    capture::Pipeline::new(&gpu, display, (800, 600), format).map_err(at("pipeline"))?;
+                let mut encoder = encode::Encoder::open(&choice, &gpu.device, format).map_err(at("open"))?;
+                let mut ring = Ring::new(10 * SECOND);
+                for i in 0..frames {
+                    let source = pattern(&gpu.device, 800, 600, i as u32, hdr).map_err(at("pattern"))?;
+                    let frame = pipeline.convert(&source, (800, 600), format.fps).map_err(at("convert"))?;
+                    encoder.encode(&frame, format.time(i)).map_err(at("encode"))?.into_iter().for_each(|p| ring.push(p));
+                }
+                encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
+                save::write_mp4(&path, &ring.since(i64::MIN), format).map_err(at("save"))?;
+                read_back(&path).map_err(at("read back"))
+            })();
+            match outcome {
+                Ok((count, key, last)) if count as i64 == frames && key && last == format.time(frames - 1) => {
+                    println!("ok   {case} {kind} {}: {count} frames", choice.name)
+                }
+                Ok((count, key, last)) => {
+                    failures += 1;
+                    println!("FAIL {case} {kind} {}: {count} of {frames} frames, keyframe first {key}, last at {last}", choice.name)
+                }
+                Err(e) => {
+                    failures += 1;
+                    println!("FAIL {case} {kind} {}: {e}", choice.name)
+                }
             }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
     if failures > 0 {
-        return Err(windows::core::Error::new(E_SELF_TEST, format!("{failures} encoder(s) failed")));
+        return Err(windows::core::Error::new(E_SELF_TEST, format!("{failures} check(s) failed")));
     }
     Ok(())
 }
@@ -203,35 +243,138 @@ fn at(stage: &'static str) -> impl Fn(windows::core::Error) -> windows::core::Er
 
 const E_SELF_TEST: windows::core::HRESULT = windows::core::HRESULT(0x8000_4005_u32 as i32);
 
-/// A moving bar over a gradient, so consecutive frames differ.
-fn pattern(device: &ID3D11Device, width: u32, height: u32, frame: u32) -> Result<ID3D11Texture2D> {
-    let bar = (frame * 13) % width;
-    let pixels: Vec<u8> = (0..height)
-        .flat_map(|y| (0..width).map(move |x| (x, y)))
-        .flat_map(|(x, y)| {
+const TEST_DISPLAY: Display = Display { hdr: true, sdr_white: 200.0, peak: 1000.0 };
+const SDR_DISPLAY: Display = Display { hdr: false, sdr_white: hdr::SCRGB_WHITE, peak: hdr::SCRGB_WHITE };
+const MID_GREY: u8 = 128;
+
+/// How the compositor stores an sRGB value on an HDR desktop: linear, scaled up to the sdr white level.
+fn composed(srgb: u8, display: Display) -> f32 {
+    let v = srgb as f32 / 255.0;
+    let linear = if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    linear * display.sdr_white / hdr::SCRGB_WHITE
+}
+
+/// Runs the hdr pattern through the tonemap and the PQ pass and reads back the values that matter:
+/// sdr grey keeps its value, a 250 nit highlight lands below clipping, the panel peak reaches white,
+/// and in hdr10 grey and peak sit at their PQ codes with neutral chroma.
+fn check_transfer(gpu: &capture::Gpu) -> Result<String> {
+    let source = pattern(&gpu.device, 64, 64, 0, true)?;
+    let sdr = read_texture(gpu, &hdr::Tonemap::new(&gpu.device, TEST_DISPLAY)?.apply(&source)?)?;
+    let full = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 64, bottom: 64 };
+    let p010 = read_texture(gpu, &hdr::Pq::new(&gpu.device, (64, 64), 1)?.convert(&source, (64, 64), full)?)?;
+    let byte = |x: usize, y: usize, channel: usize| sdr.0[y * sdr.1 + x * 4 + channel] as u32;
+    let sample = |offset: usize| u16::from_le_bytes([p010.0[offset], p010.0[offset + 1]]) as u32 >> 6;
+    let luma = |x: usize, y: usize| sample(y * p010.1 + x * 2);
+    let chroma = |x: usize, y: usize, channel: usize| sample((64 + y / 2) * p010.1 + (x / 2) * 4 + channel * 2);
+    // grey from the flat left half, highlight from the red ramp on the right, peak from the bar below it
+    let (grey, highlight, white) = (byte(16, 32, 1), byte(40, 10, 2), byte(40, 48, 2));
+    let (pq_grey, pq_peak) = (luma(16, 32), luma(40, 48));
+    let neutral = (chroma(16, 32, 0), chroma(16, 32, 1));
+    let code = |nits: f32| (64.0 + 876.0 * pq(nits)).round() as u32;
+    let want_grey = code(composed(MID_GREY, TEST_DISPLAY) * hdr::SCRGB_WHITE);
+    let want_peak = code(TEST_DISPLAY.peak);
+    let report = format!(
+        "sdr grey {MID_GREY} -> {grey}, 250 nits -> {highlight}, peak -> {white}; \
+         hdr10 grey y {pq_grey} (want {want_grey}) cb cr {neutral:?}, peak y {pq_peak} (want {want_peak})"
+    );
+    let good = grey.abs_diff(MID_GREY as u32) <= 2
+        && (236..255).contains(&highlight)
+        && white >= 254
+        && pq_grey.abs_diff(want_grey) <= 1
+        && pq_peak.abs_diff(want_peak) <= 1
+        && neutral.0.abs_diff(512) <= 1
+        && neutral.1.abs_diff(512) <= 1;
+    if good {
+        Ok(report)
+    } else {
+        Err(windows::core::Error::new(E_SELF_TEST, report))
+    }
+}
+
+/// SMPTE ST 2084 encode, written out separately from the shader so the check is independent
+fn pq(nits: f32) -> f32 {
+    let y = (nits / 10_000.0).powf(0.159_301_76);
+    ((0.835_937_5 + 18.851_563 * y) / (1.0 + 18.6875 * y)).powf(78.84375)
+}
+
+/// Copies a texture to the CPU and returns its rows (both planes for P010) with the row pitch.
+fn read_texture(gpu: &capture::Gpu, texture: &ID3D11Texture2D) -> Result<(Vec<u8>, usize)> {
+    unsafe {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut desc);
+        let rows = if desc.Format == DXGI_FORMAT_P010 { desc.Height * 3 / 2 } else { desc.Height } as usize;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging = None;
+        gpu.device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+        let staging = staging.expect("created");
+        gpu.context.CopyResource(&staging, texture);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let pitch = mapped.RowPitch as usize;
+        let bytes = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * rows).to_vec();
+        gpu.context.Unmap(&staging, 0);
+        Ok((bytes, pitch))
+    }
+}
+
+/// A moving bar over a gradient, so consecutive frames differ. The hdr version is scRGB FP16
+/// with sdr grey on the left half, highlights up to the panel peak on the right, and a bar at peak.
+fn pattern(device: &ID3D11Device, width: u32, height: u32, frame: u32, hdr: bool) -> Result<ID3D11Texture2D> {
+    let bar = (frame * 13 + 40) % width;
+    let (format, bytes): (DXGI_FORMAT, Vec<u8>) = if hdr {
+        let grey = composed(MID_GREY, TEST_DISPLAY);
+        let peak = TEST_DISPLAY.peak / hdr::SCRGB_WHITE;
+        let pixels = (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).flat_map(|(x, y)| {
+            let rgb = if x.abs_diff(bar) < 24 && y > height / 2 {
+                [peak; 3]
+            } else if x < width / 2 {
+                [grey; 3]
+            } else {
+                [peak * (x - width / 2) as f32 / (width / 2) as f32, 0.5, (y as f32 / height as f32).max(0.01)]
+            };
+            [rgb[0], rgb[1], rgb[2], 1.0].map(half)
+        });
+        (DXGI_FORMAT_R16G16B16A16_FLOAT, pixels.flat_map(u16::to_le_bytes).collect())
+    } else {
+        let pixels = (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).flat_map(|(x, y)| {
             if x.abs_diff(bar) < 24 {
                 [255, 255, 255, 255]
             } else {
                 [(x * 255 / width) as u8, (y * 255 / height) as u8, 96, 255]
             }
-        })
-        .collect();
+        });
+        (DXGI_FORMAT_B8G8R8A8_UNORM, pixels.collect())
+    };
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
+        // capture frames carry render target binding and the video processor depends on it
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
         MiscFlags: 0,
     };
-    let data = D3D11_SUBRESOURCE_DATA { pSysMem: pixels.as_ptr() as _, SysMemPitch: width * 4, SysMemSlicePitch: 0 };
+    let pitch = bytes.len() as u32 / height;
+    let data = D3D11_SUBRESOURCE_DATA { pSysMem: bytes.as_ptr() as _, SysMemPitch: pitch, SysMemSlicePitch: 0 };
     let mut texture = None;
     unsafe { device.CreateTexture2D(&desc, Some(&data), Some(&mut texture))? };
     Ok(texture.expect("created"))
+}
+
+/// f32 to IEEE half for the positive normal values the test pattern uses.
+fn half(value: f32) -> u16 {
+    if value <= 0.0 {
+        return 0;
+    }
+    let bits = value.to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    ((exponent.clamp(1, 30) as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
 }
 
 /// Frame count, whether the first frame is a keyframe, and the last frame's timestamp.
@@ -257,5 +400,18 @@ fn read_back(path: &std::path::Path) -> Result<(u32, bool, i64)> {
             }
         }
         Ok((count, first_key, last))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::half;
+
+    #[test]
+    fn half_matches_ieee_bit_patterns() {
+        assert_eq!(half(1.0), 0x3c00);
+        assert_eq!(half(2.5), 0x4100);
+        assert_eq!(half(0.5), 0x3800);
+        assert_eq!(half(0.0), 0);
     }
 }

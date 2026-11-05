@@ -13,12 +13,44 @@ use windows::Win32::System::Variant::VARIANT;
 
 use crate::ring::{Packet, SECOND};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    /// 8 bit bt.709, what every player and discord embed shows correctly
+    H264,
+    /// hevc main10 with the pq transfer and bt.2020 primaries
+    Hdr10,
+}
+
+impl Codec {
+    fn input(self) -> GUID {
+        match self {
+            Codec::H264 => MFVideoFormat_NV12,
+            Codec::Hdr10 => MFVideoFormat_P010,
+        }
+    }
+
+    pub fn subtype(self) -> GUID {
+        match self {
+            Codec::H264 => MFVideoFormat_H264,
+            Codec::Hdr10 => MFVideoFormat_HEVC,
+        }
+    }
+
+    fn profile(self) -> u32 {
+        match self {
+            Codec::H264 => eAVEncH264VProfile_High.0 as u32,
+            Codec::Hdr10 => eAVEncH265VProfile_Main_420_10.0 as u32,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Format {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    pub codec: Codec,
 }
 
 impl Format {
@@ -38,13 +70,13 @@ pub struct Choice {
     pub hardware: bool,
 }
 
-/// H.264 encoders on this machine, hardware ones on `adapter` first, then the in-box software encoder.
-pub fn encoders(adapter: Option<LUID>) -> Result<Vec<Choice>> {
+/// Encoders for `codec` on this machine, hardware ones on `adapter` first, then software ones.
+pub fn encoders(codec: Codec, adapter: Option<LUID>) -> Result<Vec<Choice>> {
     let mut found = Vec::new();
     for hardware in [true, false] {
         let flags = if hardware { MFT_ENUM_FLAG_HARDWARE } else { MFT_ENUM_FLAG_SYNCMFT };
-        let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
-        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+        let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: codec.input() };
+        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: codec.subtype() };
         let mut list = std::ptr::null_mut();
         let mut count = 0;
         unsafe {
@@ -143,15 +175,15 @@ impl Encoder {
 
             let output = MFCreateMediaType()?;
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            output.SetGUID(&MF_MT_SUBTYPE, &format.codec.subtype())?;
             output.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate)?;
-            output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+            output.SetUINT32(&MF_MT_MPEG2_PROFILE, format.codec.profile())?;
             describe(&output, format)?;
             transform.SetOutputType(0, &output, 0)?;
 
             let input = (0..)
                 .map_while(|i| transform.GetInputAvailableType(0, i).ok())
-                .find(|t| t.GetGUID(&MF_MT_SUBTYPE).is_ok_and(|s| s == MFVideoFormat_NV12))
+                .find(|t| t.GetGUID(&MF_MT_SUBTYPE).is_ok_and(|s| s == format.codec.input()))
                 .ok_or(windows::core::Error::from(MF_E_INVALIDMEDIATYPE))?;
             describe(&input, format)?;
             transform.SetInputType(0, &input, 0)?;
@@ -296,7 +328,7 @@ impl Encoder {
         }
     }
 
-    /// Copies an NV12 texture into a packed system memory buffer for software encoders.
+    /// Copies an NV12 or P010 texture into a packed system memory buffer for software encoders.
     fn read_back(&mut self, texture: &ID3D11Texture2D) -> Result<IMFMediaBuffer> {
         unsafe {
             let staging = match &self.staging {
@@ -318,14 +350,15 @@ impl Encoder {
             self.context.CopyResource(&staging, texture);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-            let (width, height) = (self.format.width as usize, self.format.height as usize);
+            let sample_bytes = if self.format.codec == Codec::Hdr10 { 2 } else { 1 };
+            let (width, height) = (self.format.width as usize * sample_bytes, self.format.height as usize);
             let size = width * height * 3 / 2;
             let buffer = MFCreateMemoryBuffer(size as u32)?;
             let mut target = std::ptr::null_mut();
             buffer.Lock(&mut target, None, None)?;
             let source = mapped.pData as *const u8;
             let pitch = mapped.RowPitch as usize;
-            // nv12: a full height luma plane, then a half height interleaved chroma plane
+            // a full height luma plane, then a half height interleaved chroma plane
             for row in 0..height + height / 2 {
                 std::ptr::copy_nonoverlapping(source.add(row * pitch), target.add(row * width), width);
             }
@@ -337,15 +370,20 @@ impl Encoder {
     }
 }
 
-fn describe(media: &IMFMediaType, format: Format) -> Result<()> {
+/// Size, rate and color signalling shared by the encoder types and the saved file.
+pub fn describe(media: &IMFMediaType, format: Format) -> Result<()> {
+    let (primaries, transfer, matrix) = match format.codec {
+        Codec::H264 => (MFVideoPrimaries_BT709.0, MFVideoTransFunc_709.0, MFVideoTransferMatrix_BT709.0),
+        Codec::Hdr10 => (MFVideoPrimaries_BT2020.0, MFVideoTransFunc_2084.0, MFVideoTransferMatrix_BT2020_10.0),
+    };
     unsafe {
         media.SetUINT64(&MF_MT_FRAME_SIZE, ((format.width as u64) << 32) | format.height as u64)?;
         media.SetUINT64(&MF_MT_FRAME_RATE, ((format.fps as u64) << 32) | 1)?;
         media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1 << 32) | 1)?;
         media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        media.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
-        media.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
-        media.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+        media.SetUINT32(&MF_MT_VIDEO_PRIMARIES, primaries as u32)?;
+        media.SetUINT32(&MF_MT_TRANSFER_FUNCTION, transfer as u32)?;
+        media.SetUINT32(&MF_MT_YUV_MATRIX, matrix as u32)?;
         media.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
     }
     Ok(())
@@ -368,8 +406,9 @@ fn packet(sample: &IMFSample, frame: i64) -> Result<Packet> {
     }
 }
 
-/// SPS and PPS NAL units, start codes included, from an Annex B access unit.
-pub fn parameter_sets(access_unit: &[u8]) -> Vec<u8> {
+/// Parameter set NAL units (h.264 sps and pps, hevc vps sps and pps), start codes included,
+/// from an Annex B access unit.
+pub fn parameter_sets(codec: Codec, access_unit: &[u8]) -> Vec<u8> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 <= access_unit.len() {
@@ -386,7 +425,12 @@ pub fn parameter_sets(access_unit: &[u8]) -> Vec<u8> {
         while n + 1 < starts.len() && end > start && access_unit[end - 1] == 0 {
             end -= 1;
         }
-        if start < end && matches!(access_unit[start] & 0x1f, 7 | 8) {
+        let header = access_unit.get(start).copied().unwrap_or(0);
+        let wanted = match codec {
+            Codec::H264 => matches!(header & 0x1f, 7 | 8),
+            Codec::Hdr10 => matches!((header >> 1) & 0x3f, 32..=34),
+        };
+        if start < end && wanted {
             out.extend_from_slice(&[0, 0, 0, 1]);
             out.extend_from_slice(&access_unit[start..end]);
         }
@@ -396,7 +440,7 @@ pub fn parameter_sets(access_unit: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::parameter_sets;
+    use super::{parameter_sets, Codec};
 
     #[test]
     fn keeps_only_sps_and_pps() {
@@ -406,11 +450,24 @@ mod tests {
             0, 0, 1, 0x68, 4, 5, // pps, three byte start code
             0, 0, 0, 1, 0x65, 9, 9, 9, // idr slice
         ];
-        assert_eq!(parameter_sets(&unit), [0, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x68, 4, 5]);
+        assert_eq!(parameter_sets(Codec::H264, &unit), [0, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x68, 4, 5]);
+    }
+
+    #[test]
+    fn keeps_hevc_vps_sps_and_pps() {
+        let unit = [
+            0, 0, 0, 1, 0x46, 0x01, 0x50, // access unit delimiter
+            0, 0, 0, 1, 0x40, 0x01, 7, // vps
+            0, 0, 0, 1, 0x42, 0x01, 8, // sps
+            0, 0, 0, 1, 0x44, 0x01, 9, // pps
+            0, 0, 0, 1, 0x26, 0x01, 5, // idr slice
+        ];
+        let expected = [0, 0, 0, 1, 0x40, 0x01, 7, 0, 0, 0, 1, 0x42, 0x01, 8, 0, 0, 0, 1, 0x44, 0x01, 9];
+        assert_eq!(parameter_sets(Codec::Hdr10, &unit), expected);
     }
 
     #[test]
     fn empty_without_parameter_sets() {
-        assert!(parameter_sets(&[0, 0, 1, 0x41, 7, 7]).is_empty());
+        assert!(parameter_sets(Codec::H264, &[0, 0, 1, 0x41, 7, 7]).is_empty());
     }
 }
