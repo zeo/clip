@@ -60,6 +60,9 @@ pub enum Target {
     Window(HWND),
 }
 
+// window and monitor handles are plain ids that any thread may use
+unsafe impl Send for Target {}
+
 impl Target {
     pub fn monitor(self) -> HMONITOR {
         match self {
