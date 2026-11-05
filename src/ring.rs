@@ -1,8 +1,43 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
+
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 /// media foundation time base: 100 ns ticks
 pub const SECOND: i64 = 10_000_000;
+
+/// One timeline for every stream, in ticks since `start` on the performance counter that wasapi
+/// stamps packets with and that `Instant` reads on windows.
+#[derive(Clone, Copy)]
+pub struct Clock {
+    epoch: i64,
+    pub started: Instant,
+}
+
+impl Clock {
+    pub fn start() -> Self {
+        Self { started: Instant::now(), epoch: counter() }
+    }
+
+    pub fn now(&self) -> i64 {
+        counter() - self.epoch
+    }
+
+    /// Converts a performance counter reading already in 100 ns units, as wasapi reports them.
+    pub fn at(&self, counter: i64) -> i64 {
+        counter - self.epoch
+    }
+}
+
+fn counter() -> i64 {
+    let (mut count, mut frequency) = (0, 1);
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut count);
+        let _ = QueryPerformanceFrequency(&mut frequency);
+    }
+    (count as i128 * SECOND as i128 / frequency as i128) as i64
+}
 
 #[derive(Debug)]
 pub struct Packet {
@@ -48,7 +83,9 @@ impl Ring {
     /// Packets from the last keyframe at or before `since` through the newest one.
     pub fn since(&self, since: i64) -> Vec<Arc<Packet>> {
         let start = self.keys.iter().rev().find(|&&k| k <= since).or(self.keys.front()).copied();
-        let Some(start) = start else { return Vec::new() };
+        let Some(start) = start else {
+            return Vec::new();
+        };
         self.packets.iter().skip_while(|p| p.pts < start).cloned().collect()
     }
 

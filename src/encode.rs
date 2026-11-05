@@ -100,7 +100,9 @@ pub fn encoders(codec: Codec, adapter: Option<LUID>) -> Result<Vec<Choice>> {
                 continue;
             }
             for slot in std::slice::from_raw_parts_mut(list, count as usize) {
-                let Some(activate) = slot.take() else { continue };
+                let Some(activate) = slot.take() else {
+                    continue;
+                };
                 found.push(Choice { name: friendly_name(&activate), activate, hardware });
             }
             CoTaskMemFree(Some(list as _));
@@ -392,7 +394,7 @@ pub fn describe(media: &IMFMediaType, format: Format) -> Result<()> {
     Ok(())
 }
 
-fn packet(sample: &IMFSample, frame: i64) -> Result<Packet> {
+pub fn packet(sample: &IMFSample, frame: i64) -> Result<Packet> {
     unsafe {
         let buffer = sample.ConvertToContiguousBuffer()?;
         let mut data = std::ptr::null_mut();

@@ -19,9 +19,9 @@ use windows::Win32::Graphics::Gdi::{MonitorFromWindow, HMONITOR, MONITOR_DEFAULT
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
-use crate::encode::{Choice, Codec, Encoder, Format};
+use crate::encode::{Codec, Encoder, Format};
 use crate::hdr::{Display, Pq, Tonemap};
-use crate::ring::Ring;
+use crate::ring::{Clock, Ring};
 
 #[derive(Clone)]
 pub struct Gpu {
@@ -311,20 +311,18 @@ pub fn output_size(source: (u32, u32), max_height: u32) -> (u32, u32) {
 /// Captures `target` into `ring` at a constant frame rate until `stop` is set.
 /// When the source sends nothing new the last frame repeats, so every clip is constant frame rate.
 pub fn record(
-    gpu: &Gpu,
-    target: Target,
-    display: Display,
-    choice: &Choice,
+    mut source: Source,
+    mut pipeline: Pipeline,
+    mut encoder: Encoder,
     format: Format,
+    clock: Clock,
     ring: &Arc<Mutex<Ring>>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let mut source = Source::start(gpu, target, format.fps, display.hdr)?;
-    let mut pipeline = Pipeline::new(gpu, display, source.size(), format)?;
-    let mut encoder = Encoder::open(choice, &gpu.device, format)?;
     let period = Duration::from_nanos(1_000_000_000 / format.fps as u64);
-    let started = Instant::now();
-    let mut tick: u64 = 0;
+    let started = clock.started;
+    // setup took a moment, so the first frame lands where the clock already is
+    let mut tick = (started.elapsed().as_nanos() / period.as_nanos()) as u64;
     let mut last = None;
     while !stop.load(Ordering::Relaxed) {
         let due = started + period * tick as u32;
