@@ -38,7 +38,7 @@ A process tree belongs to one track only, so nothing is heard twice.
 
 `cargo test` needs no GPU. `memory self-test` runs the tonemap, HDR10 and scaling shaders against known values. It encodes two seconds of a moving pattern with every hardware and software encoder it finds, switches HDR halfway through, muxes the result with two audio tracks and reads it back. `--live` adds the sync test.
 
-`memory sync` measures A/V sync on the real capture path. A nearly transparent window under every other window flashes six times, and a click plays at -54 dBFS with each flash. The test then finds both in the saved clip and prints how far apart they landed. It never takes focus and is safe to run mid match.
+`memory sync` measures A/V sync on the real capture path. A nearly transparent window under every other window flashes six times, and a click plays at -72 dBFS with each flash. It records at the display's refresh rate unless `--fps` says otherwise. The test then finds both in the saved clip and prints how far apart they landed. It never takes focus and is safe to run mid match.
 
 ## limits
 
@@ -46,8 +46,8 @@ A process tree belongs to one track only, so nothing is heard twice.
 - An app muted or turned down in the Windows volume mixer is muted in its track as well, because process loopback taps the stream after per-app volume.
 - Windows system sounds belong to no app process, so no track records them.
 - A launcher that started the game, Steam for example, is left out of `others`, since recording its process tree would record the game a second time.
-- Sync is measured to about one frame (17 ms at 60 fps).
-- The -54 dBFS test click may be faintly audible on a quiet system with headphones.
+- Sync is measured to one display refresh, 8 ms at 120 Hz, since a flash only reaches the clip on the frame it was shown.
+- The -72 dBFS test click could only be heard with the volume at maximum in a silent room.
 - Mastering values in HDR10 files are whatever the display driver reports.
 - Switching HDR mid recording is covered by the self-test, which swaps the display state on synthetic frames. It hasn't been tested by toggling a real display.
 

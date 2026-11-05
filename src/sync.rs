@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, Result, HSTRING};
 use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use windows::Win32::Graphics::Gdi::{
     GetStockObject, InvalidateRect, UpdateWindow, BLACK_BRUSH, GET_STOCK_OBJECT_FLAGS, HBRUSH, WHITE_BRUSH,
 };
@@ -21,9 +21,9 @@ const FIRST: Duration = Duration::from_millis(1500);
 const SPACING: Duration = Duration::from_secs(1);
 const LIT: Duration = Duration::from_millis(250);
 const SIDE: i32 = 400;
-// -54 dbfs, lost under any game yet plain against the exact silence of our own loopback
-const LOUD: i16 = 64;
-const HEARD: i16 = 32;
+// -72 dbfs, inaudible at any sane volume yet plain against the exact silence of our own loopback
+const LOUD: i16 = 8;
+const HEARD: i16 = 4;
 const CLICK: u64 = RATE as u64 / 50;
 // a sound starts a new click only after this much quiet
 const QUIET: i64 = SECOND * 3 / 10;
@@ -52,7 +52,12 @@ pub fn run(args: &[String]) -> std::result::Result<(), String> {
         let _ = go.send(clock);
         stage.join()
     };
-    let (marks, start) = crate::record_clip(args, Target::Window(window), &lanes, &out, work)?;
+    // a flash can only land on a captured frame, so capture every frame the compositor shows
+    let mut args = args.to_vec();
+    if let Some(rate) = refresh_rate().filter(|_| !args.iter().any(|a| a == "--fps")) {
+        args.extend(["--fps".into(), rate.to_string()]);
+    }
+    let (marks, start) = crate::record_clip(&args, Target::Window(window), &lanes, &out, work)?;
     let read = onsets(&out);
     let _ = std::fs::remove_file(&out);
     let marks = marks.map_err(|_| "the test window thread panicked".to_string())?;
@@ -80,6 +85,13 @@ pub fn run(args: &[String]) -> std::result::Result<(), String> {
         ms(median(&mut gap))
     );
     Ok(())
+}
+
+fn refresh_rate() -> Option<u32> {
+    let mut info = DWM_TIMING_INFO { cbSize: size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
+    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) }.ok()?;
+    let rate = info.rateRefresh;
+    (rate.uiDenominator > 0).then(|| (rate.uiNumerator as f64 / rate.uiDenominator as f64).round() as u32)
 }
 
 fn nearest(onsets: &[i64], mark: i64) -> Option<i64> {
