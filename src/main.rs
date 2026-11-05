@@ -28,7 +28,7 @@ use ring::{Clock, Ring, SECOND};
 
 const USAGE: &str = "\
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
-               [--fps N] [--mbps N] [--height N] [--software] [--hdr10] [--mic] [--out FILE]
+               [--fps N] [--mbps N] [--height N] [--software] [--hdr10] [--mic] [--app EXE]... [--out FILE]
 memory encoders
 memory self-test";
 
@@ -107,8 +107,9 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
         }
         Target::Monitor(_) => None,
     };
-    let lanes = audio::lanes(game, args.iter().any(|a| a == "--mic"));
-    println!("audio: {}", lanes.iter().map(|lane| lane.name).collect::<Vec<_>>().join(", "));
+    let apps: Vec<String> = args.windows(2).filter(|pair| pair[0] == "--app").map(|pair| pair[1].clone()).collect();
+    let lanes = audio::lanes(game, &apps, args.iter().any(|a| a == "--mic"));
+    println!("audio: {}", lanes.iter().map(|lane| lane.name.as_str()).collect::<Vec<_>>().join(", "));
 
     let span = buffer as i64 * SECOND;
     let ring = Arc::new(Mutex::new(Ring::new(span)));
