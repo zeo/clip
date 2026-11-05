@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::HMONITOR;
 /// scRGB 1.0 is defined as 80 nits
 pub const SCRGB_WHITE: f32 = 80.0;
 
-/// A monitor's brightness setup, read once per recording so the tonemap never changes mid clip.
+/// A monitor's brightness setup. The tonemap uses the fixed panel peak, so it never pumps with content.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Display {
     pub hdr: bool,
@@ -137,6 +137,8 @@ SamplerState bilinear : register(s0);
 cbuffer Crop : register(b0) {
     float2 scale;
     float shift;
+    // nits for sdr white when the frame holds sRGB values, 0 when it holds scRGB
+    float white;
 };
 
 static const float3x3 BT709_TO_BT2020 = {
@@ -146,7 +148,12 @@ static const float3x3 BT709_TO_BT2020 = {
 };
 
 float3 pq(float2 uv) {
-    float3 nits = mul(BT709_TO_BT2020, frame.SampleLevel(bilinear, uv * scale, 0).rgb) * 80;
+    float3 c = frame.SampleLevel(bilinear, uv * scale, 0).rgb;
+    if (white > 0) {
+        c = saturate(c);
+        c = (c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)) * white / 80;
+    }
+    float3 nits = mul(BT709_TO_BT2020, c) * 80;
     float3 y = pow(saturate(nits / 10000), 0.1593017578125);
     return pow((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y), 78.84375);
 }
@@ -406,7 +413,7 @@ impl Tonemap {
     }
 }
 
-/// Writes scRGB FP16 frames straight into P010 as hdr10: bt.2020 primaries, the PQ curve in
+/// Writes scRGB FP16 frames, or sRGB ones at a given sdr white, straight into P010 as hdr10: bt.2020 primaries, the PQ curve in
 /// absolute nits, limited range. Video processors are free to refuse PQ output (NVIDIA's does),
 /// so the color math and the scaling happen here. Targets rotate like the converter's.
 pub struct Pq {
@@ -464,11 +471,19 @@ impl Pq {
     }
 
     /// Scales the `content` region of `source` into `dest` (even pixels) of the next target, black around it.
-    pub fn convert(&mut self, source: &ID3D11Texture2D, content: (u32, u32), dest: RECT) -> Result<ID3D11Texture2D> {
+    /// `sdr_white` marks the source as sRGB and places its white at that many nits.
+    pub fn convert(
+        &mut self,
+        source: &ID3D11Texture2D,
+        content: (u32, u32),
+        dest: RECT,
+        sdr_white: Option<f32>,
+    ) -> Result<ID3D11Texture2D> {
         let size = size(source);
         let content = (content.0.clamp(1, size.0), content.1.clamp(1, size.1));
         let width = (dest.right - dest.left).max(2) as f32;
-        let crop = [content.0 as f32 / size.0 as f32, content.1 as f32 / size.1 as f32, 0.5 / width, 0.0];
+        let crop =
+            [content.0 as f32 / size.0 as f32, content.1 as f32 / size.1 as f32, 0.5 / width, sdr_white.unwrap_or(0.0)];
         let (texture, luma, chroma) = &self.targets[self.next];
         self.next = (self.next + 1) % self.targets.len();
         let at = |divisor: i32| {

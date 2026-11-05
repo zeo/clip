@@ -20,7 +20,7 @@ use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDe
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
 use crate::encode::{Codec, Encoder, Format};
-use crate::hdr::{Display, Filter, Pq, Scaler, Tonemap};
+use crate::hdr::{self, Display, Filter, Pq, Scaler, Tonemap};
 use crate::ring::{Clock, Ring, SECOND};
 
 #[derive(Clone)]
@@ -75,13 +75,21 @@ pub struct Source {
     device: IDirect3DDevice,
     size: SizeInt32,
     pixels: DirectXPixelFormat,
+    target: Target,
+}
+
+/// scRGB FP16 on an hdr display, otherwise windows hands over 8 bit sRGB already clipped
+fn pixels(hdr: bool) -> DirectXPixelFormat {
+    if hdr {
+        DirectXPixelFormat::R16G16B16A16Float
+    } else {
+        DirectXPixelFormat::B8G8R8A8UIntNormalized
+    }
 }
 
 impl Source {
-    /// `hdr` asks for scRGB FP16 frames, otherwise windows hands over 8 bit sRGB already clipped.
     pub fn start(gpu: &Gpu, target: Target, fps: u32, hdr: bool) -> Result<Self> {
-        let pixels =
-            if hdr { DirectXPixelFormat::R16G16B16A16Float } else { DirectXPixelFormat::B8G8R8A8UIntNormalized };
+        let pixels = pixels(hdr);
         unsafe {
             let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
             let item: GraphicsCaptureItem = match target {
@@ -98,7 +106,7 @@ impl Source {
             // windows 11 24h2 and later stop compositing frames faster than we encode them
             let _ = session.SetMinUpdateInterval(TimeSpan { Duration: SECOND / fps as i64 });
             session.StartCapture()?;
-            Ok(Self { pool, session, device, size, pixels })
+            Ok(Self { pool, session, device, size, pixels, target })
         }
     }
 
@@ -119,6 +127,15 @@ impl Source {
             }
         }
         Some(frame)
+    }
+
+    /// Switches the frame format when the display goes into or out of hdr. Frames already queued
+    /// keep the old format, and a failed switch keeps it too, so the pipeline takes either.
+    pub fn follow(&mut self, hdr: bool) {
+        let pixels = pixels(hdr);
+        if pixels != self.pixels && self.pool.Recreate(&self.device, pixels, 2, self.size).is_ok() {
+            self.pixels = pixels;
+        }
     }
 }
 
@@ -257,44 +274,75 @@ impl Converter {
 }
 
 /// Everything between a captured frame and the encoder: our own resampling to the encode size, then
-/// on an HDR display FP16 frames are tonemapped for h.264 or written straight to P010 for hdr10, and
-/// otherwise the video processor turns BGRA into NV12 one to one.
-pub enum Pipeline {
-    Sdr(Option<Tonemap>, Scaler, Converter, (u32, u32)),
-    Hdr10(Scaler, Pq, (u32, u32)),
+/// for h.264 FP16 frames are tonemapped and the video processor turns BGRA into NV12 one to one, and
+/// for hdr10 both formats go to P010, sdr frames with their white at the display's sdr white level.
+/// The display can switch hdr on or off mid recording, so each frame is converted by its own format.
+pub struct Pipeline {
+    device: ID3D11Device,
+    scaler: Scaler,
+    output: (u32, u32),
+    encode: Encode,
+    pub display: Display,
 }
+
+enum Encode {
+    Sdr(Tonemap, Converter),
+    /// nits for sdr white, the last level an hdr display reported
+    Hdr10(Pq, f32),
+}
+
+/// sdr reference white from ITU-R BT.2408, for when no hdr display has said otherwise
+const REFERENCE_WHITE: f32 = 203.0;
 
 impl Pipeline {
     pub fn new(gpu: &Gpu, display: Display, format: Format, filter: Filter) -> Result<Self> {
         let output = (format.width, format.height);
-        Ok(match format.codec {
-            Codec::Hdr10 => Pipeline::Hdr10(
-                Scaler::new(&gpu.device, filter, output, DXGI_FORMAT_R16G16B16A16_FLOAT)?,
-                Pq::new(&gpu.device, output, IN_FLIGHT)?,
-                output,
+        let (encode, middle) = match format.codec {
+            Codec::Hdr10 => {
+                let white = if display.hdr { display.sdr_white } else { REFERENCE_WHITE };
+                (Encode::Hdr10(Pq::new(&gpu.device, output, IN_FLIGHT)?, white), DXGI_FORMAT_R16G16B16A16_FLOAT)
+            }
+            Codec::H264 => (
+                Encode::Sdr(Tonemap::new(&gpu.device, display)?, Converter::new(gpu, output, output, format.fps)?),
+                DXGI_FORMAT_B8G8R8A8_UNORM,
             ),
-            Codec::H264 => Pipeline::Sdr(
-                display.hdr.then(|| Tonemap::new(&gpu.device, display)).transpose()?,
-                Scaler::new(&gpu.device, filter, output, DXGI_FORMAT_B8G8R8A8_UNORM)?,
-                Converter::new(gpu, output, output, format.fps)?,
-                output,
-            ),
+        };
+        Ok(Self {
+            device: gpu.device.clone(),
+            scaler: Scaler::new(&gpu.device, filter, output, middle)?,
+            output,
+            encode,
+            display,
         })
+    }
+
+    /// Takes on a new display state: the tonemap follows it, and hdr10 keeps the last hdr sdr white.
+    pub fn follow(&mut self, display: Display) -> Result<()> {
+        match &mut self.encode {
+            Encode::Sdr(tonemap, _) => *tonemap = Tonemap::new(&self.device, display)?,
+            Encode::Hdr10(_, white) if display.hdr => *white = display.sdr_white,
+            Encode::Hdr10(..) => {}
+        }
+        self.display = display;
+        Ok(())
     }
 
     /// Letterboxes the `content` region of `frame` into the next encoder surface and returns it.
     pub fn convert(&mut self, frame: &ID3D11Texture2D, content: (u32, u32), fps: u32) -> Result<ID3D11Texture2D> {
-        match self {
-            Pipeline::Hdr10(scaler, pq, output) => {
-                let scaled = scaler.apply(frame, content, letterbox(content, *output))?;
-                pq.convert(&scaled, *output, RECT { left: 0, top: 0, right: output.0 as i32, bottom: output.1 as i32 })
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { frame.GetDesc(&mut desc) };
+        let hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let output = self.output;
+        let dest = letterbox(content, output);
+        match &mut self.encode {
+            Encode::Hdr10(pq, white) => {
+                let scaled = self.scaler.apply(frame, content, dest)?;
+                let full = RECT { left: 0, top: 0, right: output.0 as i32, bottom: output.1 as i32 };
+                pq.convert(&scaled, output, full, (!hdr).then_some(*white))
             }
-            Pipeline::Sdr(tonemap, scaler, converter, output) => {
-                let frame = match tonemap {
-                    Some(tonemap) => tonemap.apply(frame)?,
-                    None => frame.clone(),
-                };
-                converter.convert(&scaler.apply(&frame, content, letterbox(content, *output))?, *output, fps)
+            Encode::Sdr(tonemap, converter) => {
+                let frame = if hdr { tonemap.apply(frame)? } else { frame.clone() };
+                converter.convert(&self.scaler.apply(&frame, content, dest)?, output, fps)
             }
         }
     }
@@ -344,6 +392,15 @@ pub fn record(
         let due = started + period * tick as u32 + period / 2;
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
+        }
+        // once a second, catch hdr being switched, the sdr brightness slider, or a window moving screens
+        if tick.is_multiple_of(format.fps as u64) {
+            if let Ok(now) = hdr::display(source.target.monitor()) {
+                if now != pipeline.display {
+                    source.follow(now.hdr);
+                    pipeline.follow(now)?;
+                }
+            }
         }
         let mut newest = None;
         while let Some(frame) = held.take().or_else(|| source.next()) {

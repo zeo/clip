@@ -238,7 +238,8 @@ fn list_encoders() -> Result<()> {
 }
 
 /// Runs synthetic frames through every stage after capture, on each encoder this machine has,
-/// with two synthetic audio lanes, and reads the saved file back. Covers sdr, hdr tonemapped to sdr, and hdr10.
+/// with two synthetic audio lanes, and reads the saved file back. Covers sdr, hdr tonemapped to sdr, and hdr10,
+/// each switching hdr on or off halfway.
 fn self_test() -> Result<()> {
     let gpu = capture::gpu()?;
     let dir = std::env::temp_dir().join(format!("memory-self-test-{}", std::process::id()));
@@ -277,7 +278,13 @@ fn self_test() -> Result<()> {
                     capture::Pipeline::new(&gpu, display, format, hdr::Filter::Area).map_err(at("pipeline"))?;
                 let mut encoder = encode::Encoder::open(&choice, &gpu.device, format).map_err(at("open"))?;
                 let mut ring = Ring::new(10 * SECOND);
+                // halfway through, the display switches hdr on or off
+                let switched = if hdr { SDR_DISPLAY } else { TEST_DISPLAY };
                 for i in 0..frames {
+                    if i == frames / 2 {
+                        pipeline.follow(switched).map_err(at("switch hdr"))?;
+                    }
+                    let hdr = hdr != (i >= frames / 2);
                     let source = pattern(&gpu.device, 800, 600, i as u32, hdr).map_err(at("pattern"))?;
                     let frame = pipeline.convert(&source, (800, 600), format.fps).map_err(at("convert"))?;
                     encoder
@@ -380,12 +387,18 @@ fn check_scale(gpu: &capture::Gpu) -> Result<String> {
 
 /// Runs the hdr pattern through the tonemap and the PQ pass and reads back the values that matter:
 /// sdr grey keeps its value, a 250 nit highlight lands below clipping, the panel peak reaches white,
-/// and in hdr10 grey and peak sit at their PQ codes with neutral chroma.
+/// and in hdr10 grey and peak sit at their PQ codes with neutral chroma. Plain sRGB grey, as frames
+/// come once hdr is switched off, must land on the same hdr10 code as the composed grey.
 fn check_transfer(gpu: &capture::Gpu) -> Result<String> {
     let source = pattern(&gpu.device, 64, 64, 0, true)?;
     let sdr = read_texture(gpu, &hdr::Tonemap::new(&gpu.device, TEST_DISPLAY)?.apply(&source)?)?;
-    let full = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 64, bottom: 64 };
-    let p010 = read_texture(gpu, &hdr::Pq::new(&gpu.device, (64, 64), 1)?.convert(&source, (64, 64), full)?)?;
+    let full = RECT { left: 0, top: 0, right: 64, bottom: 64 };
+    let mut pq_pass = hdr::Pq::new(&gpu.device, (64, 64), 1)?;
+    let p010 = read_texture(gpu, &pq_pass.convert(&source, (64, 64), full, None)?)?;
+    let flat =
+        upload(&gpu.device, 64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, &[MID_GREY, MID_GREY, MID_GREY, 255].repeat(64 * 64))?;
+    let plain = read_texture(gpu, &pq_pass.convert(&flat, (64, 64), full, Some(TEST_DISPLAY.sdr_white))?)?;
+    let plain_grey = u16::from_le_bytes([plain.0[32 * plain.1 + 32], plain.0[32 * plain.1 + 33]]) as u32 >> 6;
     let byte = |x: usize, y: usize, channel: usize| sdr.0[y * sdr.1 + x * 4 + channel] as u32;
     let sample = |offset: usize| u16::from_le_bytes([p010.0[offset], p010.0[offset + 1]]) as u32 >> 6;
     let luma = |x: usize, y: usize| sample(y * p010.1 + x * 2);
@@ -399,12 +412,14 @@ fn check_transfer(gpu: &capture::Gpu) -> Result<String> {
     let want_peak = code(TEST_DISPLAY.peak);
     let report = format!(
         "sdr grey {MID_GREY} -> {grey}, 250 nits -> {highlight}, peak -> {white}; \
-         hdr10 grey y {pq_grey} (want {want_grey}) cb cr {neutral:?}, peak y {pq_peak} (want {want_peak})"
+         hdr10 grey y {pq_grey} (want {want_grey}) cb cr {neutral:?}, peak y {pq_peak} (want {want_peak}), \
+         sdr grey into hdr10 y {plain_grey}"
     );
     let good = grey.abs_diff(MID_GREY as u32) <= 2
         && (236..255).contains(&highlight)
         && white >= 254
         && pq_grey.abs_diff(want_grey) <= 1
+        && plain_grey.abs_diff(want_grey) <= 1
         && pq_peak.abs_diff(want_peak) <= 1
         && neutral.0.abs_diff(512) <= 1
         && neutral.1.abs_diff(512) <= 1;
