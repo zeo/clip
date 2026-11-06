@@ -73,7 +73,7 @@
 </script>
 
 <div class="thumb" use:watch>
-  {#if shown}<img src={convertFileSrc(shown)} alt="" draggable="false" />{:else if failed}<span class="thumb-none">no preview</span>{/if}
+  {#if shown}<img src={convertFileSrc(shown)} alt="" draggable="false" />{:else if failed}<span class="thumb-none">No preview</span>{/if}
   {#if live}
     <!-- svelte-ignore a11y_media_has_caption -->
     <video src={convertFileSrc(clip.path)} autoplay muted loop></video>

@@ -4,7 +4,12 @@
   import Thumb from './Thumb.svelte';
   import { at, day, size, title, type Clip } from './types';
 
-  let { clips, onopen, showApp = true }: { clips: Clip[]; onopen: (clip: Clip) => void; showApp?: boolean } = $props();
+  let {
+    clips,
+    onopen,
+    showApp = true,
+    grouped = true
+  }: { clips: Clip[]; onopen: (clip: Clip) => void; showApp?: boolean; grouped?: boolean } = $props();
   let hovered = $state<string | null>(null);
   let error = $state('');
   const selected = new SvelteSet<string>();
@@ -13,8 +18,9 @@
   const picked = $derived(clips.filter((clip) => selected.has(clip.path)));
   const allStarred = $derived(picked.length > 0 && picked.every((clip) => clip.starred));
 
-  // clips come newest first and each session's clips sit together in that order
+  // clips come newest first and each session's clips sit together in that order, unless sorted otherwise
   const sessions = $derived.by(() => {
+    if (!grouped) return clips.length > 0 ? [clips] : [];
     const groups = new Map<number, Clip[]>();
     for (const clip of clips) {
       const group = groups.get(clip.session);
@@ -60,11 +66,13 @@
     {@const newest = session[0]}
     {@const oldest = session[session.length - 1]}
     <section class="session">
-      <h3 class="rule-head session-head">
-        {#if showApp}<span class="proper session-app">{newest.app}</span>{/if}
-        <span class:session-app={!showApp}>{day(oldest.modified)} {at(oldest.modified)}{newest !== oldest ? ` to ${at(newest.modified)}` : ''}</span>
-        <span class="session-count">{session.length} {session.length === 1 ? 'clip' : 'clips'}</span>
-      </h3>
+      {#if grouped}
+        <h3 class="session-head">
+          {#if showApp}<span>{newest.app}</span>{/if}
+          <span class:session-when={showApp}>{day(oldest.modified)} {at(oldest.modified)}{newest !== oldest ? ` to ${at(newest.modified)}` : ''}</span>
+          <span class="mono">{session.length} {session.length === 1 ? 'clip' : 'clips'}</span>
+        </h3>
+      {/if}
       <ul class="grid" class:picking={picked.length > 0}>
         {#each session as clip (clip.path)}
           <li
@@ -78,16 +86,16 @@
               onclick={(e) => (picked.length > 0 || e.shiftKey || e.ctrlKey ? pick(clip, e) : onopen(clip))}
             >
               <Thumb {clip} live={hovered === clip.path} />
-              <span class="clip-name proper">{title(clip)}</span>
-              <span class="clip-meta mono proper">{size(clip.bytes)}</span>
+              <span class="clip-name">{title(clip)}</span>
+              <span class="clip-meta mono">{size(clip.bytes)}</span>
             </button>
-            <button class="pick" aria-pressed={selected.has(clip.path)} aria-label="select" onclick={(e) => pick(clip, e)}>
+            <button class="pick" aria-pressed={selected.has(clip.path)} aria-label="Select" onclick={(e) => pick(clip, e)}>
               <svg viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" /></svg>
             </button>
             <button
               class="star"
               aria-pressed={clip.starred}
-              aria-label="star"
+              aria-label="Star"
               onclick={() => act('star', { paths: [clip.path], on: !clip.starred })}
             >
               <svg viewBox="0 0 16 16"><path d="M8 1.6l1.9 4 4.3.5-3.2 3 .9 4.3L8 11.2l-3.9 2.2.9-4.3-3.2-3 4.3-.5z" /></svg>
@@ -98,14 +106,14 @@
     </section>
   {/each}
   {#if picked.length > 0}
-    <div class="selection" role="toolbar" aria-label="selected clips">
+    <div class="selection" role="toolbar" aria-label="Selected clips">
       <span class="mono">{picked.length} selected, {size(picked.reduce((total, clip) => total + clip.bytes, 0))}</span>
       <span class="grow"></span>
-      <button class="btn" onclick={() => act('star', { paths: picked.map((clip) => clip.path), on: !allStarred })}>
-        {allStarred ? 'unstar' : 'star'}
+      <button class="gel" onclick={() => act('star', { paths: picked.map((clip) => clip.path), on: !allStarred })}>
+        {allStarred ? 'Unstar' : 'Star'}
       </button>
-      <button class="btn danger" onclick={remove}>delete</button>
-      <button class="btn ghost" onclick={() => selected.clear()}>clear <kbd>esc</kbd></button>
+      <button class="gel danger" onclick={remove}>Delete</button>
+      <button class="gel" onclick={() => selected.clear()}>Clear <kbd>Esc</kbd></button>
     </div>
   {/if}
 </div>

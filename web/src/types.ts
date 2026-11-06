@@ -10,6 +10,7 @@ export type Settings = {
   folder: string;
   startWithWindows: boolean;
   cap: number;
+  steamgriddb: string;
 };
 
 export type Status = { recording: boolean; app: string; message: string };
@@ -59,8 +60,8 @@ export function at(ms: number): string {
 export function day(ms: number): string {
   const start = new Date();
   start.setHours(0, 0, 0, 0);
-  if (ms >= start.getTime()) return 'today';
-  if (ms >= start.getTime() - 864e5) return 'yesterday';
+  if (ms >= start.getTime()) return 'Today';
+  if (ms >= start.getTime() - 864e5) return 'Yesterday';
   return date.format(ms);
 }
 
@@ -83,4 +84,24 @@ export function games(clips: Clip[]): Game[] {
 
 export function sessionCount(clips: Clip[]): number {
   return new Set(clips.map((clip) => clip.session)).size;
+}
+
+export type Query = { show: 'all' | 'starred' | 'today' | 'week'; sort: 'newest' | 'longest' | 'largest'; search: string };
+
+export function choose(clips: Clip[], query: Query): Clip[] {
+  const since = { all: 0, starred: 0, today: new Date().setHours(0, 0, 0, 0), week: Date.now() - 7 * 864e5 }[query.show];
+  const words = query.search.trim().toLowerCase();
+  const kept = clips.filter(
+    (clip) =>
+      clip.modified >= since &&
+      (query.show !== 'starred' || clip.starred) &&
+      (!words || `${title(clip)} ${clip.name} ${clip.app}`.toLowerCase().includes(words))
+  );
+  if (query.sort === 'longest') kept.sort((a, b) => b.seconds - a.seconds);
+  if (query.sort === 'largest') kept.sort((a, b) => b.bytes - a.bytes);
+  return kept;
+}
+
+export function sentence(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
