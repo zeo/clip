@@ -63,8 +63,16 @@ pub fn lanes(game: Option<u32>, apps: &[String], mic: bool) -> Vec<Lane> {
     if let Some(pid) = game {
         lanes.push(Lane { name: "game".into(), source: Source::Process(pid) });
     }
+    let processes = Processes::snapshot();
+    // the game's own sound is already on its track, a second lane for the same exe would stay silent
+    let recorded = game.and_then(|pid| processes.0.get(&pid)).map(|(_, name)| name.as_str());
     let discord: Vec<String> = DISCORD.map(String::from).into();
-    let voice = !Processes::snapshot().roots(&discord).is_empty();
+    let voice = !recorded.is_some_and(|name| DISCORD.contains(&name)) && !processes.roots(&discord).is_empty();
+    let apps: Vec<String> = apps
+        .iter()
+        .map(|app| app.to_ascii_lowercase().trim_end_matches(".exe").to_string())
+        .filter(|name| recorded != Some(format!("{name}.exe").as_str()))
+        .collect();
     // exclude mode carves out only one tree, so it can stand in for the rest only when no other lane claims one
     let rest =
         if voice || !apps.is_empty() { Source::Rest } else { Source::Except(game.unwrap_or_else(std::process::id)) };
@@ -72,14 +80,32 @@ pub fn lanes(game: Option<u32>, apps: &[String], mic: bool) -> Vec<Lane> {
     if voice {
         lanes.push(Lane { name: "voice".into(), source: Source::Named(discord) });
     }
-    for app in apps {
-        let name = app.to_ascii_lowercase().trim_end_matches(".exe").to_string();
+    for name in apps {
         lanes.push(Lane { source: Source::Named(vec![format!("{name}.exe")]), name });
     }
     if mic {
         lanes.push(Lane { name: "mic".into(), source: Source::Microphone });
     }
     lanes
+}
+
+/// The lowercase exe names of apps holding an audio session, Discord aside since it always gets
+/// the voice track.
+pub fn playing() -> Result<Vec<String>> {
+    // whatever thread asks, the session api wants com, and an apartment already set up is fine too
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let pids = Sessions::new(Arc::new(AtomicBool::new(false)))?.pids()?;
+    let processes = Processes::snapshot();
+    let own = std::process::id();
+    let mut names: Vec<String> = pids
+        .into_iter()
+        .filter(|&pid| pid != own)
+        .filter_map(|pid| processes.0.get(&pid).map(|(_, name)| name.clone()))
+        .filter(|name| !DISCORD.contains(&name.as_str()))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
 }
 
 /// Every running process's parent and lowercase exe name.

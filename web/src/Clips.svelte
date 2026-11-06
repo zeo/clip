@@ -3,7 +3,7 @@
   import Thumb from './Thumb.svelte';
   import { size, type Clip } from './types';
 
-  let { clips, buffer }: { clips: Clip[]; buffer: number } = $props();
+  let { clips, app, buffer }: { clips: Clip[]; app: string | null; buffer: number } = $props();
   let playing = $state<string | null>(null);
   let error = $state('');
   const current = $derived(clips.find((clip) => clip.path === playing) ?? null);
@@ -21,7 +21,7 @@
 
 <div class="view">
   <div class="view-head">
-    <h1>clips</h1>
+    <h1 class:proper={app !== null}>{app ?? 'clips'}</h1>
     <p class="view-sub">{clips.length} saved, newest first</p>
   </div>
 
@@ -41,7 +41,7 @@
   {#if error}<p class="form-error">{error}</p>{/if}
 
   {#if clips.length === 0}
-    <p class="empty">nothing saved yet. press alt+f9 and the last {buffer} s land here.</p>
+    <p class="empty">nothing saved yet. press alt+f9 in any app and its last {buffer} s land here.</p>
   {:else}
     <ul class="grid">
       {#each clips as clip (clip.path)}
@@ -55,6 +55,7 @@
             <Thumb path={clip.path} />
             <span class="clip-name">{when.format(clip.modified)}</span>
             <span class="clip-meta mono proper">{size(clip.bytes)}</span>
+            {#if app === null}<span class="clip-app proper">{clip.app}</span>{/if}
           </button>
         </li>
       {/each}

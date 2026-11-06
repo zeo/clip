@@ -5,17 +5,18 @@ export type Settings = {
   mbps: number;
   hdr10: boolean;
   mic: boolean;
+  apps: string[];
   folder: string;
   startWithWindows: boolean;
 };
 
-export type Status = { recording: boolean; message: string };
+export type Status = { recording: boolean; app: string; message: string };
 
-export type Clip = { path: string; name: string; bytes: number; modified: number };
+export type Clip = { path: string; app: string; name: string; bytes: number; modified: number };
 
-// desktop and voice tracks at 192 kbps each, plus the mic when it's on
+// the app and everything else at 192 kbps each, plus every app split out and the mic when it's on
 export function ramMB(s: Settings): number {
-  const tracks = 2 + (s.mic ? 1 : 0);
+  const tracks = 2 + s.apps.length + (s.mic ? 1 : 0);
   return Math.round((s.buffer * (s.mbps * 1e6 + tracks * 192e3)) / 8 / 1e6);
 }
 

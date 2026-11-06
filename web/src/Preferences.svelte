@@ -9,6 +9,8 @@
   let saved = $state('');
   let error = $state('');
   let busy = $state(false);
+  let playing = $state<string[]>([]);
+  const choices = $derived([...new Set([...playing, ...(draft?.apps ?? [])])].sort());
   const changed = $derived(draft !== null && JSON.stringify(draft) !== saved);
 
   const presets = [
@@ -25,7 +27,21 @@
     const s = await invoke<Settings>('settings');
     saved = JSON.stringify(s);
     draft = s;
+    await listPlaying();
   });
+
+  async function listPlaying() {
+    try {
+      playing = await invoke<string[]>('audio_apps');
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function split(exe: string, on: boolean) {
+    if (!draft) return;
+    draft.apps = on ? [...draft.apps, exe] : draft.apps.filter((app) => app !== exe);
+  }
 
   async function pickFolder() {
     if (!draft) return;
@@ -108,11 +124,23 @@
     </label>
 
     <h3 class="rule-head">audio</h3>
-    <p class="form-hint">desktop sound and discord always get their own tracks</p>
+    <p class="form-hint">the recorded app, everything else and discord always get a track each. apps switched on here get one too</p>
+    <div class="apps">
+      {#each choices as exe (exe)}
+        <label class="toggle">
+          <input type="checkbox" checked={draft.apps.includes(exe)} onchange={(e) => split(exe, e.currentTarget.checked)} />
+          <span class="switch"></span>
+          <span class="proper mono">{exe}</span>
+        </label>
+      {:else}
+        <p class="form-hint">no app is playing sound right now</p>
+      {/each}
+    </div>
+    <div class="btn-row"><button class="btn ghost" onclick={listPlaying}>look again</button></div>
     <label class="toggle">
       <input type="checkbox" bind:checked={draft.mic} />
       <span class="switch"></span>
-      <span>record the default microphone on a third track</span>
+      <span>record the default microphone on its own track</span>
     </label>
 
     <h3 class="rule-head">files</h3>

@@ -9,10 +9,18 @@
 
   const win = getCurrentWindow();
   let view = $state<'clips' | 'settings'>('clips');
-  let status = $state<Status>({ recording: false, message: 'starting' });
+  let status = $state<Status>({ recording: false, app: '', message: 'starting' });
   let settings = $state<Settings | null>(null);
   let clips = $state<Clip[]>([]);
   let first = $state(false);
+  let app = $state<string | null>(null);
+  // clips arrive newest first, so apps come out in order of their latest clip
+  const apps = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const clip of clips) counts.set(clip.app, (counts.get(clip.app) ?? 0) + 1);
+    return [...counts];
+  });
+  const shown = $derived(app === null ? clips : clips.filter((clip) => clip.app === app));
 
   async function refresh() {
     [settings, clips] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
@@ -62,6 +70,7 @@
         <h2>buffer</h2>
         <span class="module-meta" class:live={status.recording}>{status.recording ? 'live' : 'off'}</span>
       </div>
+      {#if status.recording}<p class="buffer-app proper">{status.app}</p>{/if}
       <p class="buffer-note" class:err={!status.recording && status.message !== 'starting'}>{status.message}</p>
       <button class="btn primary wide" disabled={!status.recording} onclick={() => invoke('save_clip')}>
         save clip <kbd>alt+f9</kbd>
@@ -82,11 +91,28 @@
         </button>
       </div>
     </section>
+    {#if view === 'clips' && apps.length > 0}
+      <section class="module">
+        <div class="module-head"><span class="module-index">C</span><h2>apps</h2></div>
+        <div class="tasks" role="radiogroup" aria-label="app">
+          <button class="nav-item app" role="radio" aria-checked={app === null} onclick={() => (app = null)}>
+            <span>all</span>
+            <span class="nav-item-count">{clips.length}</span>
+          </button>
+          {#each apps as [name, count] (name)}
+            <button class="nav-item app" role="radio" aria-checked={app === name} onclick={() => (app = name)}>
+              <span class="proper app-name">{name}</span>
+              <span class="nav-item-count">{count}</span>
+            </button>
+          {/each}
+        </div>
+      </section>
+    {/if}
   </aside>
 
   <main class="stage">
     {#if view === 'clips'}
-      <Clips {clips} buffer={settings?.buffer ?? 30} />
+      <Clips clips={shown} {app} buffer={settings?.buffer ?? 30} />
     {:else}
       <Preferences {first} onapplied={applied} />
     {/if}

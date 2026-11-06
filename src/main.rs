@@ -4,6 +4,7 @@ mod app;
 mod audio;
 mod capture;
 mod encode;
+mod focus;
 use hdrkit as hdr;
 mod ring;
 mod save;

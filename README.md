@@ -2,7 +2,7 @@
 
 A game clipper for Windows 11 that keeps the last stretch of play in RAM and writes it out on demand. Nothing is injected into the game: video comes from Windows Graphics Capture and audio from per-process loopback, so anti-cheat has nothing to object to.
 
-Started with no arguments, it sits in the tray and keeps the last 30 seconds of the primary monitor, with desktop and Discord audio. Alt+F9, or save clip in the tray menu, writes them to `Videos\memory`, with a beep once the file is written. The window, opened from the tray, sets the buffer length, quality, HDR, mic, folder and start with Windows, and lists saved clips with a player. The editor and game API auto-clips come later. The same exe is also a command line recorder:
+Started with no arguments, it sits in the tray and records whichever app has focus: that app's window, with its sound on a track of its own. Alt+F9, or save clip in the tray menu, writes the last 30 seconds to `Videos\memory\<app>`, with a beep once the file is written. The window, opened from the tray or by starting memory again, sets the buffer length, quality, HDR, mic, the apps that get their own audio track, the folder and start with Windows. It lists saved clips with a player, grouped by app. The editor and game API auto-clips come later. The same exe is also a command line recorder:
 
 ```
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
@@ -15,6 +15,14 @@ memory self-test [--live]
 `capture` records for `--for` seconds (10 by default) and saves the last `--buffer` seconds (30) to `--out` (`clip.mp4`). The default output is 1080p60 H.264 at 20 Mbps. Frames are scaled on the GPU with an area filter and encoded by the GPU's Media Foundation encoder: NVENC, AMF or QSV. Packets sit in a ring that drops whole one-second GOPs, so every clip starts on a keyframe. Saving copies packets into the MP4 without re-encoding.
 
 `encoders` lists the H.264 and HEVC Main10 encoders, hardware and software, that Media Foundation offers on the GPU memory captures with.
+
+## following the app
+
+The tray app looks at the focused window four times a second. Each app is named by its exe's file description, so `cs2.exe` lands in `Counter-Strike 2`, or by the exe name when it has none. Recording moves to a new app once it has kept focus for a second, so alt-tabbing past a window doesn't restart anything. The app just left keeps recording in the background for a minute. Alt-tab back within that minute and its buffer is whole, even with Alt+F9 pressed the moment it has focus again. While both run, the buffer takes twice the RAM settings shows.
+
+The desktop, taskbar, start menu, minimized windows, tool windows and memory's own window are skipped. When the recorded window closes, or no app has had focus yet, memory records the primary monitor and saves to `desktop`.
+
+Settings lists the apps playing sound right now. Each one switched on gets its own track in every clip, the way OBS adds an application audio capture source, and is left out of `others`. While that app is the one being recorded, its sound stays on `game` and it gets no second track.
 
 ## hdr
 
@@ -29,7 +37,7 @@ Each source gets its own AAC track (192 kbps) on the video's clock:
 - `game`: the captured window's process and everything it launched
 - `others`: every other app playing sound (`desktop` when a whole monitor is captured)
 - `voice`: Discord, when it's running
-- one track per `--app EXE`
+- one track per `--app EXE`, or per app switched on in settings, named after the exe
 - `mic`, with `--mic`
 
 A process belongs to one track only, so nothing is heard twice. With no `voice` or `--app` track, `others` is a single capture of everything outside the game, so it also records Windows system sounds and the launcher that started the game.
@@ -44,6 +52,8 @@ Windows only gives a per-app capture the app's own sound and that of its direct 
 
 ## limits
 
+- Store (UWP) apps sit inside an Application Frame Host window. memory names the clip folder after that host and puts the app's sound in `others`, not `game`. Untested.
+- Apps running as administrator are untested: Windows may refuse capture and per-app audio to a non-elevated memory.
 - AMD (AMF) and Intel (QSV) encoders are untested. The only GPU here is NVIDIA, so the software encoder and WARP stand in for them.
 - An app muted or turned down in the Windows volume mixer is muted in its track as well, because process loopback taps the stream after per-app volume.
 - With a `voice` or `--app` track running, Windows system sounds are left out: their audio session reports no process, so there is nothing to open a per-app capture on.
