@@ -37,12 +37,7 @@ pub fn tracks(path: &Path) -> std::result::Result<Vec<(String, Vec<u8>)>, String
 fn decode_tracks(path: &Path) -> Result<Vec<Vec<u8>>> {
     unsafe {
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
-        let streams: Vec<u32> = (0..)
-            .map_while(|i| reader.GetCurrentMediaType(i).ok().map(|media| (i, media)))
-            .filter(|(_, media)| media.GetGUID(&MF_MT_MAJOR_TYPE).is_ok_and(|major| major == MFMediaType_Audio))
-            .map(|(i, _)| i)
-            .collect();
-        streams
+        audio_streams(&reader, path)?
             .iter()
             .map(|&stream| {
                 reader.SetCurrentMediaType(stream, None, &audio_type(MFAudioFormat_PCM)?)?;
@@ -58,6 +53,73 @@ fn decode_tracks(path: &Path) -> Result<Vec<Vec<u8>>> {
             })
             .collect()
     }
+}
+
+/// The reader's audio streams in the file's track order. The mpeg-4 source numbers its streams in
+/// another order than the file's tracks (reversed on windows 11), so each stream is put back in
+/// its track's place by the frame sizes it carries.
+pub unsafe fn audio_streams(reader: &IMFSourceReader, path: &Path) -> Result<Vec<u32>> {
+    let found: Vec<u32> = (0..)
+        .map_while(|i| reader.GetCurrentMediaType(i).ok().map(|media| (i, media)))
+        .filter(|(_, media)| media.GetGUID(&MF_MT_MAJOR_TYPE).is_ok_and(|major| major == MFMediaType_Audio))
+        .map(|(i, _)| i)
+        .collect();
+    let tracks = crate::save::frame_sizes(path).unwrap_or_default();
+    Ok(in_track_order(&found, &stream_frame_sizes(reader, &found)?, &tracks))
+}
+
+/// The compressed size of every frame of each stream, read in one pass without decoding.
+unsafe fn stream_frame_sizes(reader: &IMFSourceReader, streams: &[u32]) -> Result<Vec<Vec<u32>>> {
+    reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+    for &stream in streams {
+        reader.SetStreamSelection(stream, true)?;
+    }
+    let mut sizes = vec![Vec::new(); streams.len()];
+    let mut ended = 0;
+    while ended < streams.len() {
+        let (mut index, mut flags, mut sample) = (0, 0, None);
+        reader.ReadSample(MF_SOURCE_READER_ANY_STREAM.0 as u32, 0, Some(&mut index), Some(&mut flags), None, Some(&mut sample))?;
+        if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
+            return Err(E_FAIL.into());
+        }
+        let Some(lane) = streams.iter().position(|&stream| stream == index) else { continue };
+        if let Some(sample) = sample {
+            sizes[lane].push(sample.GetTotalLength()?);
+        }
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            ended += 1;
+        }
+    }
+    Ok(sizes)
+}
+
+/// The streams reordered so the nth is the one whose frames match the file's nth audio track.
+/// Streams that match no track fill the places left, and tracks with the same frames are
+/// interchangeable.
+fn in_track_order(streams: &[u32], seen: &[Vec<u32>], tracks: &[Vec<u32>]) -> Vec<u32> {
+    let mut taken = vec![false; tracks.len().max(streams.len())];
+    let matched: Vec<Option<usize>> = seen
+        .iter()
+        .map(|frames| {
+            let track = (0..tracks.len()).find(|&track| !taken[track] && tracks[track] == *frames)?;
+            taken[track] = true;
+            Some(track)
+        })
+        .collect();
+    let mut placed: Vec<(usize, u32)> = matched
+        .into_iter()
+        .zip(streams)
+        .map(|(track, &stream)| {
+            let track = track.unwrap_or_else(|| {
+                let free = taken.iter().position(|taken| !taken).unwrap_or(0);
+                taken[free] = true;
+                free
+            });
+            (track, stream)
+        })
+        .collect();
+    placed.sort_unstable();
+    placed.into_iter().map(|(_, stream)| stream).collect()
 }
 
 pub fn write_wav(path: &Path, pcm: &[u8]) -> std::io::Result<()> {
@@ -338,6 +400,15 @@ fn trim_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streams_go_back_to_their_tracks_by_frame_sizes() {
+        let tracks = [vec![9, 8, 7], vec![6, 6, 6], vec![5, 4, 3]];
+        let seen = [tracks[2].clone(), tracks[1].clone(), tracks[0].clone()];
+        assert_eq!(in_track_order(&[1, 2, 3], &seen, &tracks), [3, 2, 1]);
+        assert_eq!(in_track_order(&[1, 2], &[vec![1], vec![2]], &[]), [1, 2]);
+        assert_eq!(in_track_order(&[4, 5], &[vec![1], tracks[0].clone()], &tracks), [5, 4]);
+    }
 
     #[test]
     fn a_longer_cut_gets_a_lower_bitrate_and_then_a_smaller_picture() {

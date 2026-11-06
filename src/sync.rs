@@ -304,7 +304,7 @@ pub fn onsets(path: &std::path::Path) -> Result<(Vec<i64>, Vec<i64>)> {
     unsafe {
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
         let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-        let sound = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+        let sound = *crate::export::audio_streams(&reader, path)?.first().ok_or(E_FAIL)?;
         let nv12 = MFCreateMediaType()?;
         nv12.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         nv12.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;

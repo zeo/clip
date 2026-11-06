@@ -184,13 +184,40 @@ pub struct Probe {
 }
 
 pub fn probe(path: &Path) -> std::io::Result<Probe> {
+    read_moov(&moov_of(path)?).ok_or_else(invalid)
+}
+
+/// Every audio track's frame sizes in track order, which tell its stream apart in a demuxer that
+/// lists the tracks in another order.
+pub fn frame_sizes(path: &Path) -> std::io::Result<Vec<Vec<u32>>> {
+    read_frame_sizes(&moov_of(path)?).ok_or_else(invalid)
+}
+
+fn moov_of(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let (at, size) = moov(&mut file, len)?;
     let mut data = vec![0; size as usize];
     file.seek(SeekFrom::Start(at))?;
     file.read_exact(&mut data)?;
-    read_moov(&data).ok_or_else(invalid)
+    Ok(data)
+}
+
+fn read_frame_sizes(data: &[u8]) -> Option<Vec<Vec<u32>>> {
+    let u32_at = |data: &[u8], at: usize| Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?));
+    let mut tracks = Vec::new();
+    for (kind, trak) in boxes(child(data, &[b"moov"])?)? {
+        if &kind != b"trak" || child(trak, &[b"mdia", b"hdlr"])?.get(8..12)? != b"soun" {
+            continue;
+        }
+        let stsz = child(trak, &[b"mdia", b"minf", b"stbl", b"stsz"])?;
+        let (size, count) = (u32_at(stsz, 4)?, u32_at(stsz, 8)? as usize);
+        tracks.push(match size {
+            0 => (0..count).map(|i| u32_at(stsz, 12 + 4 * i)).collect::<Option<_>>()?,
+            size => vec![size; count],
+        });
+    }
+    Some(tracks)
 }
 
 fn read_moov(data: &[u8]) -> Option<Probe> {
