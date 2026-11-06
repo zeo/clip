@@ -174,11 +174,14 @@ pub fn renamed(path: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(to)
 }
 
-/// Moves a clip to the recycle bin.
-pub fn recycle(path: &Path) -> Result<(), String> {
+/// Moves clips to the recycle bin in one operation, so one undo brings them all back.
+pub fn recycle(paths: &[PathBuf]) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
+    if paths.is_empty() {
+        return Ok(());
+    }
     // shell file operations take a list of paths, each ending in a nul and the list in another
-    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
+    let from: Vec<u16> = paths.iter().flat_map(|path| path.as_os_str().encode_wide().chain([0])).chain([0]).collect();
     let mut operation = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: PCWSTR(from.as_ptr()),
@@ -187,7 +190,13 @@ pub fn recycle(path: &Path) -> Result<(), String> {
     };
     match unsafe { SHFileOperationW(&mut operation) } {
         0 if !operation.fAnyOperationsAborted.as_bool() => Ok(()),
-        code => Err(format!("couldn't move {} to the recycle bin ({code:#x})", path.display())),
+        code => {
+            let what = match paths {
+                [path] => path.display().to_string(),
+                _ => format!("{} clips", paths.len()),
+            };
+            Err(format!("couldn't move {what} to the recycle bin ({code:#x})"))
+        }
     }
 }
 

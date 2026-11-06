@@ -630,9 +630,9 @@ fn marked(shared: &Shared, change: impl FnOnce(&mut Marks, &Path)) -> Result<(),
 }
 
 #[tauri::command]
-fn star(app: AppHandle, shared: State<Shared>, path: PathBuf, on: bool) -> Result<(), String> {
-    clip_in_folder(&shared, &path)?;
-    marked(&shared, |marks, folder| marks.star(folder, &path, on))?;
+fn star(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>, on: bool) -> Result<(), String> {
+    paths.iter().try_for_each(|path| clip_in_folder(&shared, path))?;
+    marked(&shared, |marks, folder| paths.iter().for_each(|path| marks.star(folder, path, on)))?;
     let _ = app.emit("clips", ());
     Ok(())
 }
@@ -648,12 +648,14 @@ fn rename(app: AppHandle, shared: State<Shared>, path: PathBuf, name: String) ->
 }
 
 #[tauri::command]
-fn delete(app: AppHandle, shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    clip_in_folder(&shared, &path)?;
-    library::recycle(&path)?;
-    marked(&shared, |marks, folder| marks.forget(folder, &path))?;
+fn delete(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
+    paths.iter().try_for_each(|path| clip_in_folder(&shared, path))?;
+    let recycled = library::recycle(&paths);
+    // a cancelled operation can still have moved some of them
+    let gone = paths.iter().filter(|path| !path.exists());
+    marked(&shared, |marks, folder| gone.for_each(|path| marks.forget(folder, path)))?;
     let _ = app.emit("clips", ());
-    Ok(())
+    recycled
 }
 
 #[tauri::command]

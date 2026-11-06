@@ -266,6 +266,15 @@ button:disabled { cursor: default; opacity: 0.45; }
 .clip:hover .star, .star:focus-visible, .star[aria-pressed="true"] { opacity: 1; }
 .star:hover { border-color: var(--rule-2); }
 .star[aria-pressed="true"] svg { fill: var(--accent); stroke: var(--accent); }
+.grid { user-select: none; }
+.clip.picked { border-color: var(--accent); }
+.pick { position: absolute; top: 11px; left: 11px; display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 1px solid var(--rule-2); border-radius: var(--r-ctl); background: rgba(0, 0, 0, 0.55); cursor: pointer; opacity: 0; transition: opacity 140ms var(--easing); }
+.pick svg { width: 13px; height: 13px; fill: none; stroke: transparent; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.clip:hover .pick, .pick:focus-visible, .picking .pick { opacity: 1; }
+.pick:hover { border-color: var(--text); }
+.pick[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); }
+.pick[aria-pressed="true"] svg { stroke: var(--on-accent); }
+.selection { position: sticky; bottom: 0; display: flex; align-items: center; gap: 8px; margin-top: 20px; padding: 8px 10px 8px 14px; border: 1px solid var(--rule-2); border-radius: var(--r-card); background: var(--surface-2); box-shadow: var(--seam); font-size: 12px; color: var(--text-hi); }
 
 .cut { display: flex; flex-direction: column; gap: 12px; }
 .cut .view-head { margin-bottom: 4px; }

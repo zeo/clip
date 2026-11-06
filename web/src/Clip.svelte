@@ -193,7 +193,7 @@
 
   async function remove() {
     video?.pause();
-    if (await act('deleting', () => invoke('delete', { path: clip.path }).then(() => true))) onclose();
+    if (await act('deleting', () => invoke('delete', { paths: [clip.path] }).then(() => true))) onclose();
   }
 
   function keys(e: KeyboardEvent) {
@@ -322,7 +322,7 @@
     {#if error}<span class="form-error">{error}</span>{/if}
     <button class="btn" onclick={() => invoke('open', { path: clip.path })}>open</button>
     <button class="btn" onclick={() => invoke('reveal', { path: clip.path })}>show in folder</button>
-    <button class="btn" aria-pressed={clip.starred} onclick={() => invoke('star', { path: clip.path, on: !clip.starred })}>
+    <button class="btn" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred })}>
       {clip.starred ? 'starred' : 'star'}
     </button>
     <button class="btn" onclick={() => (naming = clip.name)}>rename</button>
