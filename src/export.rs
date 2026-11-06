@@ -4,11 +4,15 @@ use std::sync::Arc;
 use windows::core::{Interface, Result, GUID, HSTRING};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT_NV12,
+    DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 
 use crate::audio::{audio_type, Aac, AAC_BYTES_PER_SECOND, BLOCK, CHANNELS, RATE};
+use crate::capture::Converter;
 use crate::encode::{Codec, Encoder, Format};
 use crate::ring::{Packet, SECOND};
 use crate::sync::each_sample;
@@ -226,8 +230,6 @@ fn trim_video(
         let attributes = attributes.ok_or(windows::core::Error::from(E_FAIL))?;
         attributes.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &manager)?;
         attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-        // lets the reader put the gpu video processor after the decoder to shrink the picture
-        attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(source.as_os_str()), &attributes)?;
         let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
         reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
@@ -238,35 +240,31 @@ fn trim_video(
             subtype if subtype == MFVideoFormat_HEVC => Codec::Hdr10,
             _ => Codec::H264,
         };
-        let coded = native.GetUINT64(&MF_MT_FRAME_SIZE)?;
-        let (width, height) = picture(&native)?;
+        let shown = picture(&native)?;
         let rate = native.GetUINT64(&MF_MT_FRAME_RATE)?;
         let fps = ((rate >> 32) as f64 / (rate & 0xffff_ffff).max(1) as f64).round().max(1.0) as u32;
         let bytes = std::fs::metadata(source).map_or(0, |meta| meta.len());
         let seconds = crate::save::probe(source).map_or(0.0, |probe| probe.seconds).max(1.0);
         let bitrate = native.GetUINT32(&MF_MT_AVG_BITRATE).unwrap_or((bytes as f64 * 8.0 / seconds) as u32);
         let (bitrate, (width, height)) = match target {
-            Some((most, tallest)) => {
-                let smaller = crate::capture::output_size((width, height), tallest);
-                // nvidia's hevc encoder writes a wrong crop for widths off a multiple of 64
-                let encodable = codec != Codec::Hdr10 || smaller.0.is_multiple_of(64);
-                (bitrate.min(most), if encodable { smaller } else { (width, height) })
-            }
-            None => (bitrate, (width, height)),
+            Some((most, tallest)) => (bitrate.min(most), crate::capture::output_size(shown, tallest)),
+            None => (bitrate, shown),
         };
         let format = Format { width, height, fps, bitrate, codec };
 
-        let (subtype, texture_format) = match codec {
-            Codec::H264 => (MFVideoFormat_NV12, DXGI_FORMAT_NV12),
-            Codec::Hdr10 => (MFVideoFormat_P010, DXGI_FORMAT_P010),
+        let (subtype, texture_format, space) = match codec {
+            Codec::H264 => (MFVideoFormat_NV12, DXGI_FORMAT_NV12, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709),
+            Codec::Hdr10 => (MFVideoFormat_P010, DXGI_FORMAT_P010, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020),
         };
         let decoded = MFCreateMediaType()?;
         decoded.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         decoded.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
-        if (format.width as u64) << 32 | format.height as u64 != coded {
-            decoded.SetUINT64(&MF_MT_FRAME_SIZE, (format.width as u64) << 32 | format.height as u64)?;
-        }
         reader.SetCurrentMediaType(stream, None, &decoded)?;
+        // the source reader's own video processor lifts pq black from 64 to 93, so the picture is
+        // shrunk by one told the same color space on both sides
+        let mut shrink = ((width, height) != shown)
+            .then(|| Converter::new(&gpu, shown, (width, height), fps, texture_format, (space, space)))
+            .transpose()?;
 
         let choices = crate::encode::encoders(codec, Some(gpu.adapter))?;
         let mut encoder = choices
@@ -275,8 +273,8 @@ fn trim_video(
             .ok_or(windows::core::Error::new(MF_E_TOPO_CODEC_NOT_FOUND, "no encoder opened"))?;
 
         let desc = D3D11_TEXTURE2D_DESC {
-            Width: format.width,
-            Height: format.height,
+            Width: shown.0,
+            Height: shown.1,
             MipLevels: 1,
             ArraySize: 1,
             Format: texture_format,
@@ -294,7 +292,7 @@ fn trim_video(
             targets.push(texture.ok_or(windows::core::Error::from(E_FAIL))?);
         }
         // decoders pad the coded height to a multiple of 16, so only the picture is copied
-        let picture = D3D11_BOX { left: 0, top: 0, front: 0, right: format.width, bottom: format.height, back: 1 };
+        let picture = D3D11_BOX { left: 0, top: 0, front: 0, right: shown.0, bottom: shown.1, back: 1 };
 
         reader.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(start))?;
         let (mut packets, mut first, mut kept) = (Vec::new(), None, 0i64);
@@ -323,7 +321,11 @@ fn trim_video(
                 buffer.GetSubresourceIndex()?,
                 Some(&picture),
             );
-            packets.extend(encoder.encode(target, format.time(kept))?);
+            let frame = match &mut shrink {
+                Some(shrink) => shrink.convert(target, shown, fps)?,
+                None => target.clone(),
+            };
+            packets.extend(encoder.encode(&frame, format.time(kept))?);
             first.get_or_insert(time);
             kept += 1;
         }

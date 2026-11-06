@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use windows::core::{Result, BOOL, HSTRING};
+use windows::core::{Interface, Result, BOOL, HSTRING};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -497,7 +497,9 @@ fn self_test() -> Result<()> {
             let heard = sync::onsets(&source).map_err(|e| e.message())?.1.first().copied();
             let size = std::fs::metadata(&fitted).map_err(|e| e.to_string())?.len();
             let fit = (back(&fitted)?, frame_size(&fitted).map_err(|e| e.message())?, size);
-            Ok((tracks, back(&mixed)?, back(&kept)?, onset.zip(heard), fit))
+            let level = |path, from| luma(path, from).map_err(|e| e.message());
+            let levels = [level(&source, 0.5)?, level(&mixed, 0.0)?, level(&fitted, 0.0)?];
+            Ok((tracks, back(&mixed)?, back(&kept)?, onset.zip(heard), fit, levels))
         })();
         let two_seconds = |frames: usize| frames.abs_diff(2 * audio::RATE as usize) <= 2048;
         // a cut from 0.5 s hears the tone half a second sooner than the source does
@@ -505,7 +507,7 @@ fn self_test() -> Result<()> {
             onsets.is_some_and(|(cut, source)| (source - cut - SECOND / 2).abs() < SECOND / 1000)
         };
         match &outcome {
-            Ok((tracks, mixed, kept, onset, (fitted, frame, size)))
+            Ok((tracks, mixed, kept, onset, (fitted, frame, size), [level, rest @ ..]))
                 if tracks.iter().map(|(name, _)| name.as_str()).eq(["tone 440", "tone 660"])
                     && tracks.iter().all(|&(_, frames)| two_seconds(frames))
                     && matches!(mixed.as_slice(), [(30, true, _), (40.., _, _)])
@@ -513,9 +515,12 @@ fn self_test() -> Result<()> {
                     && on_time(*onset)
                     && matches!(fitted.as_slice(), [(30, true, _), (40.., _, _)])
                     && *frame == (960, 540)
-                    && *size <= budget =>
+                    && *size <= budget
+                    && rest.iter().all(|other| (other - level).abs() < 2.0 / 256.0) =>
             {
-                println!("ok   trim {case}: 30 frames from 0.5 s, mixed and kept audio, {size} bytes at 960x540")
+                println!(
+                    "ok   trim {case}: 30 frames from 0.5 s, mixed and kept audio, {size} bytes at 960x540, levels kept"
+                )
             }
             other => {
                 failures += 1;
@@ -728,8 +733,6 @@ fn half(value: f32) -> u16 {
 
 type Streams = Vec<(u32, bool, i64)>;
 
-/// Every stream's sample count, whether it starts on a keyframe, and its last timestamp: the video
-/// stream first, then the audio streams in file order.
 fn frame_size(path: &std::path::Path) -> Result<(u32, u32)> {
     unsafe {
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
@@ -737,6 +740,49 @@ fn frame_size(path: &std::path::Path) -> Result<(u32, u32)> {
     }
 }
 
+/// The mean luma of the first frame at or after `from` seconds, from 0 to 1 of the code range.
+fn luma(path: &std::path::Path, from: f64) -> Result<f64> {
+    unsafe {
+        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
+        let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+        let native = reader.GetNativeMediaType(stream, 0)?;
+        let (width, height) = export::picture(&native)?;
+        let ten = native.GetGUID(&MF_MT_SUBTYPE)? == MFVideoFormat_HEVC;
+        let decoded = MFCreateMediaType()?;
+        decoded.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        decoded.SetGUID(&MF_MT_SUBTYPE, if ten { &MFVideoFormat_P010 } else { &MFVideoFormat_NV12 })?;
+        reader.SetCurrentMediaType(stream, None, &decoded)?;
+        let from = (from * SECOND as f64) as i64;
+        loop {
+            let (mut flags, mut time, mut sample) = (0, 0, None);
+            reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))?;
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                return Err(windows::core::Error::new(E_SELF_TEST, "no frame that late"));
+            }
+            let Some(sample) = sample.filter(|_| time >= from) else { continue };
+            let buffer: IMF2DBuffer = sample.ConvertToContiguousBuffer()?.cast()?;
+            let (mut first, mut pitch) = (std::ptr::null_mut(), 0);
+            buffer.Lock2D(&mut first, &mut pitch)?;
+            let row = |y: u32| first.offset(y as isize * pitch as isize);
+            let sum: u64 = (0..height)
+                .map(|y| match ten {
+                    // p010 keeps its 10 bits at the top of each 16
+                    true => std::slice::from_raw_parts(row(y) as *const u16, width as usize)
+                        .iter()
+                        .map(|&v| (v >> 6) as u64)
+                        .sum::<u64>(),
+                    false => std::slice::from_raw_parts(row(y), width as usize).iter().map(|&v| v as u64).sum(),
+                })
+                .sum();
+            buffer.Unlock2D()?;
+            let top = if ten { 1023.0 } else { 255.0 };
+            return Ok(sum as f64 / (width as u64 * height as u64) as f64 / top);
+        }
+    }
+}
+
+/// Every stream's sample count, whether it starts on a keyframe, and its last timestamp: the video
+/// stream first, then the audio streams in file order.
 fn read_back(path: &std::path::Path) -> Result<Streams> {
     unsafe {
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;

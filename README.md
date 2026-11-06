@@ -76,7 +76,6 @@ Windows only gives a per-app capture the app's own sound and that of its direct 
 - Sync is measured to one display refresh, 8 ms at 120 Hz, since a flash only reaches the clip on the frame it was shown.
 - The test click peaks at -72 dBFS. With headphones and the volume near maximum it may still be faintly audible.
 - Mastering values in HDR10 files are whatever the display driver reports.
-- NVIDIA's HEVC encoder writes a wrong crop for widths that aren't a multiple of 64: 852 wide comes out showing 834. An HDR10 clip's Discord copy therefore only shrinks when the smaller width is such a multiple, as 1280x720 and 960x540 are for 16:9, and keeps its size otherwise.
 - Switching HDR was tested on a real display on build 26340 with an NVIDIA GPU. Each switch freezes the clip for about 0.4 s. After switching HDR on, Windows composes the first frames with SDR white at 80 nits, so they come out at a third of their linear brightness. That lasted from 0.13 s to 0.8 s across six switches at 60 and 120 fps. For about 1.5 s the driver reports a lower peak, which makes highlights roll off a little early.
 
 ## credits

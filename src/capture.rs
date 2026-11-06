@@ -159,8 +159,9 @@ pub fn texture(frame: &Direct3D11CaptureFrame) -> Result<ID3D11Texture2D> {
     unsafe { frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface() }
 }
 
-/// Scales and converts BGRA frames to NV12 with the GPU's video processor.
-/// Output textures rotate so the encoder can still be reading one while the next is written.
+/// Scales frames and converts them into `format` from one color space to another with the GPU's
+/// video processor. Output textures rotate so the encoder can still be reading one while the next
+/// is written.
 pub struct Converter {
     device: ID3D11Device,
     video: ID3D11VideoDevice,
@@ -169,6 +170,8 @@ pub struct Converter {
     processor: ID3D11VideoProcessor,
     input: (u32, u32),
     output: (u32, u32),
+    format: DXGI_FORMAT,
+    spaces: (DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_TYPE),
     targets: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
     next: usize,
 }
@@ -176,7 +179,14 @@ pub struct Converter {
 const IN_FLIGHT: usize = 6;
 
 impl Converter {
-    pub fn new(gpu: &Gpu, input: (u32, u32), output: (u32, u32), fps: u32) -> Result<Self> {
+    pub fn new(
+        gpu: &Gpu,
+        input: (u32, u32),
+        output: (u32, u32),
+        fps: u32,
+        format: DXGI_FORMAT,
+        spaces: (DXGI_COLOR_SPACE_TYPE, DXGI_COLOR_SPACE_TYPE),
+    ) -> Result<Self> {
         unsafe {
             let video: ID3D11VideoDevice = gpu.device.cast()?;
             let context: ID3D11VideoContext1 = gpu.context.cast()?;
@@ -194,17 +204,18 @@ impl Converter {
             let processor = video.CreateVideoProcessor(&enumerator, 0)?;
             context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
             context.VideoProcessorSetStreamFrameFormat(&processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-            context.VideoProcessorSetStreamColorSpace1(&processor, 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-            context.VideoProcessorSetOutputColorSpace1(&processor, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+            context.VideoProcessorSetStreamColorSpace1(&processor, 0, spaces.0);
+            context.VideoProcessorSetOutputColorSpace1(&processor, spaces.1);
             let full = RECT { left: 0, top: 0, right: output.0 as i32, bottom: output.1 as i32 };
             context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&full));
+            context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&full));
 
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: output.0,
                 Height: output.1,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
+                Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
@@ -232,13 +243,15 @@ impl Converter {
                 processor,
                 input,
                 output,
+                format,
+                spaces,
                 targets,
                 next: 0,
             })
         }
     }
 
-    /// Letterboxes the `content` region of `source` into the next NV12 target and returns it.
+    /// Scales the `content` region of `source` over the whole of the next target and returns it.
     pub fn convert(&mut self, source: &ID3D11Texture2D, content: (u32, u32), fps: u32) -> Result<ID3D11Texture2D> {
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -246,7 +259,7 @@ impl Converter {
             if (desc.Width, desc.Height) != self.input {
                 let context = self.device.GetImmediateContext()?;
                 let gpu = Gpu { device: self.device.clone(), context, adapter: LUID::default() };
-                *self = Self::new(&gpu, (desc.Width, desc.Height), self.output, fps)?;
+                *self = Self::new(&gpu, (desc.Width, desc.Height), self.output, fps, self.format, self.spaces)?;
             }
             let content = (content.0.min(desc.Width).max(1), content.1.min(desc.Height).max(1));
             let mut view = None;
@@ -263,9 +276,7 @@ impl Converter {
                 Some(&mut view),
             )?;
             let source_rect = RECT { left: 0, top: 0, right: content.0 as i32, bottom: content.1 as i32 };
-            let dest_rect = letterbox(content, self.output);
             self.context.VideoProcessorSetStreamSourceRect(&self.processor, 0, true, Some(&source_rect));
-            self.context.VideoProcessorSetStreamDestRect(&self.processor, 0, true, Some(&dest_rect));
             let (texture, target) = &self.targets[self.next];
             self.next = (self.next + 1) % self.targets.len();
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
@@ -311,7 +322,17 @@ impl Pipeline {
                 (Encode::Hdr10(Pq::new(&gpu.device, output, IN_FLIGHT)?, white), DXGI_FORMAT_R16G16B16A16_FLOAT)
             }
             Codec::H264 => (
-                Encode::Sdr(Tonemap::new(&gpu.device, display)?, Converter::new(gpu, output, output, format.fps)?),
+                Encode::Sdr(
+                    Tonemap::new(&gpu.device, display)?,
+                    Converter::new(
+                        gpu,
+                        output,
+                        output,
+                        format.fps,
+                        DXGI_FORMAT_NV12,
+                        (DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709),
+                    )?,
+                ),
                 DXGI_FORMAT_B8G8R8A8_UNORM,
             ),
         };
