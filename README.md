@@ -2,7 +2,7 @@
 
 A game clipper for Windows 11 that keeps the last stretch of play in RAM and writes it out on demand. Nothing is injected into the game: video comes from Windows Graphics Capture and audio from per-process loopback, so anti-cheat has nothing to object to.
 
-Started with no arguments, it sits in the tray and records whichever app has focus: that app's window, with its sound on a track of its own. Alt+F9, or save clip in the tray menu, writes the last 30 seconds to `Videos\memory\<app>`, with a short sound once the file is written: capscr's shutter played backwards, so the two are told apart by ear. A failed save plays the Windows error sound instead. The window, opened from the tray or by starting memory again, sets the buffer length, quality, HDR, mic, the apps that get their own audio track, the folder and start with Windows. It holds the clip library and a page per clip for trimming. Game API auto-clips come later. The same exe is also a command line recorder:
+Started with no arguments, it sits in the tray and records the game in focus: its window, with its sound on a track of its own. Alt+F9, or save clip in the tray menu, writes the last 30 seconds to `Videos\memory\<app>`, with a short sound once the file is written: capscr's shutter played backwards, so the two are told apart by ear. A failed save plays the Windows error sound instead. Alt+F10 marks the moment and saves a clip by itself 15 seconds later, so the moment sits in the middle. The window, opened from the tray or by starting memory again, sets the buffer length, quality, HDR, mic, the apps that get their own audio track, the folder and start with Windows. It holds the clip library and a page per clip for trimming. Game API auto-clips come later. The same exe is also a command line recorder:
 
 ```
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
@@ -20,9 +20,13 @@ memory self-test [--live]
 
 The tray app looks at the focused window four times a second. Each app is named by its exe's file description, so `cs2.exe` lands in `Counter-Strike 2`, or by the exe name when it has none. Recording moves to a new app once it has kept focus for a second, so alt-tabbing past a window doesn't restart anything. The app just left keeps recording in the background for a minute. Alt-tab back within that minute and its buffer is whole, even with Alt+F9 pressed the moment it has focus again. While both run, the buffer takes twice the RAM settings shows.
 
-Only games are followed: a window counts once it covers its whole monitor, the way fullscreen and borderless games do, and maximized windows don't. Settings lists the apps with a window open, and any switched on there are recorded in a window too. The desktop, taskbar, start menu, minimized and cloaked windows, tool windows and memory's own window never are. Focus moving to something else leaves the game recording. Once the recorded window closes, memory records nothing and the tray says it is waiting for a game, and Alt+F9 plays the Windows error sound.
+Only games are followed: a window counts once it covers its whole monitor, the way fullscreen and borderless games do, and maximized windows don't. Settings lists the apps with a window open, and any switched on there are recorded in a window too. The desktop, taskbar, start menu, minimized and cloaked windows, tool windows and memory's own window never are. Focus moving to something else leaves the game recording. Once the recorded window closes, memory records nothing and the tray says it is waiting for a game, and Alt+F9 or Alt+F10 plays the Windows error sound.
 
 Settings lists the apps playing sound right now. Each one switched on gets its own track in every clip, the way OBS adds an application audio capture source, and is left out of `others`. While that app is the one being recorded, its sound stays on `game` and it gets no second track.
+
+## marks
+
+Alt+F10 marks the moment, and the clip saves itself 15 seconds after the newest mark, or half the buffer when that is shorter. Another Alt+F10 in that wait moves the save on, but never so far that the first mark would fall out of the buffer. Alt+F9 during the wait saves at once, and the marked clip still comes after. Each clip keeps its marks in `library.json` next to the settings, as seconds into the clip, and the clip page draws them on the timeline. A trimmed copy keeps the marks inside the cut. Marks belong to the recording they were made in. Alt-tabbing or closing the game before the save leaves that recording running until its clip is written.
 
 ## library
 

@@ -23,6 +23,7 @@ export type Clip = {
   seconds: number;
   fps: number;
   starred: boolean;
+  marks: number[];
   session: number;
   thumb: string | null;
 };

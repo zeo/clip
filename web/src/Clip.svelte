@@ -280,6 +280,16 @@
     <span class="lane-label mono">time</span>
     <div class="timeline" bind:this={bar} role="presentation" onpointerdown={(e) => drag(e, 'head')}>
       <div class="kept" style:left={pct(start)} style:right={`calc(100% - ${pct(end)})`}></div>
+      {#each clip.marks as at (at)}
+        <button
+          class="mark"
+          style:left={pct(at)}
+          aria-label="mark at {clock(at, true)}"
+          title="alt+f10 at {clock(at, true)}"
+          onpointerdown={(e) => e.stopPropagation()}
+          onclick={() => (video?.pause(), seek(at))}
+        ></button>
+      {/each}
       <div class="handle" style:left={pct(start)} role="presentation" onpointerdown={(e) => drag(e, 'in')}></div>
       <div class="handle out" style:left={pct(end)} role="presentation" onpointerdown={(e) => drag(e, 'out')}></div>
       <div class="playhead" style:left={pct(now)}></div>
@@ -315,5 +325,5 @@
     <button class="btn" onclick={() => (naming = clip.name)}>rename</button>
     <button class="btn ghost danger" disabled={busy !== ''} onclick={remove}>delete</button>
   </div>
-  <p class="form-hint keys">space plays, arrows step one frame, i and o set the cut, drag the handles to trim</p>
+  <p class="form-hint keys">space plays, arrows step one frame, i and o set the cut, drag the handles to trim, the green ticks are alt+f10 marks</p>
 </div>

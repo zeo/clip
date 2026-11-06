@@ -81,6 +81,9 @@
       <button class="btn primary wide" disabled={!status.recording} onclick={() => invoke('save_clip')}>
         save clip <kbd>alt+f9</kbd>
       </button>
+      <button class="btn wide" disabled={!status.recording} onclick={() => invoke('mark_clip')}>
+        mark, saves in 15 s <kbd>alt+f10</kbd>
+      </button>
     </section>
     <section class="module">
       <div class="module-head"><span class="module-index">B</span><h2>view</h2></div>

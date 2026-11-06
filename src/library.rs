@@ -23,6 +23,8 @@ pub struct Clip {
     pub seconds: f64,
     pub fps: f64,
     pub starred: bool,
+    /// seconds into the clip where alt+f10 was pressed
+    pub marks: Vec<f64>,
     pub session: usize,
     pub thumb: Option<PathBuf>,
 }
@@ -33,6 +35,7 @@ pub struct Clip {
 pub struct Marks {
     /// paths inside the clips folder, with forward slashes
     starred: HashSet<String>,
+    marked: HashMap<String, Vec<f64>>,
 }
 
 impl Marks {
@@ -42,7 +45,7 @@ impl Marks {
 
     pub fn store(&self, file: &Path) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(file, json).map_err(|e| format!("can't save stars: {e}"))
+        std::fs::write(file, json).map_err(|e| format!("can't save the library: {e}"))
     }
 
     pub fn starred(&self, folder: &Path, path: &Path) -> bool {
@@ -58,10 +61,28 @@ impl Marks {
         }
     }
 
+    pub fn marks(&self, folder: &Path, path: &Path) -> Vec<f64> {
+        self.marked.get(&key(folder, path)).cloned().unwrap_or_default()
+    }
+
+    pub fn mark(&mut self, folder: &Path, path: &Path, at: Vec<f64>) {
+        if !at.is_empty() {
+            self.marked.insert(key(folder, path), at);
+        }
+    }
+
     pub fn moved(&mut self, folder: &Path, from: &Path, to: &Path) {
         if self.starred.remove(&key(folder, from)) {
             self.starred.insert(key(folder, to));
         }
+        if let Some(at) = self.marked.remove(&key(folder, from)) {
+            self.marked.insert(key(folder, to), at);
+        }
+    }
+
+    pub fn forget(&mut self, folder: &Path, path: &Path) {
+        self.starred.remove(&key(folder, path));
+        self.marked.remove(&key(folder, path));
     }
 }
 
@@ -91,9 +112,10 @@ pub fn list(folder: &Path, marks: &Marks, thumbs: &Path) -> Vec<Clip> {
             let path = entry.path();
             let name = path.file_stem()?.to_string_lossy().into_owned();
             let (seconds, fps) = crate::save::probe(&path).map_or((0.0, 0.0), |probe| (probe.seconds, probe.fps));
-            let starred = marks.starred(folder, &path);
+            let (starred, at) = (marks.starred(folder, &path), marks.marks(folder, &path));
             let thumb = Some(thumb(thumbs, &path, modified, meta.len())).filter(|thumb| thumb.is_file());
-            Some(Clip { path, app, name, bytes: meta.len(), modified, seconds, fps, starred, session: 0, thumb })
+            let bytes = meta.len();
+            Some(Clip { path, app, name, bytes, modified, seconds, fps, starred, marks: at, session: 0, thumb })
         })
         .collect();
     clips.sort_by_key(|clip| std::cmp::Reverse(clip.modified));
@@ -212,6 +234,20 @@ mod tests {
     }
 
     #[test]
+    fn marks_follow_a_rename_and_go_with_a_delete() {
+        let folder = Path::new(r"C:\clips");
+        let (from, to) = (folder.join(r"a\one.mp4"), folder.join(r"a\two.mp4"));
+        let mut marks = Marks::default();
+        marks.mark(folder, &from, vec![12.5]);
+        marks.star(folder, &from, true);
+        marks.moved(folder, &from, &to);
+        assert!(marks.marks(folder, &from).is_empty());
+        assert_eq!(marks.marks(folder, &to), [12.5]);
+        marks.forget(folder, &to);
+        assert!(marks.marks(folder, &to).is_empty() && !marks.starred(folder, &to));
+    }
+
+    #[test]
     fn renaming_refuses_what_windows_would() {
         let path = Path::new(r"C:\clips\Fortnite\2026-11-06 14-02-11.mp4");
         assert!(renamed(path, "clutch 1v4").is_ok_and(|to| to.ends_with(r"Fortnite\clutch 1v4.mp4")));
@@ -230,6 +266,7 @@ mod tests {
             seconds: 0.0,
             fps: 0.0,
             starred,
+            marks: Vec::new(),
             session: 0,
             thumb: None,
         }
