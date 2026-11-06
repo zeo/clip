@@ -27,6 +27,8 @@ pub struct Clip {
     pub marks: Vec<f64>,
     pub session: usize,
     pub thumb: Option<PathBuf>,
+    /// the app's exe icon, once memory has recorded it
+    pub icon: Option<PathBuf>,
 }
 
 /// What memory remembers about clips beside the files, kept next to the settings.
@@ -114,8 +116,9 @@ pub fn list(folder: &Path, marks: &Marks, thumbs: &Path) -> Vec<Clip> {
             let (seconds, fps) = crate::save::probe(&path).map_or((0.0, 0.0), |probe| (probe.seconds, probe.fps));
             let (starred, at) = (marks.starred(folder, &path), marks.marks(folder, &path));
             let thumb = Some(thumb(thumbs, &path, modified, meta.len())).filter(|thumb| thumb.is_file());
+            let icon = Some(icon(thumbs, &app)).filter(|icon| icon.is_file());
             let bytes = meta.len();
-            Some(Clip { path, app, name, bytes, modified, seconds, fps, starred, marks: at, session: 0, thumb })
+            Some(Clip { path, app, name, bytes, modified, seconds, fps, starred, marks: at, session: 0, thumb, icon })
         })
         .collect();
     clips.sort_by_key(|clip| std::cmp::Reverse(clip.modified));
@@ -148,7 +151,13 @@ fn sessions(clips: &[(&str, u64)]) -> Vec<usize> {
 pub fn thumb(thumbs: &Path, path: &Path, modified: u64, bytes: u64) -> PathBuf {
     let mut hash = std::hash::DefaultHasher::new();
     (path, modified, bytes).hash(&mut hash);
-    thumbs.join(format!("{:016x}.jpg", hash.finish()))
+    // the size is in the name so stills from a smaller long side get made again
+    thumbs.join(format!("{:016x}-640.jpg", hash.finish()))
+}
+
+/// Where an app's exe icon lives, beside the stills.
+pub fn icon(thumbs: &Path, app: &str) -> PathBuf {
+    thumbs.with_file_name("icons").join(format!("{app}.png"))
 }
 
 /// Drops stills whose clip has gone.
@@ -278,6 +287,7 @@ mod tests {
             marks: Vec::new(),
             session: 0,
             thumb: None,
+            icon: None,
         }
     }
 

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+  import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
 
   let { clip, onclose, onmoved }: { clip: Clip; onclose: () => void; onmoved: (path: string) => void } = $props();
@@ -216,28 +217,7 @@
 
 <svelte:window onkeydown={keys} />
 
-<div class="view cut">
-  <div class="view-head">
-    {#if naming !== null}
-      <!-- svelte-ignore a11y_autofocus -->
-      <input
-        class="rename proper"
-        bind:value={naming}
-        autofocus
-        onkeydown={(e) => {
-          if (e.key === 'Enter') rename();
-          if (e.key === 'Escape') naming = null;
-        }}
-        onblur={rename}
-      />
-    {:else}
-      <h1 class="proper">{title(clip)}</h1>
-    {/if}
-    <p class="view-sub">
-      <span class="proper">{clip.app}</span>, {day(clip.modified)} {at(clip.modified)}, {size(clip.bytes)}{clip.fps ? `, ${Math.round(clip.fps)} fps` : ''}
-    </p>
-  </div>
-
+<div class="theater">
   <div class="screen">
     <!-- svelte-ignore a11y_media_has_caption -->
     <video
@@ -257,76 +237,118 @@
     ></video>
   </div>
 
-  <div class="transport">
-    <button class="btn" onclick={toggle} aria-label={paused ? 'play' : 'pause'}>
-      <svg class="glyph" viewBox="0 0 12 12">
-        {#if paused}<path d="M3 1.5v9l7.5-4.5z" />{:else}<path d="M2.5 1.5h2.5v9H2.5zM7 1.5h2.5v9H7z" />{/if}
-      </svg>
-    </button>
-    <span class="mono readout"><span class="hi">{clock(now, true)}</span> / {clock(duration, true)}</span>
-    <span class="sep">|</span>
-    <span class="mono readout">in {clock(start, true)} out {clock(end, true)}, <span class="hi">{(end - start).toFixed(2)} s</span></span>
-    <span class="grow"></span>
-    <div class="segmented" role="radiogroup" aria-label="audio in the copy">
-      <button role="radio" aria-checked={mix} onclick={() => (mix = true)}>mix to one track</button>
-      <button role="radio" aria-checked={!mix} onclick={() => (mix = false)}>keep tracks</button>
+  <div class="dock">
+    <div class="transport">
+      <button class="btn" onclick={toggle} aria-label={paused ? 'play' : 'pause'}>
+        <svg class="glyph" viewBox="0 0 12 12">
+          {#if paused}<path d="M3 1.5v9l7.5-4.5z" />{:else}<path d="M2.5 1.5h2.5v9H2.5zM7 1.5h2.5v9H7z" />{/if}
+        </svg>
+      </button>
+      <span class="mono readout"><span class="hi">{clock(now, true)}</span> / {clock(duration, true)}</span>
+      <span class="grow"></span>
+      <span class="form-hint keys">space plays, arrows step a frame, i and o set the cut</span>
     </div>
-    <button class="btn" disabled={busy !== ''} onclick={() => exportCut(true)} title="under 20 MB, one audio track">
-      {busy === 'fitting' ? 'fitting' : 'copy for discord'}
-    </button>
-    <button class="btn primary" disabled={busy !== ''} onclick={() => exportCut(false)}>
-      {busy === 'saving' ? 'saving' : 'save trimmed copy'}
-    </button>
-  </div>
-
-  <div class="tracks">
-    <span class="lane-label mono">time</span>
-    <div class="timeline" bind:this={bar} role="presentation" onpointerdown={(e) => drag(e, 'head')}>
-      <div class="kept" style:left={pct(start)} style:right={`calc(100% - ${pct(end)})`}></div>
-      {#each clip.marks as at (at)}
-        <button
-          class="mark"
-          style:left={pct(at)}
-          aria-label="mark at {clock(at, true)}"
-          title="alt+f10 at {clock(at, true)}"
-          onpointerdown={(e) => e.stopPropagation()}
-          onclick={() => (video?.pause(), seek(at))}
-        ></button>
-      {/each}
-      <div class="handle" style:left={pct(start)} role="presentation" onpointerdown={(e) => drag(e, 'in')}></div>
-      <div class="handle out" style:left={pct(end)} role="presentation" onpointerdown={(e) => drag(e, 'out')}></div>
-      <div class="playhead" style:left={pct(now)}></div>
-    </div>
-    {#each lanes as lane, i (i)}
-      <div class="lane-label" class:quiet={!audible.includes(i)}>
-        <span class="proper lane-name">{lane.name}</span>
-        <button class="lane-key" aria-pressed={lane.muted} onclick={() => setLane(i, { muted: !lane.muted })}>m</button>
-        <button class="lane-key" aria-pressed={lane.solo} onclick={() => setLane(i, { solo: !lane.solo })}>s</button>
-      </div>
-      <div class="wave" class:quiet={!audible.includes(i)}>
-        <svg viewBox="0 0 {PEAKS} 100" preserveAspectRatio="none"><path d={lane.peaks} /></svg>
-        <div class="dim" style:right={`calc(100% - ${pct(start)})`}></div>
-        <div class="dim" style:left={pct(end)}></div>
+    <div class="tracks">
+      <span class="lane-label mono">time</span>
+      <div class="timeline" bind:this={bar} role="presentation" onpointerdown={(e) => drag(e, 'head')}>
+        <div class="kept" style:left={pct(start)} style:right={`calc(100% - ${pct(end)})`}></div>
+        {#each clip.marks as at (at)}
+          <button
+            class="mark"
+            style:left={pct(at)}
+            aria-label="mark at {clock(at, true)}"
+            title="alt+f10 at {clock(at, true)}"
+            onpointerdown={(e) => e.stopPropagation()}
+            onclick={() => (video?.pause(), seek(at))}
+          ></button>
+        {/each}
+        <div class="handle" style:left={pct(start)} role="presentation" onpointerdown={(e) => drag(e, 'in')}></div>
+        <div class="handle out" style:left={pct(end)} role="presentation" onpointerdown={(e) => drag(e, 'out')}></div>
         <div class="playhead" style:left={pct(now)}></div>
       </div>
-    {:else}
-      <span></span>
-      <p class="form-hint">{loading ? 'reading the audio tracks' : 'no audio tracks'}</p>
-    {/each}
+      {#each lanes as lane, i (i)}
+        <div class="lane-label" class:quiet={!audible.includes(i)}>
+          <span class="proper lane-name">{lane.name}</span>
+          <button class="lane-key" aria-pressed={lane.muted} title="mute" onclick={() => setLane(i, { muted: !lane.muted })}>m</button>
+          <button class="lane-key" aria-pressed={lane.solo} title="solo" onclick={() => setLane(i, { solo: !lane.solo })}>s</button>
+        </div>
+        <div class="wave" class:quiet={!audible.includes(i)}>
+          <svg viewBox="0 0 {PEAKS} 100" preserveAspectRatio="none"><path d={lane.peaks} /></svg>
+          <div class="dim" style:right={`calc(100% - ${pct(start)})`}></div>
+          <div class="dim" style:left={pct(end)}></div>
+          <div class="playhead" style:left={pct(now)}></div>
+        </div>
+      {:else}
+        <span></span>
+        <p class="form-hint">{loading ? 'reading the audio tracks' : 'no audio tracks'}</p>
+      {/each}
+    </div>
   </div>
 
-  <div class="btn-row actions">
-    <button class="btn ghost" onclick={onclose}>back <kbd>esc</kbd></button>
-    <span class="grow"></span>
-    {#if note}<span class="form-hint proper">{note}</span>{/if}
-    {#if error}<span class="form-error">{error}</span>{/if}
-    <button class="btn" onclick={() => invoke('open', { path: clip.path })}>open</button>
-    <button class="btn" onclick={() => invoke('reveal', { path: clip.path })}>show in folder</button>
-    <button class="btn" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred })}>
-      {clip.starred ? 'starred' : 'star'}
-    </button>
-    <button class="btn" onclick={() => (naming = clip.name)}>rename</button>
-    <button class="btn ghost danger" disabled={busy !== ''} onclick={remove}>delete</button>
-  </div>
-  <p class="form-hint keys">space plays, arrows step one frame, i and o set the cut, drag the handles to trim, the green ticks are alt+f10 marks</p>
+  <aside class="inspector">
+    <section class="panel">
+      <div class="panel-app">
+        <Icon app={clip.app} icon={clip.icon} size={22} />
+        <span class="proper">{clip.app}</span>
+      </div>
+      {#if naming !== null}
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          class="rename proper"
+          bind:value={naming}
+          autofocus
+          onkeydown={(e) => {
+            if (e.key === 'Enter') rename();
+            if (e.key === 'Escape') naming = null;
+          }}
+          onblur={rename}
+        />
+      {:else}
+        <h1 class="panel-title proper" title="double click to rename" ondblclick={() => (naming = clip.name)}>{title(clip)}</h1>
+      {/if}
+      <dl class="facts">
+        <div><dt>saved</dt><dd>{day(clip.modified)} {at(clip.modified)}</dd></div>
+        <div><dt>length</dt><dd>{clock(duration, true)}</dd></div>
+        <div><dt>size</dt><dd class="proper">{size(clip.bytes)}</dd></div>
+        <div><dt>frame rate</dt><dd>{clip.fps ? `${Math.round(clip.fps)} fps` : 'unknown'}</dd></div>
+        <div><dt>tracks</dt><dd>{loading ? '...' : lanes.length}</dd></div>
+        <div><dt>marks</dt><dd>{clip.marks.length || 'none'}</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel">
+      <h3 class="panel-head">cut</h3>
+      <dl class="facts cut-facts">
+        <div><dt>in</dt><dd>{clock(start, true)}</dd></div>
+        <div><dt>out</dt><dd>{clock(end, true)}</dd></div>
+        <div><dt>keeps</dt><dd class="hi">{(end - start).toFixed(2)} s</dd></div>
+      </dl>
+      <div class="segmented" role="radiogroup" aria-label="audio in the copy">
+        <button role="radio" aria-checked={mix} onclick={() => (mix = true)}>mix to one</button>
+        <button role="radio" aria-checked={!mix} onclick={() => (mix = false)}>keep tracks</button>
+      </div>
+      <p class="form-hint">{audible.length} of {lanes.length} tracks go in, the muted ones are left out</p>
+      <button class="btn primary wide" disabled={busy !== ''} onclick={() => exportCut(false)}>
+        {busy === 'saving' ? 'saving' : 'save trimmed copy'}
+      </button>
+      <button class="btn wide" disabled={busy !== ''} onclick={() => exportCut(true)} title="under 20 MB, one audio track">
+        {busy === 'fitting' ? 'fitting' : 'copy for discord'}
+      </button>
+      {#if note}<p class="form-hint proper">{note}</p>{/if}
+      {#if error}<p class="form-error">{error}</p>{/if}
+    </section>
+
+    <section class="panel">
+      <h3 class="panel-head">clip</h3>
+      <div class="panel-actions">
+        <button class="btn" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred })}>
+          {clip.starred ? 'starred' : 'star'}
+        </button>
+        <button class="btn" onclick={() => (naming = clip.name)}>rename</button>
+        <button class="btn" onclick={() => invoke('open', { path: clip.path })}>open</button>
+        <button class="btn" onclick={() => invoke('reveal', { path: clip.path })}>show in folder</button>
+        <button class="btn ghost danger wide-cell" disabled={busy !== ''} onclick={remove}>delete</button>
+      </div>
+    </section>
+  </aside>
 </div>

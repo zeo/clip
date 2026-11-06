@@ -1,7 +1,7 @@
 <script lang="ts" module>
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 
-  const LONG_SIDE = 384;
+  const LONG_SIDE = 640;
   // stills are made one at a time, so the library holds at most one media player of its own
   let queue: Promise<unknown> = Promise.resolve();
 
@@ -49,7 +49,7 @@
 <script lang="ts">
   import { clock, type Clip } from './types';
 
-  let { clip, live }: { clip: Clip; live: boolean } = $props();
+  let { clip, live = false, badge = true }: { clip: Clip; live?: boolean; badge?: boolean } = $props();
   let made = $state<string | null>(null);
   let failed = $state(false);
   const shown = $derived(clip.thumb ?? made);
@@ -78,5 +78,5 @@
     <!-- svelte-ignore a11y_media_has_caption -->
     <video src={convertFileSrc(clip.path)} autoplay muted loop></video>
   {/if}
-  {#if clip.seconds > 0}<span class="duration mono">{clock(clip.seconds)}</span>{/if}
+  {#if badge && clip.seconds > 0}<span class="duration mono">{clock(clip.seconds)}</span>{/if}
 </div>

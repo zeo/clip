@@ -2,13 +2,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, BOOL, HSTRING, PWSTR};
+use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_ContainerFormatPng, IWICImagingFactory, WICBitmapEncoderNoCache,
+};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::SHDefExtractIconW;
+use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
@@ -123,6 +130,45 @@ pub fn app_name(pid: u32) -> String {
     let Some(exe) = exe(pid) else { return "app".into() };
     let name = description(&exe).unwrap_or_else(|| exe.file_stem().unwrap_or_default().to_string_lossy().into_owned());
     folder_safe(&name)
+}
+
+/// Writes the icon of `pid`'s exe to `to` as a 256 px png, unless one is there already.
+pub fn save_icon(pid: u32, to: &Path) -> Result<(), String> {
+    if to.exists() {
+        return Ok(());
+    }
+    let exe = exe(pid).ok_or("no exe")?;
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let part = to.with_extension("part");
+    unsafe {
+        let mut icon = HICON::default();
+        SHDefExtractIconW(&HSTRING::from(exe.as_path()), 0, 0, Some(&mut icon), None, 256)
+            .ok()
+            .map_err(|e| e.to_string())?;
+        if icon.is_invalid() {
+            return Err(format!("{} has no icon", exe.display()));
+        }
+        let written = (|| -> windows::core::Result<()> {
+            let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let bitmap = factory.CreateBitmapFromHICON(icon)?;
+            let stream = factory.CreateStream()?;
+            stream.InitializeFromFilename(&HSTRING::from(part.as_path()), GENERIC_WRITE.0)?;
+            let encoder = factory.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+            encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+            let mut frame = None;
+            encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
+            let frame = frame.ok_or_else(windows::core::Error::empty)?;
+            frame.Initialize(None)?;
+            frame.WriteSource(&bitmap, std::ptr::null())?;
+            frame.Commit()?;
+            encoder.Commit()
+        })();
+        let _ = DestroyIcon(icon);
+        written.map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&part, to).map_err(|e| e.to_string())
 }
 
 fn exe_name(pid: u32) -> Option<String> {

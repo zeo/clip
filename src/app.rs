@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HWND, LPARAM, WPARAM};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
@@ -234,7 +234,12 @@ fn serve() -> Result<(), String> {
                         let _ = std::fs::create_dir_all(&folder);
                         let _ = Command::new("explorer").arg(folder).spawn();
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            remember(app, &window);
+                        }
+                        app.exit(0)
+                    }
                     _ => {}
                 }
             });
@@ -245,11 +250,15 @@ fn serve() -> Result<(), String> {
         })
         .build(context)
         .map_err(|e| e.to_string())?
-        .run(|_, event| {
-            // closing the window only hides memory in the tray, quitting from the tray passes a code
-            if let RunEvent::ExitRequested { code: None, api, .. } = event {
-                api.prevent_exit();
+        .run(|app, event| match event {
+            RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { .. }, .. } => {
+                if let Some(window) = app.get_webview_window(&label) {
+                    remember(app, &window);
+                }
             }
+            // closing the window only hides memory in the tray, quitting from the tray passes a code
+            RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            _ => {}
         });
     Ok(())
 }
@@ -269,10 +278,71 @@ fn show(app: &AppHandle) {
     let app = app.clone();
     // building a webview inside an event handler deadlocks on windows
     std::thread::spawn(move || {
-        if let Some(config) = app.config().app.windows.first() {
-            let _ = WebviewWindowBuilder::from_config(&app, config).and_then(|window| window.build());
+        let Some(mut config) = app.config().app.windows.first().cloned() else { return };
+        match placement(&app) {
+            Some(placed) => {
+                (config.width, config.height, config.maximized) = (placed.width, placed.height, placed.maximized);
+                if let Some((x, y)) = placed.x.zip(placed.y).filter(|&(x, y)| on_screen(&app, x, y)) {
+                    (config.x, config.y, config.center) = (Some(x), Some(y), false);
+                }
+            }
+            None => config.maximized = true,
         }
+        let _ = WebviewWindowBuilder::from_config(&app, &config).and_then(|window| window.build());
     });
+}
+
+/// Where the window was when it last closed, in logical pixels.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct Placement {
+    x: Option<f64>,
+    y: Option<f64>,
+    width: f64,
+    height: f64,
+    maximized: bool,
+}
+
+fn placement_file(app: &AppHandle) -> PathBuf {
+    app.state::<Shared>().file.with_file_name("window.json")
+}
+
+fn placement(app: &AppHandle) -> Option<Placement> {
+    serde_json::from_str(&std::fs::read_to_string(placement_file(app)).ok()?).ok()
+}
+
+fn remember(app: &AppHandle, window: &WebviewWindow) {
+    if window.is_minimized().unwrap_or(true) {
+        return;
+    }
+    let maximized = window.is_maximized().unwrap_or(false);
+    let placed = if maximized {
+        // a maximized window's bounds are the monitor's, so the last normal ones are kept for restoring
+        let fallback = app.config().app.windows.first().map_or((1080.0, 700.0), |config| (config.width, config.height));
+        let last =
+            placement(app).unwrap_or(Placement { x: None, y: None, width: fallback.0, height: fallback.1, maximized });
+        Placement { maximized, ..last }
+    } else {
+        let (Ok(scale), Ok(at), Ok(size)) = (window.scale_factor(), window.outer_position(), window.inner_size())
+        else {
+            return;
+        };
+        let (at, size) = (at.to_logical::<f64>(scale), size.to_logical::<f64>(scale));
+        Placement { x: Some(at.x), y: Some(at.y), width: size.width, height: size.height, maximized }
+    };
+    if let Ok(json) = serde_json::to_string(&placed) {
+        let _ = std::fs::write(placement_file(app), json);
+    }
+}
+
+/// Whether a window placed at `x`, `y` would have its title bar on a monitor that is still there.
+fn on_screen(app: &AppHandle, x: f64, y: f64) -> bool {
+    app.available_monitors().unwrap_or_default().iter().any(|monitor| {
+        let (at, size) = (
+            monitor.position().to_logical::<f64>(monitor.scale_factor()),
+            monitor.size().to_logical::<f64>(monitor.scale_factor()),
+        );
+        (at.x..at.x + size.width).contains(&(x + 60.0)) && (at.y..at.y + size.height).contains(&(y + 10.0))
+    })
 }
 
 /// A session and the app window it records.
@@ -341,7 +411,10 @@ fn record(
         let pid = focus::pid(window);
         let lanes = crate::audio::lanes(Some(pid), &current.apps, current.mic);
         let session = Session::start(&current.options(), Target::Window(window), &lanes)?;
-        Ok(Rc::new(Recording { session, window, app: focus::app_name(pid) }))
+        let app = focus::app_name(pid);
+        // the icon only dresses up the library, a game without one still records
+        let _ = focus::save_icon(pid, &library::icon(thumbs, &app));
+        Ok(Rc::new(Recording { session, window, app }))
     };
     let focused = || focus::focused(&settings.lock().expect("settings poisoned").record);
     let report = |recording: &Result<Rc<Recording>, String>| {

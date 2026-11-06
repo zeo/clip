@@ -26,7 +26,10 @@ export type Clip = {
   marks: number[];
   session: number;
   thumb: string | null;
+  icon: string | null;
 };
+
+export type Game = { app: string; icon: string | null; clips: Clip[]; bytes: number };
 
 export type Track = { name: string; path: string };
 
@@ -64,4 +67,20 @@ export function day(ms: number): string {
 // clips keep the time they were saved as their name until renamed
 export function title(clip: Clip): string {
   return /^\d{4}-\d\d-\d\d \d\d-\d\d-\d\d$/.test(clip.name) ? at(clip.modified) : clip.name;
+}
+
+// clips arrive newest first, so games come out in order of their latest clip and keep their clips in that order
+export function games(clips: Clip[]): Game[] {
+  const found = new Map<string, Game>();
+  for (const clip of clips) {
+    let game = found.get(clip.app);
+    if (!game) found.set(clip.app, (game = { app: clip.app, icon: clip.icon, clips: [], bytes: 0 }));
+    game.clips.push(clip);
+    game.bytes += clip.bytes;
+  }
+  return [...found.values()];
+}
+
+export function sessionCount(clips: Clip[]): number {
+  return new Set(clips.map((clip) => clip.session)).size;
 }

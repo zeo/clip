@@ -4,12 +4,7 @@
   import Thumb from './Thumb.svelte';
   import { at, day, size, title, type Clip } from './types';
 
-  let {
-    clips,
-    heading,
-    buffer,
-    onopen
-  }: { clips: Clip[]; heading: string; buffer: number; onopen: (clip: Clip) => void } = $props();
+  let { clips, onopen, showApp = true }: { clips: Clip[]; onopen: (clip: Clip) => void; showApp?: boolean } = $props();
   let hovered = $state<string | null>(null);
   let error = $state('');
   const selected = new SvelteSet<string>();
@@ -59,25 +54,15 @@
   }
 </script>
 
-<div class="view">
-  <div class="view-head">
-    <h1 class:proper={heading !== 'clips' && heading !== 'starred'}>{heading}</h1>
-    <p class="view-sub">{clips.length} saved, {sessions.length} {sessions.length === 1 ? 'session' : 'sessions'}</p>
-  </div>
+<div class="sessions">
   {#if error}<p class="form-error">{error}</p>{/if}
-
-  {#if clips.length === 0}
-    <p class="empty">
-      {heading === 'starred' ? 'no starred clips yet' : `nothing saved yet. press alt+f9 in any app and its last ${buffer} s land here.`}
-    </p>
-  {/if}
   {#each sessions as session (session[0].path)}
     {@const newest = session[0]}
     {@const oldest = session[session.length - 1]}
     <section class="session">
       <h3 class="rule-head session-head">
-        <span class="proper session-app">{newest.app}</span>
-        <span>{day(oldest.modified)} {at(oldest.modified)}{newest !== oldest ? ` to ${at(newest.modified)}` : ''}</span>
+        {#if showApp}<span class="proper session-app">{newest.app}</span>{/if}
+        <span class:session-app={!showApp}>{day(oldest.modified)} {at(oldest.modified)}{newest !== oldest ? ` to ${at(newest.modified)}` : ''}</span>
         <span class="session-count">{session.length} {session.length === 1 ? 'clip' : 'clips'}</span>
       </h3>
       <ul class="grid" class:picking={picked.length > 0}>
@@ -125,4 +110,11 @@
   {/if}
 </div>
 
-<svelte:window onkeydown={(e) => e.key === 'Escape' && selected.clear()} />
+<svelte:window
+  onkeydowncapture={(e) => {
+    if (e.key !== 'Escape' || selected.size === 0) return;
+    // the page behind would take esc as back too
+    e.preventDefault();
+    selected.clear();
+  }}
+/>
