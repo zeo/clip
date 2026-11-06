@@ -6,6 +6,7 @@ export type Settings = {
   hdr10: boolean;
   mic: boolean;
   apps: string[];
+  record: string[];
   folder: string;
   startWithWindows: boolean;
   cap: number;

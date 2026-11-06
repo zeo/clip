@@ -10,7 +10,8 @@
   let error = $state('');
   let busy = $state(false);
   let playing = $state<string[]>([]);
-  const choices = $derived([...new Set([...playing, ...(draft?.apps ?? [])])].sort());
+  let windowed = $state<string[]>([]);
+  const choices = (open: string[], on: string[] = []) => [...new Set([...open, ...on])].sort();
   const changed = $derived(draft !== null && JSON.stringify(draft) !== saved);
 
   const presets = [
@@ -27,20 +28,20 @@
     const s = await invoke<Settings>('settings');
     saved = JSON.stringify(s);
     draft = s;
-    await listPlaying();
+    await look();
   });
 
-  async function listPlaying() {
+  async function look() {
     try {
-      playing = await invoke<string[]>('audio_apps');
+      [playing, windowed] = await Promise.all([invoke<string[]>('audio_apps'), invoke<string[]>('windowed_apps')]);
     } catch (e) {
       error = String(e);
     }
   }
 
-  function split(exe: string, on: boolean) {
+  function pick(list: 'apps' | 'record', exe: string, on: boolean) {
     if (!draft) return;
-    draft.apps = on ? [...draft.apps, exe] : draft.apps.filter((app) => app !== exe);
+    draft[list] = on ? [...draft[list], exe] : draft[list].filter((app) => app !== exe);
   }
 
   async function pickFolder() {
@@ -124,12 +125,29 @@
       <span>keep hdr as hevc hdr10 when the display is in hdr, instead of tonemapping to sdr</span>
     </label>
 
+    <h3 class="rule-head">recording</h3>
+    <p class="form-hint">
+      a game is recorded once it covers a whole monitor, fullscreen or borderless. apps switched on here are recorded in a window too. nothing else is, not even the desktop
+    </p>
+    <div class="apps">
+      {#each choices(windowed, draft.record) as exe (exe)}
+        <label class="toggle">
+          <input type="checkbox" checked={draft.record.includes(exe)} onchange={(e) => pick('record', exe, e.currentTarget.checked)} />
+          <span class="switch"></span>
+          <span class="proper mono">{exe}</span>
+        </label>
+      {:else}
+        <p class="form-hint">no app has a window open right now</p>
+      {/each}
+    </div>
+    <div class="btn-row"><button class="btn ghost" onclick={look}>look again</button></div>
+
     <h3 class="rule-head">audio</h3>
     <p class="form-hint">the recorded app, everything else and discord always get a track each. apps switched on here get one too</p>
     <div class="apps">
-      {#each choices as exe (exe)}
+      {#each choices(playing, draft.apps) as exe (exe)}
         <label class="toggle">
-          <input type="checkbox" checked={draft.apps.includes(exe)} onchange={(e) => split(exe, e.currentTarget.checked)} />
+          <input type="checkbox" checked={draft.apps.includes(exe)} onchange={(e) => pick('apps', exe, e.currentTarget.checked)} />
           <span class="switch"></span>
           <span class="proper mono">{exe}</span>
         </label>
@@ -137,7 +155,7 @@
         <p class="form-hint">no app is playing sound right now</p>
       {/each}
     </div>
-    <div class="btn-row"><button class="btn ghost" onclick={listPlaying}>look again</button></div>
+    <div class="btn-row"><button class="btn ghost" onclick={look}>look again</button></div>
     <label class="toggle">
       <input type="checkbox" bind:checked={draft.mic} />
       <span class="switch"></span>

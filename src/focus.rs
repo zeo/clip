@@ -1,15 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use windows::core::{w, HSTRING, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND};
+use windows::core::{w, BOOL, HSTRING, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
 };
 
 /// How long a newly focused app has to keep focus before recording moves to it, so passing
@@ -30,15 +32,50 @@ const SHELL: [&str; 10] = [
     "NotifyIconOverflowWindow",
 ];
 
-/// The focused window when it belongs to an app that can be recorded: not the shell, a tool
-/// window, something minimized, or memory itself.
-pub fn focused() -> Option<HWND> {
+/// The focused window when it is worth recording: an app's window covering its whole monitor,
+/// fullscreen or borderless, or one of `also`, lowercase exe names recorded in a window too.
+pub fn focused(also: &[String]) -> Option<HWND> {
+    let window = unsafe { GetForegroundWindow() };
+    if unsafe { IsIconic(window) }.as_bool() {
+        return None;
+    }
+    let pid = app_pid(window)?;
+    (fills_monitor(window) || (!also.is_empty() && exe_name(pid).is_some_and(|name| also.contains(&name))))
+        .then_some(window)
+}
+
+/// The lowercase exe names of apps with a window open, for picking which to record in a window.
+pub fn windowed() -> Vec<String> {
+    unsafe extern "system" fn visit(window: HWND, data: LPARAM) -> BOOL {
+        let pids = unsafe { &mut *(data.0 as *mut Vec<u32>) };
+        if unsafe { GetWindowTextLengthW(window) } > 0 {
+            pids.extend(app_pid(window));
+        }
+        true.into()
+    }
+    let mut pids = Vec::new();
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut pids as *mut _ as isize)) };
+    pids.sort_unstable();
+    pids.dedup();
+    let mut names: Vec<String> = pids.into_iter().filter_map(exe_name).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// The process behind a window that belongs to an app: not the shell, a tool window, something
+/// hidden or cloaked, or memory itself.
+fn app_pid(window: HWND) -> Option<u32> {
     unsafe {
-        let window = GetForegroundWindow();
-        if window.is_invalid() || !IsWindowVisible(window).as_bool() || IsIconic(window).as_bool() {
+        if window.is_invalid() || !IsWindowVisible(window).as_bool() {
             return None;
         }
         if GetWindowLongW(window, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+            return None;
+        }
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(window, DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4);
+        if cloaked != 0 {
             return None;
         }
         let mut class = [0u16; 64];
@@ -46,9 +83,33 @@ pub fn focused() -> Option<HWND> {
         if SHELL.contains(&String::from_utf16_lossy(&class[..len]).as_str()) {
             return None;
         }
-        let pid = pid(window);
-        (pid != 0 && pid != std::process::id()).then_some(window)
     }
+    let pid = pid(window);
+    (pid != 0 && pid != std::process::id()).then_some(pid)
+}
+
+// a maximized window can cover a monitor without a taskbar, and that is still a window
+fn fills_monitor(window: HWND) -> bool {
+    unsafe {
+        let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut rect = RECT::default();
+        if monitor.is_invalid()
+            || IsZoomed(window).as_bool()
+            || !GetMonitorInfoW(monitor, &mut info).as_bool()
+            || GetWindowRect(window, &mut rect).is_err()
+        {
+            return false;
+        }
+        covers(rect, info.rcMonitor)
+    }
+}
+
+fn covers(window: RECT, monitor: RECT) -> bool {
+    window.left <= monitor.left
+        && window.top <= monitor.top
+        && window.right >= monitor.right
+        && window.bottom >= monitor.bottom
 }
 
 pub fn pid(window: HWND) -> u32 {
@@ -62,6 +123,10 @@ pub fn app_name(pid: u32) -> String {
     let Some(exe) = exe(pid) else { return "app".into() };
     let name = description(&exe).unwrap_or_else(|| exe.file_stem().unwrap_or_default().to_string_lossy().into_owned());
     folder_safe(&name)
+}
+
+fn exe_name(pid: u32) -> Option<String> {
+    Some(exe(pid)?.file_name()?.to_string_lossy().to_lowercase())
 }
 
 fn exe(pid: u32) -> Option<PathBuf> {
@@ -186,6 +251,16 @@ mod tests {
         let start = Instant::now();
         assert_eq!(follow.tick(Some(1), Some(1), None, start), None);
         assert_eq!(follow.tick(None, Some(1), None, start + SETTLE * 3), None);
+    }
+
+    #[test]
+    fn only_a_window_over_the_whole_monitor_fills_it() {
+        let rect = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let monitor = rect(1920, 0, 4480, 1440);
+        assert!(covers(monitor, monitor));
+        assert!(covers(rect(1912, -8, 4488, 1448), monitor));
+        assert!(!covers(rect(1912, -8, 4488, 1400), monitor));
+        assert!(!covers(rect(0, 0, 1920, 1080), monitor));
     }
 
     #[test]

@@ -77,7 +77,7 @@
         <span class="module-meta" class:live={status.recording}>{status.recording ? 'live' : 'off'}</span>
       </div>
       {#if status.recording}<p class="buffer-app proper">{status.app}</p>{/if}
-      <p class="buffer-note" class:err={!status.recording && status.message !== 'starting'}>{status.message}</p>
+      <p class="buffer-note" class:err={!status.recording && !['starting', 'waiting for a game'].includes(status.message)}>{status.message}</p>
       <button class="btn primary wide" disabled={!status.recording} onclick={() => invoke('save_clip')}>
         save clip <kbd>alt+f9</kbd>
       </button>

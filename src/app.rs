@@ -35,6 +35,7 @@ use crate::{hdr, Options, Session};
 static SAVED: &[u8] = include_bytes!("../assets/saved.wav");
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const WM_RESTART: u32 = WM_APP;
+const WAITING: &str = "waiting for a game";
 // an app left a moment ago keeps recording this long, so alt+tabbing back finds its buffer whole
 const GRACE: Duration = Duration::from_secs(60);
 
@@ -49,6 +50,8 @@ pub struct Settings {
     mic: bool,
     /// exe names that get a track each
     apps: Vec<String>,
+    /// exe names recorded in a window too, not only covering a monitor
+    record: Vec<String>,
     folder: PathBuf,
     start_with_windows: bool,
     /// whole gigabytes the clips folder may hold, 0 for no limit
@@ -65,6 +68,7 @@ impl Default for Settings {
             hdr10: false,
             mic: false,
             apps: Vec::new(),
+            record: Vec::new(),
             folder: PathBuf::new(),
             start_with_windows: false,
             cap: 0,
@@ -95,7 +99,6 @@ impl Settings {
 #[derive(Serialize, Clone, Default)]
 struct Status {
     recording: bool,
-    /// the app being recorded, or desktop
     app: String,
     message: String,
 }
@@ -145,6 +148,7 @@ fn serve() -> Result<(), String> {
             open,
             reveal,
             audio_apps,
+            windowed_apps,
             star,
             rename,
             delete,
@@ -264,14 +268,14 @@ fn show(app: &AppHandle) {
     });
 }
 
-/// A session and the app it records, or the primary monitor when `window` is none.
+/// A session and the app window it records.
 struct Recording {
     session: Session,
-    window: Option<HWND>,
+    window: HWND,
     app: String,
 }
 
-/// Records on this thread's message loop, following the focused app, saving a clip on every
+/// Records on this thread's message loop, following the focused game, saving a clip on every
 /// WM_HOTKEY and starting over on WM_RESTART.
 fn record(
     app: &AppHandle,
@@ -290,19 +294,15 @@ fn record(
     let media = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }
         .and_then(|()| unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) })
         .map_err(|e| e.to_string());
-    let begin = |window: Option<HWND>| -> Result<Recording, String> {
+    let begin = |window: HWND| -> Result<Recording, String> {
         media.clone()?;
         let current = settings.lock().expect("settings poisoned").clone();
-        let (target, game, name) = match window {
-            Some(window) => {
-                let pid = focus::pid(window);
-                (Target::Window(window), Some(pid), focus::app_name(pid))
-            }
-            None => (crate::primary(), None, "desktop".to_string()),
-        };
-        let lanes = crate::audio::lanes(game, &current.apps, current.mic);
-        Ok(Recording { session: Session::start(&current.options(), target, &lanes)?, window, app: name })
+        let pid = focus::pid(window);
+        let lanes = crate::audio::lanes(Some(pid), &current.apps, current.mic);
+        let session = Session::start(&current.options(), Target::Window(window), &lanes)?;
+        Ok(Recording { session, window, app: focus::app_name(pid) })
     };
+    let focused = || focus::focused(&settings.lock().expect("settings poisoned").record);
     let report = |recording: &Result<Recording, String>| {
         let buffer = settings.lock().expect("settings poisoned").options().buffer;
         let next = match recording {
@@ -323,7 +323,7 @@ fn record(
         let _ = app.emit("status", &next);
         *status.lock().expect("status poisoned") = next;
     };
-    let mut current: Result<Recording, String> = Err("starting".into());
+    let mut current: Result<Recording, String> = Err(WAITING.into());
     let mut previous: Option<(Recording, Instant)> = None;
     let mut follow = Follow::default();
     let mut refused = None;
@@ -333,39 +333,43 @@ fn record(
             restart = false;
             // the old sessions let go of the encoder before the new one opens its own
             previous = None;
-            drop(std::mem::replace(&mut current, Err("starting".into())));
-            let window = focus::focused();
-            current = begin(window).or_else(|e| if window.is_some() { begin(None) } else { Err(e) });
+            drop(std::mem::replace(&mut current, Err(WAITING.into())));
+            refused = None;
+            if let Some(window) = focused() {
+                current = begin(window);
+                refused = current.is_err().then_some(window);
+            }
             report(&current);
         }
         if unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 <= 0 {
             break;
         }
-        let recorded = current.as_ref().ok().and_then(|r| r.window);
-        let back = previous.as_ref().and_then(|(r, _)| r.window);
+        let gone = |w: HWND| !unsafe { IsWindow(Some(w)) }.as_bool();
+        let recorded = current.as_ref().ok().map(|r| r.window);
+        let back = previous.as_ref().map(|(r, _)| r.window);
         let next = match msg.message {
             WM_RESTART => {
                 restart = true;
                 None
             }
             WM_TIMER => {
-                if previous.as_ref().is_some_and(|(_, left)| left.elapsed() > GRACE) {
+                if previous.as_ref().is_some_and(|(r, left)| left.elapsed() > GRACE || gone(r.window)) {
                     previous = None;
                 }
-                if recorded.is_some_and(|w| !unsafe { IsWindow(Some(w)) }.as_bool()) {
-                    Some(None)
-                } else {
-                    let focused = focus::focused().filter(|&w| Some(w) != refused);
-                    follow.tick(focused, recorded, back, Instant::now()).map(Some)
+                let recorded = recorded.filter(|&w| !gone(w));
+                if recorded.is_none() && current.is_ok() {
+                    current = Err(WAITING.into());
+                    report(&current);
                 }
+                let candidate = focused().filter(|&w| Some(w) != refused);
+                follow.tick(candidate, recorded, back, Instant::now())
             }
             WM_HOTKEY => {
                 // pressed straight after coming back to an app, the clip is of that app
-                if back.is_some()
-                    && focus::focused() == back
-                    && switch(back, &mut current, &mut previous, &begin).is_ok()
-                {
-                    report(&current);
+                if let Some(back) = back.filter(|&back| focused() == Some(back)) {
+                    if switch(back, &mut current, &mut previous, &begin).is_ok() {
+                        report(&current);
+                    }
                 }
                 let (folder, cap) = {
                     let settings = settings.lock().expect("settings poisoned");
@@ -403,9 +407,13 @@ fn record(
         if let Some(window) = next {
             match switch(window, &mut current, &mut previous, &begin) {
                 Ok(()) => refused = None,
-                Err(_) if window.is_some() => refused = window,
-                // with the app gone and the monitor failing too there is nothing left to record
-                Err(e) => current = Err(e),
+                Err(e) => {
+                    refused = Some(window);
+                    // a running recording carries on, only the waiting note gives way to the error
+                    if current.is_err() {
+                        current = Err(e);
+                    }
+                }
             }
             report(&current);
         }
@@ -415,21 +423,19 @@ fn record(
 /// Moves recording to `window`, leaving the app it was on recording for a while in case focus
 /// comes straight back.
 fn switch(
-    window: Option<HWND>,
+    window: HWND,
     current: &mut Result<Recording, String>,
     previous: &mut Option<(Recording, Instant)>,
-    begin: &impl Fn(Option<HWND>) -> Result<Recording, String>,
+    begin: &impl Fn(HWND) -> Result<Recording, String>,
 ) -> Result<(), String> {
     let next = match previous.take() {
-        Some((recording, _)) if window.is_some() && recording.window == window => recording,
+        Some((recording, _)) if recording.window == window => recording,
         // two sessions at most, so the older one goes first
         _ => begin(window)?,
     };
     let left = std::mem::replace(current, Ok(next));
-    *previous = left
-        .ok()
-        .filter(|left| left.window.is_some_and(|w| unsafe { IsWindow(Some(w)) }.as_bool()))
-        .map(|left| (left, Instant::now()));
+    *previous =
+        left.ok().filter(|left| unsafe { IsWindow(Some(left.window)) }.as_bool()).map(|left| (left, Instant::now()));
     Ok(())
 }
 
@@ -678,4 +684,9 @@ fn reveal(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
 #[tauri::command]
 async fn audio_apps() -> Result<Vec<String>, String> {
     crate::audio::playing().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn windowed_apps() -> Vec<String> {
+    focus::windowed()
 }

@@ -20,7 +20,7 @@ memory self-test [--live]
 
 The tray app looks at the focused window four times a second. Each app is named by its exe's file description, so `cs2.exe` lands in `Counter-Strike 2`, or by the exe name when it has none. Recording moves to a new app once it has kept focus for a second, so alt-tabbing past a window doesn't restart anything. The app just left keeps recording in the background for a minute. Alt-tab back within that minute and its buffer is whole, even with Alt+F9 pressed the moment it has focus again. While both run, the buffer takes twice the RAM settings shows.
 
-The desktop, taskbar, start menu, minimized windows, tool windows and memory's own window are skipped. When the recorded window closes, or no app has had focus yet, memory records the primary monitor and saves to `desktop`.
+Only games are followed: a window counts once it covers its whole monitor, the way fullscreen and borderless games do, and maximized windows don't. Settings lists the apps with a window open, and any switched on there are recorded in a window too. The desktop, taskbar, start menu, minimized and cloaked windows, tool windows and memory's own window never are. Focus moving to something else leaves the game recording. Once the recorded window closes, memory records nothing and the tray says it is waiting for a game, and Alt+F9 plays the Windows error sound.
 
 Settings lists the apps playing sound right now. Each one switched on gets its own track in every clip, the way OBS adds an application audio capture source, and is left out of `others`. While that app is the one being recorded, its sound stays on `game` and it gets no second track.
 
