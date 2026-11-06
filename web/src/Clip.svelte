@@ -175,9 +175,9 @@
     }
   }
 
-  async function exportCut() {
-    const out = await act('saving', () =>
-      invoke<string>('export', { path: clip.path, start, end, tracks: audible, mix: mix && audible.length > 1 })
+  async function exportCut(discord: boolean) {
+    const out = await act(discord ? 'fitting' : 'saving', () =>
+      invoke<string>('export', { path: clip.path, start, end, tracks: audible, mix: mix && audible.length > 1, discord })
     );
     if (out) note = `saved ${out.split(/[\\/]/).pop()}`;
   }
@@ -271,7 +271,10 @@
       <button role="radio" aria-checked={mix} onclick={() => (mix = true)}>mix to one track</button>
       <button role="radio" aria-checked={!mix} onclick={() => (mix = false)}>keep tracks</button>
     </div>
-    <button class="btn primary" disabled={busy !== ''} onclick={exportCut}>
+    <button class="btn" disabled={busy !== ''} onclick={() => exportCut(true)} title="under 20 MB, one audio track">
+      {busy === 'fitting' ? 'fitting' : 'copy for discord'}
+    </button>
+    <button class="btn primary" disabled={busy !== ''} onclick={() => exportCut(false)}>
       {busy === 'saving' ? 'saving' : 'save trimmed copy'}
     </button>
   </div>

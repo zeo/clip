@@ -26,7 +26,7 @@ pub const RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
 pub const BLOCK: usize = 2 * CHANNELS as usize;
 // 192 kbps, the highest rate the in-box encoder offers
-const AAC_BYTES_PER_SECOND: u32 = 24_000;
+pub const AAC_BYTES_PER_SECOND: u32 = 24_000;
 const AAC_FRAME: i64 = 1024 * SECOND / RATE as i64;
 const POLL: Duration = Duration::from_millis(10);
 // room for the poll loop to stall while a new app's capture activates

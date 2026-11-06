@@ -409,7 +409,7 @@ fn self_test() -> Result<()> {
     for (case, codec, hdr) in
         [("sdr", Codec::H264, false), ("tonemap", Codec::H264, true), ("hdr10", Codec::Hdr10, true)]
     {
-        let format = Format { width: 640, height: 360, fps: 30, bitrate: 4_000_000, codec };
+        let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec };
         let frames = 2 * format.fps as i64;
         let choices = encode::encoders(codec, Some(gpu.adapter))?;
         if choices.is_empty() {
@@ -483,15 +483,21 @@ fn self_test() -> Result<()> {
             continue;
         }
         let (mixed, kept) = (dir.join(format!("{case} mixed.mp4")), dir.join(format!("{case} kept.mp4")));
+        let fitted = dir.join(format!("{case} fitted.mp4"));
+        // one second in this many bytes leaves about 1 Mbps for the video, which drops it to 540p
+        let budget = 360_000;
         let outcome = (|| -> std::result::Result<_, String> {
             let tracks = export::tracks(&source)?.into_iter().map(|(name, pcm)| (name, pcm.len() / audio::BLOCK));
             let tracks: Vec<(String, usize)> = tracks.collect();
-            export::trim(&source, &mixed, 0.5, 1.5, &[0, 1], true)?;
-            export::trim(&source, &kept, 0.5, 1.5, &[1], false)?;
+            export::trim(&source, &mixed, 0.5, 1.5, &[0, 1], true, None)?;
+            export::trim(&source, &kept, 0.5, 1.5, &[1], false, None)?;
+            export::trim(&source, &fitted, 0.5, 1.5, &[0, 1], true, Some(budget))?;
             let back = |path| read_back(path).map_err(|e| e.message());
             let onset = sync::onsets(&mixed).map_err(|e| e.message())?.1.first().copied();
             let heard = sync::onsets(&source).map_err(|e| e.message())?.1.first().copied();
-            Ok((tracks, back(&mixed)?, back(&kept)?, onset.zip(heard)))
+            let size = std::fs::metadata(&fitted).map_err(|e| e.to_string())?.len();
+            let fit = (back(&fitted)?, frame_size(&fitted).map_err(|e| e.message())?, size);
+            Ok((tracks, back(&mixed)?, back(&kept)?, onset.zip(heard), fit))
         })();
         let two_seconds = |frames: usize| frames.abs_diff(2 * audio::RATE as usize) <= 2048;
         // a cut from 0.5 s hears the tone half a second sooner than the source does
@@ -499,14 +505,17 @@ fn self_test() -> Result<()> {
             onsets.is_some_and(|(cut, source)| (source - cut - SECOND / 2).abs() < SECOND / 1000)
         };
         match &outcome {
-            Ok((tracks, mixed, kept, onset))
+            Ok((tracks, mixed, kept, onset, (fitted, frame, size)))
                 if tracks.iter().map(|(name, _)| name.as_str()).eq(["tone 440", "tone 660"])
                     && tracks.iter().all(|&(_, frames)| two_seconds(frames))
                     && matches!(mixed.as_slice(), [(30, true, _), (40.., _, _)])
                     && matches!(kept.as_slice(), [(30, true, _), (40.., _, _)])
-                    && on_time(*onset) =>
+                    && on_time(*onset)
+                    && matches!(fitted.as_slice(), [(30, true, _), (40.., _, _)])
+                    && *frame == (960, 540)
+                    && *size <= budget =>
             {
-                println!("ok   trim {case}: 30 frames from 0.5 s, mixed and kept audio")
+                println!("ok   trim {case}: 30 frames from 0.5 s, mixed and kept audio, {size} bytes at 960x540")
             }
             other => {
                 failures += 1;
@@ -721,6 +730,13 @@ type Streams = Vec<(u32, bool, i64)>;
 
 /// Every stream's sample count, whether it starts on a keyframe, and its last timestamp: the video
 /// stream first, then the audio streams in file order.
+fn frame_size(path: &std::path::Path) -> Result<(u32, u32)> {
+    unsafe {
+        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
+        export::picture(&reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)?)
+    }
+}
+
 fn read_back(path: &std::path::Path) -> Result<Streams> {
     unsafe {
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;

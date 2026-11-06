@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 
-use crate::audio::{audio_type, Aac, BLOCK, CHANNELS, RATE};
+use crate::audio::{audio_type, Aac, AAC_BYTES_PER_SECOND, BLOCK, CHANNELS, RATE};
 use crate::encode::{Codec, Encoder, Format};
 use crate::ring::{Packet, SECOND};
 use crate::sync::each_sample;
@@ -77,6 +77,9 @@ pub fn write_wav(path: &Path, pcm: &[u8]) -> std::io::Result<()> {
 
 /// Writes `start` to `end` seconds of `source` to `out`, re-encoded on the gpu so the cut lands on
 /// the exact frames asked for. Only the audio `tracks` listed are kept, summed into one when `mix`.
+/// With `fit`, the file is made to come in under that many bytes: the video bitrate is what the
+/// audio leaves, the picture shrinks when that is too little for its size, and a copy that comes
+/// out over is encoded again lower.
 pub fn trim(
     source: &Path,
     out: &Path,
@@ -84,11 +87,19 @@ pub fn trim(
     end: f64,
     tracks: &[usize],
     mix: bool,
+    fit: Option<u64>,
 ) -> std::result::Result<(), String> {
     let probe = crate::save::probe(source).map_err(|e| format!("can't read the clip: {e}"))?;
-    let (video, format, first, length) =
-        trim_video(source, (start * SECOND as f64) as i64, (end * SECOND as f64) as i64)
-            .map_err(|e| format!("can't re-encode the video: {}", e.message()))?;
+    let streams = if mix { tracks.len().min(1) } else { tracks.len() } as u64;
+    let target = match fit {
+        Some(bytes) => Some(fitted(bytes, end - start, streams * AAC_BYTES_PER_SECOND as u64 * 8)?),
+        None => None,
+    };
+    let video_of = |target| {
+        trim_video(source, (start * SECOND as f64) as i64, (end * SECOND as f64) as i64, target)
+            .map_err(|e| format!("can't re-encode the video: {}", e.message()))
+    };
+    let (mut video, mut format, first, length) = video_of(target)?;
     if video.is_empty() {
         return Err("there are no frames between the start and the end".into());
     }
@@ -118,8 +129,57 @@ pub fn trim(
         .map_err(|e| format!("can't encode the audio: {}", e.message()))?;
     let names: Vec<&str> = lanes.iter().map(|(name, _)| name.as_str()).collect();
     let mastering = probe.mastering.filter(|_| format.codec == Codec::Hdr10);
-    crate::save::write_mp4(out, &video, format, &audio, &names, mastering)
-        .map_err(|e| format!("can't write {}: {}", out.display(), e.message()))
+    let write = |video: &[Arc<Packet>], format| {
+        crate::save::write_mp4(out, video, format, &audio, &names, mastering)
+            .map_err(|e| format!("can't write {}: {}", out.display(), e.message()))
+    };
+    write(&video, format)?;
+    if let (Some(budget), Some((_, height))) = (fit, target) {
+        // hardware cbr can run a little over, each retry aims as far under as the last went over
+        for _ in 0..2 {
+            let size = std::fs::metadata(out).map_or(u64::MAX, |meta| meta.len());
+            if size <= budget {
+                break;
+            }
+            let bitrate = (format.bitrate as f64 * budget as f64 / size as f64 * 0.97) as u32;
+            (video, format, _, _) = video_of(Some((bitrate, height)))?;
+            write(&video, format)?;
+        }
+    }
+    Ok(())
+}
+
+// room for the mp4's boxes and sample tables, a few tens of kB for a minute at 60 fps
+const OVERHEAD: u64 = 200_000;
+
+/// The video bitrate and the tallest picture for `seconds` of clip to fit in `bytes` beside
+/// `audio` bits per second. Below 3.5 Mbps 1080p60 smears, so the picture drops to 720p, and
+/// below 1.5 Mbps to 540p.
+fn fitted(bytes: u64, seconds: f64, audio: u64) -> std::result::Result<(u32, u32), String> {
+    let video = (bytes.saturating_sub(OVERHEAD) as f64 * 8.0 * 0.95 / seconds) - audio as f64;
+    if video < 300_000.0 {
+        return Err(format!("{seconds:.0} s is too long to fit in {} MB, trim it shorter", bytes / 1_000_000));
+    }
+    let height = match video {
+        3_500_000.0.. => u32::MAX,
+        1_500_000.0.. => 720,
+        _ => 540,
+    };
+    Ok((video as u32, height))
+}
+
+/// The size of the picture shown, smaller than the coded frame when the encoder padded it, as
+/// hevc pads 720 rows to 736.
+pub fn picture(media: &IMFMediaType) -> Result<(u32, u32)> {
+    let mut area = MFVideoArea::default();
+    let blob = unsafe { std::slice::from_raw_parts_mut((&raw mut area).cast(), size_of::<MFVideoArea>()) };
+    match unsafe { media.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, blob, None) } {
+        Ok(()) if area.Area.cx > 0 && area.Area.cy > 0 => Ok((area.Area.cx as u32, area.Area.cy as u32)),
+        _ => {
+            let size = unsafe { media.GetUINT64(&MF_MT_FRAME_SIZE)? };
+            Ok(((size >> 32) as u32, size as u32))
+        }
+    }
 }
 
 fn sum(parts: &[Vec<u8>]) -> Vec<u8> {
@@ -145,9 +205,15 @@ fn aac(pcm: &[u8]) -> Result<Vec<Arc<Packet>>> {
     Ok(packets.into_iter().map(Arc::new).collect())
 }
 
-/// Decodes the frames from `start` to `end` on the gpu and encodes them again from time 0. Returns
-/// the packets, their format, the source time of the first frame kept and how many were kept.
-fn trim_video(source: &Path, start: i64, end: i64) -> Result<(Vec<Arc<Packet>>, Format, i64, i64)> {
+/// Decodes the frames from `start` to `end` on the gpu and encodes them again from time 0, at the
+/// clip's bitrate and size or at most the `target` bitrate and height. Returns the packets, their
+/// format, the source time of the first frame kept and how long the kept frames last.
+fn trim_video(
+    source: &Path,
+    start: i64,
+    end: i64,
+    target: Option<(u32, u32)>,
+) -> Result<(Vec<Arc<Packet>>, Format, i64, i64)> {
     let gpu = crate::capture::gpu()?;
     unsafe {
         let mut token = 0;
@@ -160,6 +226,8 @@ fn trim_video(source: &Path, start: i64, end: i64) -> Result<(Vec<Arc<Packet>>, 
         let attributes = attributes.ok_or(windows::core::Error::from(E_FAIL))?;
         attributes.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &manager)?;
         attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+        // lets the reader put the gpu video processor after the decoder to shrink the picture
+        attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
         let reader = MFCreateSourceReaderFromURL(&HSTRING::from(source.as_os_str()), &attributes)?;
         let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
         reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
@@ -170,13 +238,23 @@ fn trim_video(source: &Path, start: i64, end: i64) -> Result<(Vec<Arc<Packet>>, 
             subtype if subtype == MFVideoFormat_HEVC => Codec::Hdr10,
             _ => Codec::H264,
         };
-        let size = native.GetUINT64(&MF_MT_FRAME_SIZE)?;
+        let coded = native.GetUINT64(&MF_MT_FRAME_SIZE)?;
+        let (width, height) = picture(&native)?;
         let rate = native.GetUINT64(&MF_MT_FRAME_RATE)?;
         let fps = ((rate >> 32) as f64 / (rate & 0xffff_ffff).max(1) as f64).round().max(1.0) as u32;
         let bytes = std::fs::metadata(source).map_or(0, |meta| meta.len());
         let seconds = crate::save::probe(source).map_or(0.0, |probe| probe.seconds).max(1.0);
         let bitrate = native.GetUINT32(&MF_MT_AVG_BITRATE).unwrap_or((bytes as f64 * 8.0 / seconds) as u32);
-        let format = Format { width: (size >> 32) as u32, height: size as u32, fps, bitrate, codec };
+        let (bitrate, (width, height)) = match target {
+            Some((most, tallest)) => {
+                let smaller = crate::capture::output_size((width, height), tallest);
+                // nvidia's hevc encoder writes a wrong crop for widths off a multiple of 64
+                let encodable = codec != Codec::Hdr10 || smaller.0.is_multiple_of(64);
+                (bitrate.min(most), if encodable { smaller } else { (width, height) })
+            }
+            None => (bitrate, (width, height)),
+        };
+        let format = Format { width, height, fps, bitrate, codec };
 
         let (subtype, texture_format) = match codec {
             Codec::H264 => (MFVideoFormat_NV12, DXGI_FORMAT_NV12),
@@ -185,6 +263,9 @@ fn trim_video(source: &Path, start: i64, end: i64) -> Result<(Vec<Arc<Packet>>, 
         let decoded = MFCreateMediaType()?;
         decoded.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         decoded.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
+        if (format.width as u64) << 32 | format.height as u64 != coded {
+            decoded.SetUINT64(&MF_MT_FRAME_SIZE, (format.width as u64) << 32 | format.height as u64)?;
+        }
         reader.SetCurrentMediaType(stream, None, &decoded)?;
 
         let choices = crate::encode::encoders(codec, Some(gpu.adapter))?;
@@ -249,5 +330,20 @@ fn trim_video(source: &Path, start: i64, end: i64) -> Result<(Vec<Arc<Packet>>, 
         packets.extend(encoder.finish()?);
         let length = format.time(kept);
         Ok((packets.into_iter().map(Arc::new).collect(), format, first.unwrap_or(start), length))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_longer_cut_gets_a_lower_bitrate_and_then_a_smaller_picture() {
+        let audio = AAC_BYTES_PER_SECOND as u64 * 8;
+        let fits = |seconds| fitted(19_000_000, seconds, audio);
+        assert!(matches!(fits(30.0), Ok((4_000_000..=4_700_000, u32::MAX))));
+        assert!(matches!(fits(60.0), Ok((1_500_000..=3_500_000, 720))));
+        assert!(matches!(fits(150.0), Ok((300_000..=1_500_000, 540))));
+        assert!(fits(600.0).is_err());
     }
 }

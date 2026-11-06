@@ -703,8 +703,12 @@ async fn track_audio(shared: State<'_, Shared>, path: PathBuf) -> Result<Vec<Tra
     .await
 }
 
+// discord's free upload limit is 20 MB, this leaves room for however it counts a megabyte
+const DISCORD: u64 = 19_000_000;
+
 /// Saves `start` to `end` seconds of a clip as a new clip beside it, with only the `tracks` asked
-/// for, either mixed into one or kept apart.
+/// for, either mixed into one or kept apart. A `discord` copy is mixed and fits Discord's limit.
+#[allow(clippy::too_many_arguments)] // each is a field of the request the webview sends
 #[tauri::command]
 async fn export(
     app: AppHandle,
@@ -714,6 +718,7 @@ async fn export(
     end: f64,
     tracks: Vec<usize>,
     mix: bool,
+    discord: bool,
 ) -> Result<PathBuf, String> {
     clip_in_folder(&shared, &path)?;
     if !(start >= 0.0 && end > start) {
@@ -721,14 +726,16 @@ async fn export(
     }
     let out = blocking(move || {
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let kind = if discord { "discord" } else { "trimmed" };
         let out = (1..)
             .map(|n| match n {
-                1 => path.with_file_name(format!("{stem} trimmed.mp4")),
-                n => path.with_file_name(format!("{stem} trimmed {n}.mp4")),
+                1 => path.with_file_name(format!("{stem} {kind}.mp4")),
+                n => path.with_file_name(format!("{stem} {kind} {n}.mp4")),
             })
             .find(|out| !out.exists())
             .expect("some name is free");
-        crate::export::trim(&path, &out, start, end, &tracks, mix)?;
+        let fit = discord.then_some(DISCORD);
+        crate::export::trim(&path, &out, start, end, &tracks, mix || discord, fit)?;
         Ok((path, out))
     })
     .await
