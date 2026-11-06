@@ -30,6 +30,9 @@ pub struct Gpu {
     pub adapter: LUID,
 }
 
+/// Relative to normal (0), down to idle (-7).
+pub const GPU_PRIORITY: i32 = -3;
+
 pub fn gpu() -> Result<Gpu> {
     unsafe {
         let mut device = None;
@@ -49,7 +52,10 @@ pub fn gpu() -> Result<Gpu> {
         let context = context.ok_or(windows::core::Error::from(E_FAIL))?;
         // media foundation drives the encoder from its own threads on this device
         let _ = device.cast::<ID3D11Multithread>()?.SetMultithreadProtected(true);
-        let adapter = device.cast::<IDXGIDevice>()?.GetAdapter()?.GetDesc()?.AdapterLuid;
+        let dxgi = device.cast::<IDXGIDevice>()?;
+        // when the gpu is saturated the game's frames go first and ours fit in around them
+        let _ = dxgi.SetGPUThreadPriority(GPU_PRIORITY);
+        let adapter = dxgi.GetAdapter()?.GetDesc()?.AdapterLuid;
         Ok(Gpu { device, context, adapter })
     }
 }

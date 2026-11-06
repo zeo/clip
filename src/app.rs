@@ -11,22 +11,28 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindowBuilder};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HWND, LPARAM, WPARAM};
+use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
 use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThreadId, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_F9};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, IsWindow, MessageBoxW, PeekMessageW, PostThreadMessageW, SetTimer, MB_ICONERROR, MB_ICONHAND, MB_OK,
-    MSG, PM_NOREMOVE, WM_APP, WM_HOTKEY, WM_TIMER,
+    GetMessageW, IsWindow, MessageBoxW, PeekMessageW, PostThreadMessageW, SetTimer, MB_ICONERROR, MB_ICONHAND, MSG,
+    PM_NOREMOVE, WM_APP, WM_HOTKEY, WM_TIMER,
 };
 
 use crate::capture::Target;
 use crate::focus::{self, Follow};
+use crate::library::{self, Clip, Marks};
 use crate::{hdr, Options, Session};
 
+// capscr's shutter played backwards, so the two apps are told apart by ear
+static SAVED: &[u8] = include_bytes!("../assets/saved.wav");
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const WM_RESTART: u32 = WM_APP;
 // an app left a moment ago keeps recording this long, so alt+tabbing back finds its buffer whole
@@ -45,6 +51,8 @@ pub struct Settings {
     apps: Vec<String>,
     folder: PathBuf,
     start_with_windows: bool,
+    /// whole gigabytes the clips folder may hold, 0 for no limit
+    cap: u32,
 }
 
 impl Default for Settings {
@@ -59,6 +67,7 @@ impl Default for Settings {
             apps: Vec::new(),
             folder: PathBuf::new(),
             start_with_windows: false,
+            cap: 0,
         }
     }
 }
@@ -91,20 +100,14 @@ struct Status {
     message: String,
 }
 
-#[derive(Serialize)]
-struct Clip {
-    path: PathBuf,
-    app: String,
-    name: String,
-    bytes: u64,
-    /// milliseconds since the unix epoch
-    modified: u64,
-}
-
 struct Shared {
     settings: Arc<Mutex<Settings>>,
     status: Arc<Mutex<Status>>,
     file: PathBuf,
+    marks: Arc<Mutex<Marks>>,
+    marks_file: PathBuf,
+    /// stills and decoded audio for the window, safe to lose
+    cache: PathBuf,
     /// the run value, and with a profile the settings folder too
     name: String,
     first: AtomicBool,
@@ -119,6 +122,8 @@ pub fn run() {
 }
 
 fn serve() -> Result<(), String> {
+    // below normal, not background mode, which would also let windows page out the buffer
+    let _ = unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) };
     // a profile runs a separate memory beside the usual one, with its own settings and single instance
     let name = match std::env::var("MEMORY_PROFILE") {
         Ok(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!("memory-{p}"),
@@ -139,10 +144,21 @@ fn serve() -> Result<(), String> {
             save_clip,
             open,
             reveal,
-            audio_apps
+            audio_apps,
+            star,
+            rename,
+            delete,
+            save_thumb,
+            track_audio,
+            export
         ])
         .setup(move |app| {
-            let file = app.path().config_dir()?.join(&name).join("settings.json");
+            let dir = app.path().config_dir()?.join(&name);
+            let file = dir.join("settings.json");
+            let marks_file = dir.join("library.json");
+            let marks = Arc::new(Mutex::new(Marks::load(&marks_file)));
+            let cache = app.path().cache_dir()?.join(&name);
+            app.asset_protocol_scope().allow_directory(&cache, true)?;
             let stored = std::fs::read_to_string(&file).ok();
             let mut settings: Settings =
                 stored.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
@@ -181,11 +197,22 @@ fn serve() -> Result<(), String> {
             let (ready, recorder) = mpsc::channel();
             {
                 let (app, settings, status) = (app.handle().clone(), settings.clone(), status.clone());
-                std::thread::spawn(move || record(&app, &tray, &settings, &status, ready));
+                let library = (marks.clone(), cache.join("thumbs"));
+                std::thread::spawn(move || record(&app, &tray, &settings, &status, &library, ready));
             }
             let first = stored.is_none();
             let recorder = recorder.recv()?;
-            app.manage(Shared { settings, status, file, name: name.clone(), first: AtomicBool::new(first), recorder });
+            app.manage(Shared {
+                settings,
+                status,
+                file,
+                marks,
+                marks_file,
+                cache,
+                name: name.clone(),
+                first: AtomicBool::new(first),
+                recorder,
+            });
             app.on_menu_event(|app, event| {
                 let shared = app.state::<Shared>();
                 match event.id.as_ref() {
@@ -251,6 +278,7 @@ fn record(
     tray: &TrayIcon,
     settings: &Mutex<Settings>,
     status: &Mutex<Status>,
+    (marks, thumbs): &(Arc<Mutex<Marks>>, PathBuf),
     ready: mpsc::Sender<u32>,
 ) {
     let mut msg = MSG::default();
@@ -339,15 +367,29 @@ fn record(
                 {
                     report(&current);
                 }
-                let folder = settings.lock().expect("settings poisoned").folder.clone();
+                let (folder, cap) = {
+                    let settings = settings.lock().expect("settings poisoned");
+                    (settings.folder.clone(), settings.cap)
+                };
                 let saved = current.as_ref().map_err(Clone::clone).and_then(|recording| {
                     let folder = folder.join(&recording.app);
                     std::fs::create_dir_all(&folder).map_err(|e| format!("can't make {}: {e}", folder.display()))?;
                     recording.session.save(&folder.join(stamp()))
                 });
-                unsafe { MessageBeep(if saved.is_ok() { MB_OK } else { MB_ICONHAND }) }.ok();
+                match &saved {
+                    Ok(_) => unsafe {
+                        let _ = PlaySoundW(PCWSTR(SAVED.as_ptr().cast()), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+                    },
+                    Err(_) => {
+                        let _ = unsafe { MessageBeep(MB_ICONHAND) };
+                    }
+                }
                 match saved {
                     Ok(_) => {
+                        if cap > 0 {
+                            let marks = marks.lock().expect("marks poisoned");
+                            library::trim_to(&library::list(&folder, &marks, thumbs), cap as u64 * 1_000_000_000);
+                        }
                         let _ = app.emit("clips", ());
                     }
                     Err(e) => {
@@ -446,7 +488,8 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     std::fs::write(&shared.file, json).map_err(|e| format!("can't save settings: {e}"))?;
-    run_at_login(&shared.name, settings.start_with_windows).map_err(|e| format!("can't change start with windows: {e}"))?;
+    run_at_login(&shared.name, settings.start_with_windows)
+        .map_err(|e| format!("can't change start with windows: {e}"))?;
     app.asset_protocol_scope().allow_directory(&settings.folder, true).map_err(|e| e.to_string())?;
     shared.first.store(false, Ordering::Relaxed);
     let restart = {
@@ -465,30 +508,134 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
 #[tauri::command]
 fn clips(shared: State<Shared>) -> Vec<Clip> {
     let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
-    let entries = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten();
-    let mut found = Vec::new();
-    for entry in entries(&folder) {
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            let app = entry.file_name().to_string_lossy().into_owned();
-            found.extend(entries(&entry.path()).map(|inner| (inner, app.clone())));
-        } else {
-            // clips saved before memory sorted them by app were all of the desktop
-            found.push((entry, "desktop".to_string()));
-        }
-    }
-    let mut clips: Vec<Clip> = found
-        .into_iter()
-        .filter(|(entry, _)| entry.path().extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")))
-        .filter_map(|(entry, app)| {
-            let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
-            let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
-            let path = entry.path();
-            let name = path.file_stem()?.to_string_lossy().into_owned();
-            Some(Clip { path, app, name, bytes: meta.len(), modified })
-        })
-        .collect();
-    clips.sort_by_key(|clip| std::cmp::Reverse(clip.modified));
+    let thumbs = shared.cache.join("thumbs");
+    let clips = library::list(&folder, &shared.marks.lock().expect("marks poisoned"), &thumbs);
+    library::prune(&thumbs, &clips);
     clips
+}
+
+fn marked(shared: &Shared, change: impl FnOnce(&mut Marks, &Path)) -> Result<(), String> {
+    let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
+    let mut marks = shared.marks.lock().expect("marks poisoned");
+    change(&mut marks, &folder);
+    marks.store(&shared.marks_file)
+}
+
+#[tauri::command]
+fn star(app: AppHandle, shared: State<Shared>, path: PathBuf, on: bool) -> Result<(), String> {
+    clip_in_folder(&shared, &path)?;
+    marked(&shared, |marks, folder| marks.star(folder, &path, on))?;
+    let _ = app.emit("clips", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn rename(app: AppHandle, shared: State<Shared>, path: PathBuf, name: String) -> Result<PathBuf, String> {
+    clip_in_folder(&shared, &path)?;
+    let to = library::renamed(&path, &name)?;
+    std::fs::rename(&path, &to).map_err(|e| format!("couldn't rename: {e}"))?;
+    marked(&shared, |marks, folder| marks.moved(folder, &path, &to))?;
+    let _ = app.emit("clips", ());
+    Ok(to)
+}
+
+#[tauri::command]
+fn delete(app: AppHandle, shared: State<Shared>, path: PathBuf) -> Result<(), String> {
+    clip_in_folder(&shared, &path)?;
+    library::recycle(&path)?;
+    marked(&shared, |marks, folder| marks.star(folder, &path, false))?;
+    let _ = app.emit("clips", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn save_thumb(shared: State<Shared>, path: PathBuf, jpeg: Vec<u8>) -> Result<PathBuf, String> {
+    clip_in_folder(&shared, &path)?;
+    if !jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Err("a still has to be a jpeg".into());
+    }
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let modified = meta.modified().map_err(|e| e.to_string())?;
+    let modified = modified.duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis() as u64;
+    let thumbs = shared.cache.join("thumbs");
+    let thumb = library::thumb(&thumbs, &path, modified, meta.len());
+    std::fs::create_dir_all(&thumbs).map_err(|e| e.to_string())?;
+    std::fs::write(&thumb, jpeg).map_err(|e| e.to_string())?;
+    Ok(thumb)
+}
+
+#[derive(Serialize)]
+struct Track {
+    name: String,
+    /// a wav file in the cache
+    path: PathBuf,
+}
+
+/// Decodes every audio track of a clip to its own wav, since the webview only plays the first.
+#[tauri::command]
+async fn track_audio(shared: State<'_, Shared>, path: PathBuf) -> Result<Vec<Track>, String> {
+    clip_in_folder(&shared, &path)?;
+    let audio = shared.cache.join("audio");
+    blocking(move || {
+        let tracks = crate::export::tracks(&path)?;
+        // only the clip open now keeps its decoded audio
+        let _ = std::fs::remove_dir_all(&audio);
+        std::fs::create_dir_all(&audio).map_err(|e| e.to_string())?;
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        tracks
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, pcm))| {
+                let wav = audio.join(format!("{stem} {i}.wav"));
+                crate::export::write_wav(&wav, &pcm).map_err(|e| e.to_string())?;
+                Ok(Track { name, path: wav })
+            })
+            .collect()
+    })
+    .await
+}
+
+/// Saves `start` to `end` seconds of a clip as a new clip beside it, with only the `tracks` asked
+/// for, either mixed into one or kept apart.
+#[tauri::command]
+async fn export(
+    app: AppHandle,
+    shared: State<'_, Shared>,
+    path: PathBuf,
+    start: f64,
+    end: f64,
+    tracks: Vec<usize>,
+    mix: bool,
+) -> Result<PathBuf, String> {
+    clip_in_folder(&shared, &path)?;
+    if !(start >= 0.0 && end > start) {
+        return Err("the end has to come after the start".into());
+    }
+    let out = blocking(move || {
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let out = (1..)
+            .map(|n| match n {
+                1 => path.with_file_name(format!("{stem} trimmed.mp4")),
+                n => path.with_file_name(format!("{stem} trimmed {n}.mp4")),
+            })
+            .find(|out| !out.exists())
+            .expect("some name is free");
+        crate::export::trim(&path, &out, start, end, &tracks, mix)?;
+        Ok(out)
+    })
+    .await?;
+    let _ = app.emit("clips", ());
+    Ok(out)
+}
+
+/// Runs media foundation work off the webview's threads.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.map_err(|e| e.to_string())?;
+        work()
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

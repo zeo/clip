@@ -122,9 +122,32 @@ unsafe fn write_sample(writer: &IMFSinkWriter, stream: u32, packet: &Packet, bas
 /// Media foundation's sink writes neither hdr10 mastering boxes nor track names, so they go into the
 /// moov afterwards. It sits after the media, so growing it moves no chunk offset.
 fn label(path: &Path, names: &[&str], mastering: Option<Mastering>) -> std::io::Result<()> {
-    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "the mp4 boxes don't add up");
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let len = file.metadata()?.len();
+    let (at, size) = moov(&mut file, len)?;
+    let mut old = vec![0; size as usize];
+    file.seek(SeekFrom::Start(at))?;
+    file.read_exact(&mut old)?;
+    let (_, body) = boxes(&old).and_then(|b| b.into_iter().next()).ok_or_else(invalid)?;
+    let new = boxed(b"moov", &label_moov(body, names, mastering).ok_or_else(invalid)?);
+    if at + size == len {
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&new)?;
+        file.set_len(at + new.len() as u64)
+    } else {
+        file.seek(SeekFrom::Start(at + 4))?;
+        file.write_all(b"free")?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&new)
+    }
+}
+
+fn invalid() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "the mp4 boxes don't add up")
+}
+
+/// Where the moov box starts in `file` and how long it is.
+fn moov(file: &mut std::fs::File, len: u64) -> std::io::Result<(u64, u64)> {
     let (mut at, mut moov) = (0, None);
     while at + 8 <= len {
         let mut head = [0; 8];
@@ -147,21 +170,101 @@ fn label(path: &Path, names: &[&str], mastering: Option<Mastering>) -> std::io::
         }
         at += size;
     }
-    let (at, size) = moov.ok_or_else(invalid)?;
-    let mut old = vec![0; size as usize];
+    moov.ok_or_else(invalid)
+}
+
+/// What a clip's moov says about it.
+pub struct Probe {
+    pub seconds: f64,
+    /// frames per second of the video, 0 when the file doesn't say
+    pub fps: f64,
+    /// the audio tracks' names in order, empty where a track has none
+    pub tracks: Vec<String>,
+    pub mastering: Option<Mastering>,
+}
+
+pub fn probe(path: &Path) -> std::io::Result<Probe> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let (at, size) = moov(&mut file, len)?;
+    let mut data = vec![0; size as usize];
     file.seek(SeekFrom::Start(at))?;
-    file.read_exact(&mut old)?;
-    let (_, body) = boxes(&old).and_then(|b| b.into_iter().next()).ok_or_else(invalid)?;
-    let new = boxed(b"moov", &label_moov(body, names, mastering).ok_or_else(invalid)?);
-    if at + size == len {
-        file.seek(SeekFrom::Start(at))?;
-        file.write_all(&new)?;
-        file.set_len(at + new.len() as u64)
-    } else {
-        file.seek(SeekFrom::Start(at + 4))?;
-        file.write_all(b"free")?;
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&new)
+    file.read_exact(&mut data)?;
+    read_moov(&data).ok_or_else(invalid)
+}
+
+fn read_moov(data: &[u8]) -> Option<Probe> {
+    let moov = child(data, &[b"moov"])?;
+    let mvhd = child(moov, &[b"mvhd"])?;
+    let number = |at: usize, wide: bool| -> Option<u64> {
+        Some(match wide {
+            true => u64::from_be_bytes(mvhd.get(at..at + 8)?.try_into().ok()?),
+            false => u32::from_be_bytes(mvhd.get(at..at + 4)?.try_into().ok()?) as u64,
+        })
+    };
+    let (scale, duration) = match mvhd.first()? {
+        1 => (number(20, false)?, number(24, true)?),
+        _ => (number(12, false)?, number(16, false)?),
+    };
+    let mut tracks = Vec::new();
+    let mut mastering = None;
+    let mut fps = 0.0;
+    for (kind, trak) in boxes(moov)? {
+        if &kind != b"trak" {
+            continue;
+        }
+        let hdlr = child(trak, &[b"mdia", b"hdlr"])?;
+        match hdlr.get(8..12)? {
+            b"soun" => {
+                let name = hdlr.get(24..).unwrap_or_default();
+                let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+                tracks.push(String::from_utf8_lossy(name).into_owned());
+            }
+            b"vide" => {
+                let entry = |last: &[u8; 4]| {
+                    [b"hvc1", b"hev1"]
+                        .into_iter()
+                        .find_map(|e| child(trak, &[b"mdia", b"minf", b"stbl", b"stsd", e, last]))
+                };
+                if let (Some(mdcv), Some(clli)) = (entry(b"mdcv"), entry(b"clli")) {
+                    mastering = read_mastering(mdcv, clli);
+                }
+                fps = frame_rate(trak).unwrap_or(0.0);
+            }
+            _ => {}
+        }
+    }
+    Some(Probe { seconds: duration as f64 / scale.max(1) as f64, fps, tracks, mastering })
+}
+
+/// The track's timescale over its first sample's duration, which is every frame's in a clip.
+fn frame_rate(trak: &[u8]) -> Option<f64> {
+    let u32_at = |data: &[u8], at: usize| Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?) as f64);
+    let mdhd = child(trak, &[b"mdia", b"mdhd"])?;
+    let scale = u32_at(mdhd, if mdhd.first()? == &1 { 20 } else { 12 })?;
+    let delta = u32_at(child(trak, &[b"mdia", b"minf", b"stbl", b"stts"])?, 12)?;
+    (delta > 0.0).then(|| scale / delta)
+}
+
+/// The inverse of `mdcv` and `clli`.
+fn read_mastering(mdcv: &[u8], clli: &[u8]) -> Option<Mastering> {
+    let u16_at = |data: &[u8], at: usize| Some(u16::from_be_bytes(data.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_be_bytes(mdcv.get(at..at + 4)?.try_into().ok()?));
+    let xy = |at: usize| Some([u16_at(mdcv, at)? as f32 * 0.00002, u16_at(mdcv, at + 2)? as f32 * 0.00002]);
+    Some(Mastering {
+        primaries: [xy(8)?, xy(0)?, xy(4)?, xy(12)?],
+        max: u32_at(16)? as f32 / 10_000.0,
+        min: u32_at(20)? as f32 / 10_000.0,
+        average: u16_at(clli, 2)? as f32,
+    })
+}
+
+/// The body of the box at `path`, stepping over the fields an stsd or sample entry has first.
+fn child<'a>(data: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
+    let (kind, body) = boxes(data)?.into_iter().find(|(kind, _)| kind == path[0])?;
+    match path.len() {
+        1 => Some(body),
+        _ => child(body.get(header(&kind)..)?, &path[1..]),
     }
 }
 
@@ -273,15 +376,6 @@ mod tests {
         average: 400.0,
     };
 
-    fn child<'a>(data: &'a [u8], path: &[&[u8; 4]]) -> &'a [u8] {
-        let (kind, body) = boxes(data).unwrap().into_iter().find(|(kind, _)| kind == path[0]).unwrap();
-        if path.len() == 1 {
-            body
-        } else {
-            child(&body[header(&kind)..], &path[1..])
-        }
-    }
-
     #[test]
     fn labels_land_in_the_right_boxes() {
         let hdlr = |kind: &[u8; 4]| boxed(b"hdlr", &[&[0; 8][..], kind, &[0; 12], b"Handler\0"].concat());
@@ -293,14 +387,39 @@ mod tests {
 
         let out = label_moov(&moov, &["game"], Some(PANEL)).unwrap();
         let traks: Vec<_> = boxes(&out).unwrap().into_iter().filter(|(kind, _)| kind == b"trak").collect();
-        let entry = |last: &'static [u8; 4]| child(traks[0].1, &[b"mdia", b"minf", b"stbl", b"stsd", b"hvc1", last]);
+        let entry =
+            |last: &'static [u8; 4]| child(traks[0].1, &[b"mdia", b"minf", b"stbl", b"stsd", b"hvc1", last]).unwrap();
         assert_eq!(entry(b"hvcC"), [1, 2, 3]);
         let mdcv = entry(b"mdcv");
         // green x comes first, max luminance follows the four points
         assert_eq!(u16::from_be_bytes([mdcv[0], mdcv[1]]), 13250);
         assert_eq!(u32::from_be_bytes([mdcv[16], mdcv[17], mdcv[18], mdcv[19]]), 10_000_000);
         assert_eq!(entry(b"clli"), [0x03, 0xE8, 0x01, 0x90]);
-        assert_eq!(&child(traks[1].1, &[b"mdia", b"hdlr"])[24..], b"game\0");
-        assert_eq!(&child(traks[0].1, &[b"mdia", b"hdlr"])[24..], b"Handler\0");
+        assert_eq!(&child(traks[1].1, &[b"mdia", b"hdlr"]).unwrap()[24..], b"game\0");
+        assert_eq!(&child(traks[0].1, &[b"mdia", b"hdlr"]).unwrap()[24..], b"Handler\0");
+    }
+
+    #[test]
+    fn probe_reads_back_what_labels_wrote() {
+        let be = |v: u32| v.to_be_bytes();
+        let hdlr = |kind: &[u8; 4]| boxed(b"hdlr", &[&[0; 8][..], kind, &[0; 12], b"Handler\0"].concat());
+        let entry = boxed(b"hvc1", &[0; 78]);
+        let stsd = boxed(b"stsd", &[&[0, 0, 0, 0, 0, 0, 0, 1][..], &entry].concat());
+        let stts = boxed(b"stts", &[&[0; 4][..], &be(1), &be(300), &be(1500)].concat());
+        let mdhd = boxed(b"mdhd", &[&[0; 12][..], &be(90_000), &be(450_000)].concat());
+        let minf = boxed(b"minf", &boxed(b"stbl", &[stsd, stts].concat()));
+        let video = boxed(b"mdia", &[mdhd, hdlr(b"vide"), minf].concat());
+        let sound = || boxed(b"trak", &boxed(b"mdia", &hdlr(b"soun")));
+        let mvhd = boxed(b"mvhd", &[&[0; 12][..], &be(1000), &be(5500)].concat());
+        let moov = [mvhd, boxed(b"trak", &video), sound(), sound()].concat();
+
+        let labelled = boxed(b"moov", &label_moov(&moov, &["game", "voice"], Some(PANEL)).unwrap());
+        let probe = read_moov(&labelled).unwrap();
+        assert_eq!(probe.seconds, 5.5);
+        assert_eq!(probe.fps, 60.0);
+        assert_eq!(probe.tracks, ["game", "voice"]);
+        let mastering = probe.mastering.unwrap();
+        assert!((mastering.max - PANEL.max).abs() < 0.01 && (mastering.average - PANEL.average).abs() < 0.5);
+        assert!((mastering.primaries[1][0] - PANEL.primaries[1][0]).abs() < 0.0001);
     }
 }

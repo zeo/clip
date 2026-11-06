@@ -102,7 +102,7 @@ fn description(exe: &Path) -> Option<String> {
     }
 }
 
-fn folder_safe(name: &str) -> String {
+pub fn folder_safe(name: &str) -> String {
     let name: String =
         name.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { ' ' } else { c }).collect();
     let name = name.trim().trim_end_matches(['.', ' ']);

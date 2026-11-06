@@ -342,7 +342,7 @@ pub fn onsets(path: &std::path::Path) -> Result<(Vec<i64>, Vec<i64>)> {
     }
 }
 
-fn each_sample(reader: &IMFSourceReader, stream: u32, mut visit: impl FnMut(i64, &[u8])) -> Result<()> {
+pub fn each_sample(reader: &IMFSourceReader, stream: u32, mut visit: impl FnMut(i64, &[u8])) -> Result<()> {
     unsafe {
         reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
         reader.SetStreamSelection(stream, true)?;

@@ -4,7 +4,9 @@ mod app;
 mod audio;
 mod capture;
 mod encode;
+mod export;
 mod focus;
+mod library;
 use hdrkit as hdr;
 mod ring;
 mod save;
@@ -379,6 +381,16 @@ fn self_test() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("memory-self-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
     let mut failures = 0;
+    match unsafe {
+        windows::core::Interface::cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>(&gpu.device)?
+            .GetGPUThreadPriority()?
+    } {
+        capture::GPU_PRIORITY => println!("ok   gpu priority: {}", capture::GPU_PRIORITY),
+        other => {
+            failures += 1;
+            println!("FAIL gpu priority: {other}, asked for {}", capture::GPU_PRIORITY)
+        }
+    }
     match check_transfer(&gpu) {
         Ok(report) => println!("ok   transfer: {report}"),
         Err(e) => {
@@ -462,6 +474,43 @@ fn self_test() -> Result<()> {
                     failures += 1;
                     println!("FAIL {case} {kind} {}: {e}", choice.name)
                 }
+            }
+        }
+    }
+    for case in ["sdr-hardware", "hdr10-hardware"] {
+        let source = dir.join(format!("{case}.mp4"));
+        if !source.exists() {
+            continue;
+        }
+        let (mixed, kept) = (dir.join(format!("{case} mixed.mp4")), dir.join(format!("{case} kept.mp4")));
+        let outcome = (|| -> std::result::Result<_, String> {
+            let tracks = export::tracks(&source)?.into_iter().map(|(name, pcm)| (name, pcm.len() / audio::BLOCK));
+            let tracks: Vec<(String, usize)> = tracks.collect();
+            export::trim(&source, &mixed, 0.5, 1.5, &[0, 1], true)?;
+            export::trim(&source, &kept, 0.5, 1.5, &[1], false)?;
+            let back = |path| read_back(path).map_err(|e| e.message());
+            let onset = sync::onsets(&mixed).map_err(|e| e.message())?.1.first().copied();
+            let heard = sync::onsets(&source).map_err(|e| e.message())?.1.first().copied();
+            Ok((tracks, back(&mixed)?, back(&kept)?, onset.zip(heard)))
+        })();
+        let two_seconds = |frames: usize| frames.abs_diff(2 * audio::RATE as usize) <= 2048;
+        // a cut from 0.5 s hears the tone half a second sooner than the source does
+        let on_time = |onsets: Option<(i64, i64)>| {
+            onsets.is_some_and(|(cut, source)| (source - cut - SECOND / 2).abs() < SECOND / 1000)
+        };
+        match &outcome {
+            Ok((tracks, mixed, kept, onset))
+                if tracks.iter().map(|(name, _)| name.as_str()).eq(["tone 440", "tone 660"])
+                    && tracks.iter().all(|&(_, frames)| two_seconds(frames))
+                    && matches!(mixed.as_slice(), [(30, true, _), (40.., _, _)])
+                    && matches!(kept.as_slice(), [(30, true, _), (40.., _, _)])
+                    && on_time(*onset) =>
+            {
+                println!("ok   trim {case}: 30 frames from 0.5 s, mixed and kept audio")
+            }
+            other => {
+                failures += 1;
+                println!("FAIL trim {case}: {other:?}")
             }
         }
     }
