@@ -51,6 +51,7 @@
 
   async function apply() {
     if (!draft) return;
+    draft.cap = Math.max(0, Math.floor(draft.cap || 0));
     busy = true;
     error = '';
     try {
@@ -148,6 +149,13 @@
       <span class="folder proper mono">{draft.folder}</span>
       <button class="btn" onclick={pickFolder}>change</button>
     </div>
+    <div class="fields">
+      <label>
+        <span>keep clips under, <span class="proper">GB</span></span>
+        <input type="number" min="0" step="1" bind:value={draft.cap} />
+      </label>
+    </div>
+    <p class="form-hint">0 keeps everything. past the limit the oldest unstarred clips are deleted for good after each save, they skip the recycle bin</p>
 
     <h3 class="rule-head">system</h3>
     <label class="toggle">

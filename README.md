@@ -2,7 +2,7 @@
 
 A game clipper for Windows 11 that keeps the last stretch of play in RAM and writes it out on demand. Nothing is injected into the game: video comes from Windows Graphics Capture and audio from per-process loopback, so anti-cheat has nothing to object to.
 
-Started with no arguments, it sits in the tray and records whichever app has focus: that app's window, with its sound on a track of its own. Alt+F9, or save clip in the tray menu, writes the last 30 seconds to `Videos\memory\<app>`, with a beep once the file is written. The window, opened from the tray or by starting memory again, sets the buffer length, quality, HDR, mic, the apps that get their own audio track, the folder and start with Windows. It lists saved clips with a player, grouped by app. The editor and game API auto-clips come later. The same exe is also a command line recorder:
+Started with no arguments, it sits in the tray and records whichever app has focus: that app's window, with its sound on a track of its own. Alt+F9, or save clip in the tray menu, writes the last 30 seconds to `Videos\memory\<app>`, with a short sound once the file is written: capscr's shutter played backwards, so the two are told apart by ear. A failed save plays the Windows error sound instead. The window, opened from the tray or by starting memory again, sets the buffer length, quality, HDR, mic, the apps that get their own audio track, the folder and start with Windows. It holds the clip library and a page per clip for trimming. Game API auto-clips come later. The same exe is also a command line recorder:
 
 ```
 memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
@@ -23,6 +23,16 @@ The tray app looks at the focused window four times a second. Each app is named 
 The desktop, taskbar, start menu, minimized windows, tool windows and memory's own window are skipped. When the recorded window closes, or no app has had focus yet, memory records the primary monitor and saves to `desktop`.
 
 Settings lists the apps playing sound right now. Each one switched on gets its own track in every clip, the way OBS adds an application audio capture source, and is left out of `others`. While that app is the one being recorded, its sound stays on `game` and it gets no second track.
+
+## library
+
+Clips are grouped by app, then by session: clips from one app saved less than 30 minutes apart sit under one header, such as `Fortnite, today 14:02 to 14:47, 6 clips`. Each card shows a still, made once from the first second and kept in memory's cache folder, and plays the clip muted while the pointer is over it. Only one card plays at a time. Clips can be starred, renamed, and deleted to the Recycle Bin. Settings can keep the folder under a number of GB. After each save, the oldest unstarred clips past that limit are deleted for good, since the Recycle Bin would not free the space.
+
+Opening a clip shows it large over a timeline with two trim handles and one lane per audio track, each with a waveform, mute and solo. The webview only plays a file's first audio track, so the video plays muted and every track is decoded to its own WAV and played through Web Audio, restarted where the video is if they drift more than 40 ms apart. Space plays, the arrow keys step one frame, I and O set the cut, Esc goes back. Save trimmed copy writes `<name> trimmed.mp4` next to the clip and leaves the original alone. The video is decoded and encoded again on the GPU, so the cut lands on the exact frame, at the clip's size, frame rate and bitrate. Only the tracks left audible go in, either mixed into one track, which Discord and most players expect, or kept apart.
+
+## staying out of the game's way
+
+The tray app runs at below normal CPU priority and sets its GPU thread priority to -3 on the -7 to 7 scale, so a saturated GPU schedules the game's work ahead of memory's. It stays out of background mode, which would also let Windows page out the buffer. Closing the window destroys its WebView2 instead of hiding it.
 
 ## hdr
 
@@ -63,6 +73,10 @@ Windows only gives a per-app capture the app's own sound and that of its direct 
 - The test click peaks at -72 dBFS. With headphones and the volume near maximum it may still be faintly audible.
 - Mastering values in HDR10 files are whatever the display driver reports.
 - Switching HDR was tested on a real display on build 26340 with an NVIDIA GPU. Each switch freezes the clip for about 0.4 s. After switching HDR on, Windows composes the first frames with SDR white at 80 nits, so they come out at a third of their linear brightness. That lasted from 0.13 s to 0.8 s across six switches at 60 and 120 fps. For about 1.5 s the driver reports a lower peak, which makes highlights roll off a little early.
+
+## credits
+
+`assets/saved.wav` is `screenshot.wav` from [capscr](https://github.com/zeo/capscr), reversed with the leading silence trimmed. capscr is MIT licensed, copyright (c) 2024-2025 capscr contributors.
 
 ## license
 

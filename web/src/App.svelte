@@ -3,9 +3,10 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import ClipPage from './Clip.svelte';
   import Clips from './Clips.svelte';
   import Preferences from './Preferences.svelte';
-  import { ramMB, type Clip, type Settings, type Status } from './types';
+  import { ramMB, size, title, type Clip, type Settings, type Status } from './types';
 
   const win = getCurrentWindow();
   let view = $state<'clips' | 'settings'>('clips');
@@ -14,13 +15,18 @@
   let clips = $state<Clip[]>([]);
   let first = $state(false);
   let app = $state<string | null>(null);
+  let starredOnly = $state(false);
+  let opened = $state<string | null>(null);
+  const current = $derived(clips.find((clip) => clip.path === opened));
+  const starred = $derived(clips.filter((clip) => clip.starred).length);
+  const used = $derived(clips.reduce((sum, clip) => sum + clip.bytes, 0));
   // clips arrive newest first, so apps come out in order of their latest clip
   const apps = $derived.by(() => {
     const counts = new Map<string, number>();
     for (const clip of clips) counts.set(clip.app, (counts.get(clip.app) ?? 0) + 1);
     return [...counts];
   });
-  const shown = $derived(app === null ? clips : clips.filter((clip) => clip.app === app));
+  const shown = $derived(clips.filter((clip) => (app === null || clip.app === app) && (!starredOnly || clip.starred)));
 
   async function refresh() {
     [settings, clips] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
@@ -47,7 +53,7 @@
   <header class="titlebar" data-tauri-drag-region>
     <div class="titlebar-drag" data-tauri-drag-region>
       <span class="titlebar-mark" data-tauri-drag-region>memory</span>
-      <span class="titlebar-path" data-tauri-drag-region><span class="path-sep">/</span><span>{view}</span></span>
+      <span class="titlebar-path" data-tauri-drag-region><span class="path-sep">/</span><span>{view}</span>{#if view === 'clips' && current}<span class="path-sep">/</span><span class="proper">{title(current)}</span>{/if}</span>
     </div>
     <div class="window-controls">
       <button aria-label="minimize" onclick={() => win.minimize()}>
@@ -95,12 +101,16 @@
       <section class="module">
         <div class="module-head"><span class="module-index">C</span><h2>apps</h2></div>
         <div class="tasks" role="radiogroup" aria-label="app">
-          <button class="nav-item app" role="radio" aria-checked={app === null} onclick={() => (app = null)}>
+          <button class="nav-item app" role="radio" aria-checked={app === null && !starredOnly} onclick={() => ((app = null), (starredOnly = false), (opened = null))}>
             <span>all</span>
             <span class="nav-item-count">{clips.length}</span>
           </button>
+          <button class="nav-item app" role="radio" aria-checked={starredOnly} onclick={() => ((app = null), (starredOnly = true), (opened = null))}>
+            <span>starred</span>
+            <span class="nav-item-count">{starred}</span>
+          </button>
           {#each apps as [name, count] (name)}
-            <button class="nav-item app" role="radio" aria-checked={app === name} onclick={() => (app = name)}>
+            <button class="nav-item app" role="radio" aria-checked={app === name && !starredOnly} onclick={() => ((app = name), (starredOnly = false), (opened = null))}>
               <span class="proper app-name">{name}</span>
               <span class="nav-item-count">{count}</span>
             </button>
@@ -112,7 +122,25 @@
 
   <main class="stage">
     {#if view === 'clips'}
-      <Clips clips={shown} {app} buffer={settings?.buffer ?? 30} />
+      {#if current}
+        {#key current.path}
+          <ClipPage
+            clip={current}
+            onclose={() => (opened = null)}
+            onmoved={async (to) => {
+              await refresh();
+              opened = to;
+            }}
+          />
+        {/key}
+      {:else}
+        <Clips
+          clips={shown}
+          heading={starredOnly ? 'starred' : (app ?? 'clips')}
+          buffer={settings?.buffer ?? 30}
+          onopen={(clip) => (opened = clip.path)}
+        />
+      {/if}
     {:else}
       <Preferences {first} onapplied={applied} />
     {/if}
@@ -121,6 +149,8 @@
   <footer class="statusbar">
     {#if settings}
       <span class="proper">{settings.folder}</span>
+      <span class="sep">|</span>
+      <span>{size(used)}{settings.cap > 0 ? ` of ${settings.cap} GB` : ''}</span>
       <span class="grow"></span>
       <span>{settings.height >= 4320 ? 'native' : `${settings.height}p`}{settings.fps} · {settings.mbps} <span class="proper">Mbps</span></span>
       <span class="sep">|</span>
