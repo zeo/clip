@@ -27,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_NOREMOVE, WM_APP, WM_HOTKEY, WM_TIMER,
 };
 
+use crate::art::{self, Art};
 use crate::capture::Target;
 use crate::focus::{self, Follow};
 use crate::library::{self, Clip, Marks};
@@ -62,6 +63,8 @@ pub struct Settings {
     start_with_windows: bool,
     /// whole gigabytes the clips folder may hold, 0 for no limit
     cap: u32,
+    /// a steamgriddb api key, for art of games steam doesn't have
+    steamgriddb: String,
 }
 
 impl Default for Settings {
@@ -78,6 +81,7 @@ impl Default for Settings {
             folder: PathBuf::new(),
             start_with_windows: false,
             cap: 0,
+            steamgriddb: String::new(),
         }
     }
 }
@@ -161,7 +165,8 @@ fn serve() -> Result<(), String> {
             delete,
             save_thumb,
             track_audio,
-            export
+            export,
+            game_art
         ])
         .setup(move |app| {
             let dir = app.path().config_dir()?.join(&name);
@@ -414,6 +419,9 @@ fn record(
         let app = focus::app_name(pid);
         // the icon only dresses up the library, a game without one still records
         let _ = focus::save_icon(pid, &library::icon(thumbs, &app));
+        if let Some(exe) = focus::exe(pid) {
+            let _ = art::remember(&exe, &art::dir(thumbs, &app));
+        }
         Ok(Rc::new(Recording { session, window, app }))
     };
     let focused = || focus::focused(&settings.lock().expect("settings poisoned").record);
@@ -745,6 +753,27 @@ fn save_thumb(shared: State<Shared>, path: PathBuf, jpeg: Vec<u8>) -> Result<Pat
     std::fs::create_dir_all(&thumbs).map_err(|e| e.to_string())?;
     std::fs::write(&thumb, jpeg).map_err(|e| e.to_string())?;
     Ok(thumb)
+}
+
+/// A game's cover, hero and logo as far as they're on disk. Missing ones are fetched in the background
+/// and arrive in an `art` event.
+#[tauri::command]
+fn game_art(handle: AppHandle, shared: State<Shared>, app: String) -> Result<Art, String> {
+    let mut parts = Path::new(&app).components();
+    if !matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None)) {
+        return Err(format!("{app} is not an app"));
+    }
+    let dir = art::dir(&shared.cache.join("thumbs"), &app);
+    let have = art::cached(&dir, &app);
+    let key = shared.settings.lock().expect("settings poisoned").steamgriddb.trim().to_string();
+    if art::due(&dir, &have, &key) {
+        std::thread::spawn(move || {
+            if let Some(art) = art::fetch(&dir, &app, &key) {
+                let _ = handle.emit("art", &art);
+            }
+        });
+    }
+    Ok(have)
 }
 
 #[derive(Serialize)]

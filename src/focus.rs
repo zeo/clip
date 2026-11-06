@@ -175,7 +175,7 @@ fn exe_name(pid: u32) -> Option<String> {
     Some(exe(pid)?.file_name()?.to_string_lossy().to_lowercase())
 }
 
-fn exe(pid: u32) -> Option<PathBuf> {
+pub fn exe(pid: u32) -> Option<PathBuf> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut path = [0u16; 1024];

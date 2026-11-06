@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod art;
 mod audio;
 mod capture;
 mod encode;
