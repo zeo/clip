@@ -220,7 +220,8 @@ fn serve() -> Result<(), String> {
     // clip was called memory, and its folders and start entry carry that name until moved
     let (name, old) = (format!("clip{suffix}"), format!("memory{suffix}"));
     let mut context = tauri::generate_context!();
-    context.config_mut().identifier = format!("lt.rot.{name}");
+    // lt.rot.clip belongs to a different app, and sharing it would share its webview folder and single instance
+    context.config_mut().identifier = format!("lt.rot.clip-recorder{suffix}");
     tauri::Builder::default()
         // a second copy would record everything twice, so launching again opens the window instead
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
@@ -257,7 +258,7 @@ fn serve() -> Result<(), String> {
             let moves = [
                 (paths.config_dir()?, old.clone(), name.clone()),
                 (paths.cache_dir()?, old.clone(), name.clone()),
-                (paths.local_data_dir()?, format!("lt.rot.{old}"), format!("lt.rot.{name}")),
+                (paths.local_data_dir()?, format!("lt.rot.{old}"), app.config().identifier.clone()),
             ];
             if let Err(e) = migrate(&moves.map(|(root, from, to)| (root.join(from), root.join(to)))) {
                 // the old folders stay where they are, so nothing is lost by starting without them
@@ -1247,19 +1248,23 @@ mod tests {
     fn old_folders_move_once_and_never_over_new_ones() {
         let root = std::env::temp_dir().join(format!("clip-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for dir in ["memory", "memory-test", "lt.rot.clip"] {
+        for dir in ["memory", "memory-test", "lt.rot.clip-recorder"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
             std::fs::write(root.join(dir).join("settings.json"), dir).unwrap();
         }
         std::fs::create_dir_all(root.join("lt.rot.memory")).unwrap();
-        let moves =
-            [("memory", "clip"), ("memory-test", "clip-test"), ("lt.rot.memory", "lt.rot.clip"), ("gone", "new")]
-                .map(|(from, to)| (root.join(from), root.join(to)));
+        let moves = [
+            ("memory", "clip"),
+            ("memory-test", "clip-test"),
+            ("lt.rot.memory", "lt.rot.clip-recorder"),
+            ("gone", "new"),
+        ]
+        .map(|(from, to)| (root.join(from), root.join(to)));
         migrate(&moves).unwrap();
         let read = |dir: &str| std::fs::read_to_string(root.join(dir).join("settings.json")).unwrap();
         assert_eq!(
-            (read("clip"), read("clip-test"), read("lt.rot.clip")),
-            ("memory".into(), "memory-test".into(), "lt.rot.clip".into())
+            (read("clip"), read("clip-test"), read("lt.rot.clip-recorder")),
+            ("memory".into(), "memory-test".into(), "lt.rot.clip-recorder".into())
         );
         assert!(!root.join("memory").exists() && root.join("lt.rot.memory").exists() && !root.join("new").exists());
         let _ = std::fs::remove_dir_all(&root);
