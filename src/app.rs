@@ -127,21 +127,23 @@ struct Shared {
     recorder: u32,
 }
 
-/// Runs memory from the tray, keeping the last stretch of the focused app ready to save.
+/// Runs clip from the tray, keeping the last stretch of the focused app ready to save.
 pub fn run() {
     if let Err(e) = serve() {
-        unsafe { MessageBoxW(None, &HSTRING::from(e), w!("memory"), MB_ICONERROR) };
+        unsafe { MessageBoxW(None, &HSTRING::from(e), w!("clip"), MB_ICONERROR) };
     }
 }
 
 fn serve() -> Result<(), String> {
     // below normal, not background mode, which would also let windows page out the buffer
     let _ = unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) };
-    // a profile runs a separate memory beside the usual one, with its own settings and single instance
-    let name = match std::env::var("MEMORY_PROFILE") {
-        Ok(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!("memory-{p}"),
-        _ => "memory".to_string(),
+    // a profile runs a separate clip beside the usual one, with its own settings and single instance
+    let suffix = match std::env::var("CLIP_PROFILE") {
+        Ok(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!("-{p}"),
+        _ => String::new(),
     };
+    // clip was called memory, and its folders and start entry carry that name until moved
+    let (name, old) = (format!("clip{suffix}"), format!("memory{suffix}"));
     let mut context = tauri::generate_context!();
     context.config_mut().identifier = format!("lt.rot.{name}");
     tauri::Builder::default()
@@ -169,6 +171,23 @@ fn serve() -> Result<(), String> {
             game_art
         ])
         .setup(move |app| {
+            let paths = app.path();
+            let moves = [
+                (paths.config_dir()?, old.clone(), name.clone()),
+                (paths.cache_dir()?, old.clone(), name.clone()),
+                (paths.local_data_dir()?, format!("lt.rot.{old}"), format!("lt.rot.{name}")),
+            ];
+            if let Err(e) = migrate(&moves.map(|(root, from, to)| (root.join(from), root.join(to)))) {
+                // the old folders stay where they are, so nothing is lost by starting without them
+                std::thread::spawn(move || unsafe {
+                    MessageBoxW(
+                        None,
+                        &HSTRING::from(format!("clip starts without its old settings: {e}")),
+                        w!("clip"),
+                        MB_ICONERROR,
+                    )
+                });
+            }
             let dir = app.path().config_dir()?.join(&name);
             let file = dir.join("settings.json");
             let marks_file = dir.join("library.json");
@@ -179,23 +198,27 @@ fn serve() -> Result<(), String> {
             let mut settings: Settings =
                 stored.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
             if settings.folder.as_os_str().is_empty() {
-                settings.folder = app.path().video_dir()?.join("memory");
+                settings.folder = app.path().video_dir()?.join("clip");
             }
             app.asset_protocol_scope().allow_directory(&settings.folder, true)?;
+            let _ = run_at_login(&old, false);
+            if settings.start_with_windows {
+                let _ = run_at_login(&name, true);
+            }
             let menu = Menu::with_items(
                 app,
                 &[
                     &MenuItem::with_id(app, "save", "save clip   alt+f9", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "show", "open memory", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "show", "open clip", true, None::<&str>)?,
                     &MenuItem::with_id(app, "folder", "open clips folder", true, None::<&str>)?,
                     &PredefinedMenuItem::separator(app)?,
                     &MenuItem::with_id(app, "quit", "quit", true, None::<&str>)?,
                 ],
             )?;
-            let mut tray = TrayIconBuilder::with_id("memory")
+            let mut tray = TrayIconBuilder::with_id("clip")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .tooltip("memory: starting")
+                .tooltip("clip: starting")
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left, button_state: MouseButtonState::Up, ..
@@ -261,7 +284,7 @@ fn serve() -> Result<(), String> {
                     remember(app, &window);
                 }
             }
-            // closing the window only hides memory in the tray, quitting from the tray passes a code
+            // closing the window only hides clip in the tray, quitting from the tray passes a code
             RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
             _ => {}
         });
@@ -436,8 +459,8 @@ fn record(
             },
         };
         let _ = tray.set_tooltip(Some(match next.recording {
-            true => format!("memory: recording {}, {}", next.app, next.message),
-            false => format!("memory: {}", next.message),
+            true => format!("clip: recording {}, {}", next.app, next.message),
+            false => format!("clip: {}", next.message),
         }));
         let _ = app.emit("status", &next);
         *status.lock().expect("status poisoned") = next;
@@ -471,7 +494,7 @@ fn record(
                 if !at.is_empty() {
                     marks.mark(&folder, &out, at);
                     if let Err(e) = marks.store(marks_file) {
-                        let _ = tray.set_tooltip(Some(format!("memory: {e}")));
+                        let _ = tray.set_tooltip(Some(format!("clip: {e}")));
                     }
                 }
                 if cap > 0 {
@@ -480,7 +503,7 @@ fn record(
                 let _ = app.emit("clips", ());
             }
             Err(e) => {
-                let _ = tray.set_tooltip(Some(format!("memory: {e}")));
+                let _ = tray.set_tooltip(Some(format!("clip: {e}")));
             }
         }
     };
@@ -572,7 +595,7 @@ fn record(
                     }
                     Err(e) => {
                         let _ = unsafe { MessageBeep(MB_ICONHAND) };
-                        let _ = tray.set_tooltip(Some(format!("memory: {e}")));
+                        let _ = tray.set_tooltip(Some(format!("clip: {e}")));
                     }
                 }
                 None
@@ -625,6 +648,15 @@ fn free(dir: &Path) -> PathBuf {
         })
         .find(|out| !out.exists())
         .expect("some name is free")
+}
+
+/// Renames each folder to its new name, unless it's gone or the new one is already there.
+fn migrate(moves: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    moves
+        .iter()
+        .filter(|(from, to)| from.is_dir() && !to.exists())
+        .try_for_each(|(from, to)| std::fs::rename(from, to))
+        .map_err(|e| e.to_string())
 }
 
 fn run_at_login(name: &str, on: bool) -> windows::core::Result<()> {
@@ -929,5 +961,27 @@ mod tests {
         assert_eq!(due(first, first + 20 * s, buffer), first + 28 * s);
         assert_eq!(due(first, first + 29 * s, buffer), first + 29 * s);
         assert_eq!(due(first, first, 10 * s), first + 5 * s);
+    }
+
+    #[test]
+    fn old_folders_move_once_and_never_over_new_ones() {
+        let root = std::env::temp_dir().join(format!("clip-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["memory", "memory-test", "lt.rot.clip"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("settings.json"), dir).unwrap();
+        }
+        std::fs::create_dir_all(root.join("lt.rot.memory")).unwrap();
+        let moves =
+            [("memory", "clip"), ("memory-test", "clip-test"), ("lt.rot.memory", "lt.rot.clip"), ("gone", "new")]
+                .map(|(from, to)| (root.join(from), root.join(to)));
+        migrate(&moves).unwrap();
+        let read = |dir: &str| std::fs::read_to_string(root.join(dir).join("settings.json")).unwrap();
+        assert_eq!(
+            (read("clip"), read("clip-test"), read("lt.rot.clip")),
+            ("memory".into(), "memory-test".into(), "lt.rot.clip".into())
+        );
+        assert!(!root.join("memory").exists() && root.join("lt.rot.memory").exists() && !root.join("new").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

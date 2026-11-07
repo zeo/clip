@@ -1,26 +1,26 @@
-# memory
+# clip
 
 A game clipper for Windows 11 that keeps the last stretch of play in RAM and writes it out on demand. Nothing is injected into the game: video comes from Windows Graphics Capture and audio from per-process loopback, so anti-cheat has nothing to object to.
 
-Started with no arguments, it sits in the tray and records the game in focus: its window, with its sound on a track of its own. Alt+F9, or save clip in the tray menu, writes the last 30 seconds to `Videos\memory\<app>`, with a short sound once the file is written: capscr's shutter played backwards, so the two are told apart by ear. A failed save plays the Windows error sound instead. Alt+F10 marks the moment and saves a clip by itself 15 seconds later, so the moment sits in the middle. The window opens from the tray or by starting memory again. It fills the screen the first time and comes back where it was closed after that. Tabs across the top pick Home, Games, Starred or Settings, also on keys 1 to 4, and the same bar shows what is recording, with buttons to mark and save. A toolbar under it changes with the page. Over clips it filters to all, starred, today or this week, sorts by newest, longest or largest, and searches clip and game names. In Settings it switches between Recording, Video, Audio, Storage and System. It sets the buffer length, quality, HDR, mic, the apps that get their own audio track, the folder, the storage limit and start with Windows, and nothing changes until apply. Game API auto-clips come later. The same exe is also a command line recorder:
+Started with no arguments, it sits in the tray and records the game in focus: its window, with its sound on a track of its own. Alt+F9, or save clip in the tray menu, writes the last 30 seconds to `Videos\clip\<app>`, with a short sound once the file is written: capscr's shutter played backwards, so the two are told apart by ear. A failed save plays the Windows error sound instead. Alt+F10 marks the moment and saves a clip by itself 15 seconds later, so the moment sits in the middle. The window opens from the tray or by starting clip again. It fills the screen the first time and comes back where it was closed after that. Tabs across the top pick Home, Games, Starred or Settings, also on keys 1 to 4, and the same bar shows what is recording, with buttons to mark and save. A toolbar under it changes with the page. Over clips it filters to all, starred, today or this week, sorts by newest, longest or largest, and searches clip and game names. In Settings it switches between Recording, Video, Audio, Storage and System. It sets the buffer length, quality, HDR, mic, the apps that get their own audio track, the folder, the storage limit and start with Windows, and nothing changes until apply. Game API auto-clips come later. The same exe is also a command line recorder:
 
 ```
-memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
+clip capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
                [--fps N] [--mbps N] [--height N] [--scale FILTER] [--software] [--hdr10] [--mic] [--app EXE]... [--out FILE]
-memory encoders
-memory sync
-memory self-test [--live]
+clip encoders
+clip sync
+clip self-test [--live]
 ```
 
 `capture` records for `--for` seconds (10 by default) and saves the last `--buffer` seconds (30) to `--out` (`clip.mp4`). The default output is 1080p60 H.264 at 20 Mbps. Frames are scaled on the GPU with an area filter and encoded by the GPU's Media Foundation encoder: NVENC, AMF or QSV. Packets sit in a ring that drops whole one-second GOPs, so every clip starts on a keyframe. Saving copies packets into the MP4 without re-encoding.
 
-`encoders` lists the H.264 and HEVC Main10 encoders, hardware and software, that Media Foundation offers on the GPU memory captures with.
+`encoders` lists the H.264 and HEVC Main10 encoders, hardware and software, that Media Foundation offers on the GPU clip captures with.
 
 ## following the app
 
 The tray app looks at the focused window four times a second. Each app is named by its exe's file description, so `cs2.exe` lands in `Counter-Strike 2`, or by the exe name when it has none. Recording moves to a new app once it has kept focus for a second, so alt-tabbing past a window doesn't restart anything. The app just left keeps recording in the background for a minute. Alt-tab back within that minute and its buffer is whole, even with Alt+F9 pressed the moment it has focus again. While both run, the buffer takes twice the RAM settings shows.
 
-Only games are followed: a window counts once it covers its whole monitor, the way fullscreen and borderless games do, and maximized windows don't. Settings lists the apps with a window open, and any switched on there are recorded in a window too. The desktop, taskbar, start menu, minimized and cloaked windows, tool windows and memory's own window never are. Focus moving to something else leaves the game recording. Once the recorded window closes, memory records nothing and the tray says it is waiting for a game, and Alt+F9 or Alt+F10 plays the Windows error sound.
+Only games are followed: a window counts once it covers its whole monitor, the way fullscreen and borderless games do, and maximized windows don't. Settings lists the apps with a window open, and any switched on there are recorded in a window too. The desktop, taskbar, start menu, minimized and cloaked windows, tool windows and clip's own window never are. Focus moving to something else leaves the game recording. Once the recorded window closes, clip records nothing and the tray says it is waiting for a game, and Alt+F9 or Alt+F10 plays the Windows error sound.
 
 Settings lists the apps playing sound right now. Each one switched on gets its own track in every clip, the way OBS adds an application audio capture source, and is left out of `others`. While that app is the one being recorded, its sound stays on `game` and it gets no second track.
 
@@ -30,17 +30,17 @@ Alt+F10 marks the moment, and the clip saves itself 15 seconds after the newest 
 
 ## library
 
-Home lists the last 7 days of clips across every game. Games is a shelf of covers, one per game, and each cover opens the game's page under a banner of its art. The icon is read from the exe when recording starts and kept in memory's cache folder. Clips are grouped by session: clips from one app saved less than 30 minutes apart sit under one header, such as `Fortnite, today 14:02 to 14:47, 6 clips`. Each card shows a still, made once from the first second and kept in memory's cache folder, and plays the clip muted while the pointer is over it. Only one card plays at a time. Clips can be starred, renamed, and deleted to the Recycle Bin. Hovering a card also shows a check in its top left corner. Once one clip is checked, a click on any card checks it as well, Shift-click checks every clip in between, and a bar along the bottom stars or deletes them together, as one Recycle Bin operation. Esc clears the selection. Settings can keep the folder under a number of GB. After each save, the oldest unstarred clips past that limit are deleted for good, since the Recycle Bin would not free the space.
+Home lists the last 7 days of clips across every game. Games is a shelf of covers, one per game, and each cover opens the game's page under a banner of its art. The icon is read from the exe when recording starts and kept in clip's cache folder. Clips are grouped by session: clips from one app saved less than 30 minutes apart sit under one header, such as `Fortnite, today 14:02 to 14:47, 6 clips`. Each card shows a still, made once from the first second and kept in clip's cache folder, and plays the clip muted while the pointer is over it. Only one card plays at a time. Clips can be starred, renamed, and deleted to the Recycle Bin. Hovering a card also shows a check in its top left corner. Once one clip is checked, a click on any card checks it as well, Shift-click checks every clip in between, and a bar along the bottom stars or deletes them together, as one Recycle Bin operation. Esc clears the selection. Settings can keep the folder under a number of GB. After each save, the oldest unstarred clips past that limit are deleted for good, since the Recycle Bin would not free the space.
 
 Opening a clip gives it the window: the video on top, a timeline with two trim handles and one lane per audio track below it, each lane with a waveform, mute and solo, the toolbar above with back, star, rename and delete, and a panel on the right with the clip's details, the cut and its exports. The webview only plays a file's first audio track, so the video plays muted and every track is decoded to its own WAV and played through Web Audio, restarted where the video is if they drift more than 40 ms apart. Space plays, the arrow keys step one frame, I and O set the cut, Esc goes back. Save trimmed copy writes `<name> trimmed.mp4` next to the clip and leaves the original alone. The video is decoded and encoded again on the GPU, so the cut lands on the exact frame, at the clip's size, frame rate and bitrate. Only the tracks left audible go in, either mixed into one track, which Discord and most players expect, or kept apart. Copy for Discord writes `<name> discord.mp4` under 19 MB, since Discord's free upload limit is 20 MB, with the audible tracks mixed into one. The video gets whatever bitrate the audio leaves. Below 3.5 Mbps the picture drops to 720p, below 1.5 Mbps to 540p, and a copy that still comes out over is encoded again lower. A cut longer than about 4 minutes 50 seconds can't fit and is refused.
 
 ## game art
 
-Steam games get their cover, banner and logo from Steam's store CDN, with no key. When recording starts, memory reads Steam's library folders from `libraryfolders.vdf` and takes the app id of the `appmanifest_*.acf` whose install folder holds the exe. Other games get art from SteamGridDB once an API key from the preferences of a SteamGridDB profile is pasted into Settings, under System. Art is fetched once per game, only while the window is open, and kept in the cache folder. Missing art is asked for again after 7 days, or as soon as a key is added. A game without art shows its newest still and its exe icon.
+Steam games get their cover, banner and logo from Steam's store CDN, with no key. When recording starts, clip reads Steam's library folders from `libraryfolders.vdf` and takes the app id of the `appmanifest_*.acf` whose install folder holds the exe. Other games get art from SteamGridDB once an API key from the preferences of a SteamGridDB profile is pasted into Settings, under System. Art is fetched once per game, only while the window is open, and kept in the cache folder. Missing art is asked for again after 7 days, or as soon as a key is added. A game without art shows its newest still and its exe icon.
 
 ## staying out of the game's way
 
-The tray app runs at below normal CPU priority and sets its GPU thread priority to -3 on the -7 to 7 scale, so a saturated GPU schedules the game's work ahead of memory's. It stays out of background mode, which would also let Windows page out the buffer. Closing the window destroys its WebView2 instead of hiding it.
+The tray app runs at below normal CPU priority and sets its GPU thread priority to -3 on the -7 to 7 scale, so a saturated GPU schedules the game's work ahead of clip's. It stays out of background mode, which would also let Windows page out the buffer. Closing the window destroys its WebView2 instead of hiding it.
 
 ## hdr
 
@@ -60,22 +60,22 @@ Each source gets its own AAC track (192 kbps) on the video's clock:
 
 A process belongs to one track only, so nothing is heard twice. With no `voice` or `--app` track, `others` is a single capture of everything outside the game, so it also records Windows system sounds and the launcher that started the game.
 
-Windows only gives a per-app capture the app's own sound and that of its direct children. memory opens a capture on every process that holds an audio session and isn't already a direct child of one it captures. That is how a game four processes below its launcher, like Fortnite under the Epic Games Launcher, still reaches a track.
+Windows only gives a per-app capture the app's own sound and that of its direct children. clip opens a capture on every process that holds an audio session and isn't already a direct child of one it captures. That is how a game four processes below its launcher, like Fortnite under the Epic Games Launcher, still reaches a track.
 
 ## tests
 
-`cargo test` needs no GPU. `memory self-test` runs the tonemap, HDR10 and scaling shaders against known values. It encodes two seconds of a moving pattern with every hardware and software encoder it finds, switches HDR halfway through, muxes the result with two audio tracks and reads it back. `--live` adds the sync test.
+`cargo test` needs no GPU. `clip self-test` runs the tonemap, HDR10 and scaling shaders against known values. It encodes two seconds of a moving pattern with every hardware and software encoder it finds, switches HDR halfway through, muxes the result with two audio tracks and reads it back. `--live` adds the sync test.
 
-`memory sync` measures A/V sync on the real capture path. A nearly transparent window under every other window flashes six times, and a click plays at -72 dBFS with each flash. It records at the display's refresh rate unless `--fps` says otherwise. The test then finds both in the saved clip and prints how far apart they landed. It never takes focus and is safe to run mid match.
+`clip sync` measures A/V sync on the real capture path. A nearly transparent window under every other window flashes six times, and a click plays at -72 dBFS with each flash. It records at the display's refresh rate unless `--fps` says otherwise. The test then finds both in the saved clip and prints how far apart they landed. It never takes focus and is safe to run mid match.
 
 ## limits
 
-- Store (UWP) apps sit inside an Application Frame Host window. memory names the clip folder after that host and puts the app's sound in `others`, not `game`. Untested.
-- Apps running as administrator are untested: Windows may refuse capture and per-app audio to a non-elevated memory.
+- Store (UWP) apps sit inside an Application Frame Host window. clip names the clip folder after that host and puts the app's sound in `others`, not `game`. Untested.
+- Apps running as administrator are untested: Windows may refuse capture and per-app audio to a non-elevated clip.
 - AMD (AMF) and Intel (QSV) encoders are untested. The only GPU here is NVIDIA, so the software encoder and WARP stand in for them.
 - An app muted or turned down in the Windows volume mixer is muted in its track as well, because process loopback taps the stream after per-app volume.
 - With a `voice` or `--app` track running, Windows system sounds are left out: their audio session reports no process, so there is nothing to open a per-app capture on.
-- In that case a launcher that is the game's direct parent, Steam for example, is also left out of `others`, since capturing it would record the game a second time. So is the process that started memory.
+- In that case a launcher that is the game's direct parent, Steam for example, is also left out of `others`, since capturing it would record the game a second time. So is the process that started clip.
 - Per-app capture reaching only direct children was measured on Windows build 26340. Microsoft's documentation says "child processes" without saying how deep. On a build that captured whole trees, a process with sound two levels below another one would be heard twice.
 - Sync is measured to one display refresh, 8 ms at 120 Hz, since a flash only reaches the clip on the frame it was shown.
 - The test click peaks at -72 dBFS. With headphones and the volume near maximum it may still be faintly audible.

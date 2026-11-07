@@ -227,7 +227,7 @@
       {:else}
         <section class="group">
           <h2 class="group-head">Startup</h2>
-          <p class="form-hint">memory lives in the tray. Closing this window keeps it recording.</p>
+          <p class="form-hint">clip lives in the tray. Closing this window keeps it recording.</p>
           <div class="rows">
             <label class="row">
               <span class="row-label">Start with Windows</span>
@@ -254,7 +254,7 @@
       <div class="applybar">
         <span class="grow">
           {#if error}<span class="form-error">{error}</span>
-          {:else if first}memory is already recording with these. Change anything, then apply.
+          {:else if first}clip is already recording with these. Change anything, then apply.
           {:else}Unsaved changes. Applying restarts the buffer.{/if}
         </span>
         {#if changed}<button class="gel" disabled={busy} onclick={revert}>Revert</button>{/if}

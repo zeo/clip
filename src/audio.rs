@@ -191,7 +191,7 @@ fn assign(sources: &[Source], processes: &Processes, sessions: &[u32], own: u32)
         .keys()
         .map(|&pid| {
             let line: Vec<u32> = std::iter::once(pid).chain(processes.ancestors(pid)).collect();
-            // memory's own sound stays out of every lane but one asked for by its pid, as the sync test does
+            // clip's own sound stays out of every lane but one asked for by its pid, as the sync test does
             let mine = line.contains(&own);
             let lane = (0..sources.len()).find(|&i| {
                 (!mine || matches!(sources[i], Source::Process(_))) && roots[i].iter().any(|r| line.contains(r))
@@ -856,7 +856,7 @@ mod tests {
             (31, 30, "discord.exe"),
             (40, 1, "chrome.exe"),
             (41, 40, "chrome.exe"),
-            (50, 1, "memory.exe"),
+            (50, 1, "clip.exe"),
         ]);
         let sources = [
             Source::Process(20),
@@ -900,9 +900,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_s_parent_stays_out_but_its_grandparent_is_recorded() {
+    fn clip_s_parent_stays_out_but_its_grandparent_is_recorded() {
         let running =
-            processes(&[(1, 0, "explorer.exe"), (2, 1, "terminal.exe"), (3, 2, "shell.exe"), (50, 3, "memory.exe")]);
+            processes(&[(1, 0, "explorer.exe"), (2, 1, "terminal.exe"), (3, 2, "shell.exe"), (50, 3, "clip.exe")]);
         assert_eq!(assign(&[Source::Rest], &running, &[1, 2, 3, 50], 50), vec![vec![1]]);
     }
 
@@ -923,9 +923,9 @@ mod tests {
     }
 
     #[test]
-    fn only_a_pid_lane_takes_memory_itself() {
-        let running = processes(&[(1, 0, "explorer.exe"), (50, 1, "memory.exe")]);
-        let sources = [Source::Named(vec!["memory.exe".into()]), Source::Process(50), Source::Rest];
+    fn only_a_pid_lane_takes_clip_itself() {
+        let running = processes(&[(1, 0, "explorer.exe"), (50, 1, "clip.exe")]);
+        let sources = [Source::Named(vec!["clip.exe".into()]), Source::Process(50), Source::Rest];
         assert_eq!(assign(&sources, &running, &[50], 50), vec![vec![], vec![50], vec![]]);
     }
 

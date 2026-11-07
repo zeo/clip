@@ -27,11 +27,11 @@ pub struct Clip {
     pub marks: Vec<f64>,
     pub session: usize,
     pub thumb: Option<PathBuf>,
-    /// the app's exe icon, once memory has recorded it
+    /// the app's exe icon, once clip has recorded it
     pub icon: Option<PathBuf>,
 }
 
-/// What memory remembers about clips beside the files, kept next to the settings.
+/// What clip remembers about clips beside the files, kept next to the settings.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Marks {
@@ -101,7 +101,7 @@ pub fn list(folder: &Path, marks: &Marks, thumbs: &Path) -> Vec<Clip> {
             let app = entry.file_name().to_string_lossy().into_owned();
             found.extend(entries(&entry.path()).map(|inner| (inner, app.clone())));
         } else {
-            // clips saved before memory sorted them by app were all of the desktop
+            // clips saved before clip sorted them by app were all of the desktop
             found.push((entry, "desktop".to_string()));
         }
     }
@@ -276,7 +276,7 @@ mod tests {
 
     fn clip(name: &str, bytes: u64, starred: bool) -> Clip {
         Clip {
-            path: std::env::temp_dir().join(format!("memory-trim-{}-{name}.mp4", std::process::id())),
+            path: std::env::temp_dir().join(format!("clip-trim-{}-{name}.mp4", std::process::id())),
             app: "a".into(),
             name: name.into(),
             bytes,

@@ -41,7 +41,7 @@ struct Marks {
 /// The window is all but transparent, sits under every other window and never takes focus, and the
 /// click is far below anything audible over a game, so this runs fine mid match.
 pub fn run(args: &[String]) -> std::result::Result<(), String> {
-    let out = std::env::temp_dir().join(format!("memory-sync-{}.mp4", std::process::id()));
+    let out = std::env::temp_dir().join(format!("clip-sync-{}.mp4", std::process::id()));
     let lanes = [Lane { name: "sync".into(), source: Source::Process(std::process::id()) }];
     let (opened, window) = mpsc::channel();
     let (go, begun) = mpsc::channel();
@@ -130,7 +130,7 @@ fn open_window() -> Result<HWND> {
     unsafe {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
-            lpszClassName: w!("memory-sync"),
+            lpszClassName: w!("clip-sync"),
             hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             ..Default::default()
         };
@@ -138,8 +138,8 @@ fn open_window() -> Result<HWND> {
         // nearly transparent and under every other window, yet captured at full brightness
         let window = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("memory-sync"),
-            w!("memory sync"),
+            w!("clip-sync"),
+            w!("clip sync"),
             WS_POPUP,
             0,
             0,
@@ -228,7 +228,7 @@ impl Speaker {
             client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, SECOND / 10, 0, &audio::wave(), None)?;
             // windows keeps an app's mute across runs, and a muted session reaches the loopback silent
             if client.GetService::<ISimpleAudioVolume>()?.GetMute()?.as_bool() {
-                return Err(windows::core::Error::new(E_FAIL, "memory is muted in the volume mixer"));
+                return Err(windows::core::Error::new(E_FAIL, "clip is muted in the volume mixer"));
             }
             let mut speaker = Self {
                 size: client.GetBufferSize()?,

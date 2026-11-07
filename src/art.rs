@@ -56,7 +56,9 @@ pub fn cached(dir: &Path, app: &str) -> Art {
     let find = |kind: &str| {
         std::fs::read_dir(dir).ok()?.flatten().map(|entry| entry.path()).find(|path| {
             path.file_stem().is_some_and(|stem| stem == kind)
-                && path.extension().is_some_and(|ext| ["jpg", "png", "webp"].iter().any(|known| ext.eq_ignore_ascii_case(known)))
+                && path
+                    .extension()
+                    .is_some_and(|ext| ["jpg", "png", "webp"].iter().any(|known| ext.eq_ignore_ascii_case(known)))
         })
     };
     Art { app: app.to_string(), cover: find("cover"), hero: find("hero"), logo: find("logo") }
@@ -176,7 +178,13 @@ fn get(url: &str, key: Option<&str>) -> Result<Vec<u8>, String> {
     let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
     let headers = key.map(|key| HSTRING::from(format!("Authorization: Bearer {key}")));
     unsafe {
-        let session = Handle::new(WinHttpOpen(w!("memory"), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0))?;
+        let session = Handle::new(WinHttpOpen(
+            w!("clip"),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        ))?;
         WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 20_000).map_err(|e| e.to_string())?;
         let connection = Handle::new(WinHttpConnect(session.0, &HSTRING::from(host), INTERNET_DEFAULT_HTTPS_PORT, 0))?;
         let request = Handle::new(WinHttpOpenRequest(
@@ -208,7 +216,8 @@ fn get(url: &str, key: Option<&str>) -> Result<Vec<u8>, String> {
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             let mut read = 0u32;
-            WinHttpReadData(request.0, chunk.as_mut_ptr().cast(), chunk.len() as u32, &mut read).map_err(|e| e.to_string())?;
+            WinHttpReadData(request.0, chunk.as_mut_ptr().cast(), chunk.len() as u32, &mut read)
+                .map_err(|e| e.to_string())?;
             if read == 0 {
                 return Ok(body);
             }
@@ -290,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_steam_exe_finds_its_appid_through_the_library_manifests() {
-        let root = std::env::temp_dir().join(format!("memory-art-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("clip-art-{}", std::process::id()));
         let steam = root.join("Steam");
         let library = root.join("Games");
         std::fs::create_dir_all(steam.join("steamapps")).unwrap();

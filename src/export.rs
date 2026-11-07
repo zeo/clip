@@ -78,7 +78,14 @@ unsafe fn stream_frame_sizes(reader: &IMFSourceReader, streams: &[u32]) -> Resul
     let mut ended = 0;
     while ended < streams.len() {
         let (mut index, mut flags, mut sample) = (0, 0, None);
-        reader.ReadSample(MF_SOURCE_READER_ANY_STREAM.0 as u32, 0, Some(&mut index), Some(&mut flags), None, Some(&mut sample))?;
+        reader.ReadSample(
+            MF_SOURCE_READER_ANY_STREAM.0 as u32,
+            0,
+            Some(&mut index),
+            Some(&mut flags),
+            None,
+            Some(&mut sample),
+        )?;
         if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
             return Err(E_FAIL.into());
         }

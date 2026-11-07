@@ -36,11 +36,11 @@ use hdr::Display;
 use ring::{Clock, Ring, SECOND};
 
 const USAGE: &str = "\
-memory capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
+clip capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
                [--fps N] [--mbps N] [--height N] [--scale FILTER] [--software] [--hdr10] [--mic] [--app EXE]... [--out FILE]
-memory sync
-memory encoders
-memory self-test [--live]";
+clip sync
+clip encoders
+clip self-test [--live]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -379,7 +379,7 @@ fn list_encoders() -> Result<()> {
 /// each switching hdr on or off halfway.
 fn self_test() -> Result<()> {
     let gpu = capture::gpu()?;
-    let dir = std::env::temp_dir().join(format!("memory-self-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("clip-self-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
     let mut failures = 0;
     match unsafe {

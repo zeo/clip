@@ -71,7 +71,7 @@ pub fn windowed() -> Vec<String> {
 }
 
 /// The process behind a window that belongs to an app: not the shell, a tool window, something
-/// hidden or cloaked, or memory itself.
+/// hidden or cloaked, or clip itself.
 fn app_pid(window: HWND) -> Option<u32> {
     unsafe {
         if window.is_invalid() || !IsWindowVisible(window).as_bool() {
