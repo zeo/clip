@@ -3,6 +3,7 @@
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { CANCELLED, LONGEST, gif } from './gif';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
   import { discard, radios, say, view } from './view.svelte';
@@ -37,7 +38,6 @@
     { bytes: 1000e6, label: '1 GB, Nitro' },
     { bytes: -1, label: 'Custom' }
   ];
-  const CANCELLED = 'the export was cancelled';
 
   let video = $state<HTMLVideoElement>();
   let bar = $state<HTMLElement>();
@@ -61,6 +61,8 @@
   let portrait = $state(false);
   let middle = $state(0.5);
   let replace = $state(false);
+  let animated = $state(false);
+  let halted = false;
   let progress = $state<number | null>(null);
   // bumped when the file under the player changes, so the webview fetches it again
   let version = $state(0);
@@ -77,6 +79,8 @@
     return { x, span: width, left, top: (shown.height - picture.height * scale) / 2, width: narrow * width, height: picture.height * scale };
   });
   const fps = $derived(clip.fps || 60);
+  const source = $derived(convertFileSrc(clip.path) + (version ? `?v=${version}` : ''));
+  const long = $derived(animated && end - start > LONGEST);
   const soloed = $derived(lanes.some((lane) => lane.solo));
   const audible = $derived(lanes.flatMap((lane, i) => ((soloed ? lane.solo : !lane.muted) ? [i] : [])));
   const pct = (t: number) => `${(100 * t) / (duration || 1)}%`;
@@ -290,20 +294,19 @@
   async function exportCut() {
     const path = clip.path;
     const before = $state.snapshot(clip.marks);
+    const replacing = replace && !animated;
     progress = 0;
-    const heard = await listen<number>('export-progress', (e) => (progress = e.payload));
-    const out = await act('export', () =>
-      invoke<string>('export', {
-        path,
-        start,
-        end,
-        tracks: audible,
-        mix: mix && audible.length > 1,
-        fit: fit || null,
-        portrait: portrait ? middle : null,
-        replace
-      })
-    ).finally(() => (heard(), (progress = null)));
+    halted = false;
+    const heard = animated ? () => {} : await listen<number>('export-progress', (e) => (progress = e.payload));
+    const out = await act('export', async () => {
+      if (!animated) {
+        const args = { path, start, end, tracks: audible, mix: mix && audible.length > 1, fit: fit || null, portrait: portrait ? middle : null, replace };
+        return invoke<string>('export', args);
+      }
+      const cut = { start, end, middle: portrait ? middle : null, fit };
+      const bytes = await gif(source, cut, (pct) => (progress = pct), () => halted);
+      return invoke<string>('save_frame', bytes, { headers: { clip: encodeURIComponent(path), at: String(start) } });
+    }).finally(() => (heard(), (progress = null)));
     if (error === CANCELLED) {
       error = '';
       say('Export cancelled');
@@ -317,7 +320,7 @@
         (e) => (say(String(e), true), false)
       ));
     const pasted = copied ? ', copied to paste' : '';
-    if (!replace) return say(`Saved ${named(out)}${pasted}`);
+    if (!replacing) return say(`Saved ${named(out)}${pasted}`);
     [start, end] = [0, end - start];
     version++;
     // the original waits beside the clip until the undo runs out
@@ -472,7 +475,7 @@
     <!-- svelte-ignore a11y_media_has_caption -->
     <video
       bind:this={video}
-      src={convertFileSrc(clip.path) + (version ? `?v=${version}` : '')}
+      src={source}
       crossorigin="anonymous"
       muted
       preload="auto"
@@ -635,6 +638,13 @@
         <div><dt>Out</dt><dd>{clock(end, true)}</dd></div>
         <div><dt>Keeps</dt><dd>{(end - start).toFixed(2)} s</dd></div>
       </dl>
+      <div class="option">
+        <span id="format-label">Format</span>
+        <div class="seg" role="radiogroup" aria-labelledby="format-label" use:radios>
+          <button role="radio" aria-checked={!animated} disabled={busy !== ''} onclick={() => (animated = false)}>MP4</button>
+          <button role="radio" aria-checked={animated} disabled={busy !== ''} onclick={() => (animated = true)}>GIF</button>
+        </div>
+      </div>
       <label class="option">
         <span>Size</span>
         <select class="field" bind:value={view.fit} disabled={busy !== ''}>
@@ -655,20 +665,22 @@
           <button role="radio" aria-checked={portrait} disabled={busy !== ''} onclick={() => (portrait = true)}>9:16</button>
         </div>
       </div>
-      <div class="option">
-        <span id="audio-label">Audio</span>
-        <div class="seg" role="radiogroup" aria-labelledby="audio-label" use:radios>
-          <button role="radio" aria-checked={mix || fit > 0} disabled={busy !== ''} onclick={() => (mix = true)}>Mix to one</button>
-          <button role="radio" aria-checked={!mix && !fit} disabled={busy !== '' || fit > 0} onclick={() => (mix = false)}>Keep tracks</button>
+      {#if !animated}
+        <div class="option">
+          <span id="audio-label">Audio</span>
+          <div class="seg" role="radiogroup" aria-labelledby="audio-label" use:radios>
+            <button role="radio" aria-checked={mix || fit > 0} disabled={busy !== ''} onclick={() => (mix = true)}>Mix to one</button>
+            <button role="radio" aria-checked={!mix && !fit} disabled={busy !== '' || fit > 0} onclick={() => (mix = false)}>Keep tracks</button>
+          </div>
         </div>
-      </div>
-      <div class="option">
-        <span id="save-label">Save as</span>
-        <div class="seg" role="radiogroup" aria-labelledby="save-label" use:radios>
-          <button role="radio" aria-checked={!replace} disabled={busy !== ''} onclick={() => (replace = false)}>New clip</button>
-          <button role="radio" aria-checked={replace} disabled={busy !== ''} onclick={() => (replace = true)}>Replace this one</button>
+        <div class="option">
+          <span id="save-label">Save as</span>
+          <div class="seg" role="radiogroup" aria-labelledby="save-label" use:radios>
+            <button role="radio" aria-checked={!replace} disabled={busy !== ''} onclick={() => (replace = false)}>New clip</button>
+            <button role="radio" aria-checked={replace} disabled={busy !== ''} onclick={() => (replace = true)}>Replace this one</button>
+          </div>
         </div>
-      </div>
+      {/if}
       {#if fit > 0}
         <label class="option">
           <input type="checkbox" bind:checked={view.copyAfter} disabled={busy !== ''} />
@@ -676,21 +688,26 @@
         </label>
       {/if}
       <p class="form-hint">
-        {audible.length} of {lanes.length} tracks go in{fit > 0 && audible.length > 1 ? ', mixed to one since most sites play only the first' : ''}.
+        {#if animated}
+          GIFs have no sound and play up to {LONGEST} s{fit > 0 ? ', at 10 frames a second to fit the size' : ''}.
+        {:else}
+          {audible.length} of {lanes.length} tracks go in{fit > 0 && audible.length > 1 ? ', mixed to one since most sites play only the first' : ''}.
+        {/if}
         {#if portrait}Drag the frame on the picture to choose what shows.{/if}
-        {#if replace}The original goes to the recycle bin, with an undo.{/if}
-        {#if clip.hdr}HDR clips export as HEVC, which some sites and players can't show.{/if}
+        {#if replace && !animated}The original goes to the recycle bin, with an undo.{/if}
+        {#if clip.hdr && !animated}HDR clips export as HEVC, which some sites and players can't show.{/if}
       </p>
+      {#if long}<p class="form-error">The cut is {(end - start).toFixed(1)} s, trim it to {LONGEST} s or less for a GIF.</p>{/if}
       {#if progress !== null}
         <div class="exporting">
           <span class="meter" role="progressbar" aria-label="Export" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
             <span style:width="{progress}%"></span>
           </span>
-          <button class="gel" onclick={() => invoke('cancel_export')}>Cancel</button>
+          <button class="gel" onclick={() => (animated ? (halted = true) : invoke('cancel_export'))}>Cancel</button>
         </div>
       {/if}
-      <button class="gel default wide" disabled={busy !== ''} onclick={exportCut}>
-        {busy === 'export' ? `Exporting ${progress ?? 0}%` : replace ? 'Replace with the cut' : 'Export'}
+      <button class="gel default wide" disabled={busy !== '' || long} onclick={exportCut}>
+        {busy === 'export' ? `Exporting ${progress ?? 0}%` : animated ? 'Export GIF' : replace ? 'Replace with the cut' : 'Export'}
       </button>
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}
     </section>

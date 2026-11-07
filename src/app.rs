@@ -1003,8 +1003,9 @@ fn set_marks(app: AppHandle, shared: State<Shared>, path: PathBuf, mut at: Vec<f
     Ok(())
 }
 
-/// Saves the png the webview drew of a paused frame beside its clip. The body is the png, so a 4k
-/// frame isn't sent as a json list of numbers, and the headers say which clip and when.
+/// Saves the png the webview drew of a paused frame, or the gif it made of a cut, beside its clip.
+/// The body is the image, so a 4k frame isn't sent as a json list of numbers, and the headers say
+/// which clip and from when.
 #[tauri::command]
 fn save_frame(shared: State<Shared>, request: tauri::ipc::Request) -> Result<PathBuf, String> {
     let header = |name: &str| {
@@ -1014,22 +1015,24 @@ fn save_frame(shared: State<Shared>, request: tauri::ipc::Request) -> Result<Pat
     let path = PathBuf::from(header("clip")?);
     let at: f64 = header("at")?.parse().map_err(|_| "the frame's time isn't a number")?;
     clip_in_folder(&shared, &path)?;
-    let tauri::ipc::InvokeBody::Raw(png) = request.body() else {
+    let tauri::ipc::InvokeBody::Raw(image) = request.body() else {
         return Err("the frame has to come as bytes".into());
     };
-    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err("a frame has to be a png".into());
-    }
+    let kind = match image.as_slice() {
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', ..] => "png",
+        [b'G', b'I', b'F', b'8', b'9', b'a', ..] => "gif",
+        _ => return Err("a frame has to be a png or a gif".into()),
+    };
     let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
     let (minutes, seconds) = ((at / 60.0).floor(), at % 60.0);
     let out = (1..)
         .map(|n| match n {
-            1 => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s.png")),
-            n => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s {n}.png")),
+            1 => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s.{kind}")),
+            n => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s {n}.{kind}")),
         })
         .find(|out| !out.exists())
         .expect("some name is free");
-    std::fs::write(&out, png).map_err(|e| format!("couldn't save the frame: {e}"))?;
+    std::fs::write(&out, image).map_err(|e| format!("couldn't save the {kind}: {e}"))?;
     Ok(out)
 }
 
@@ -1052,7 +1055,7 @@ fn unescape(text: &str) -> Option<String> {
 
 #[tauri::command]
 fn copy_files(window: WebviewWindow, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
-    paths.iter().try_for_each(|path| clip_in_folder(&shared, path))?;
+    paths.iter().try_for_each(|path| saved_in_folder(&shared, path))?;
     crate::clipboard::copy_files(window.hwnd().map_err(|e| e.to_string())?, &paths)
 }
 
@@ -1320,11 +1323,20 @@ fn mark_clip(shared: State<Shared>) {
 
 /// Only clips in the clips folder get handed to explorer, which would run anything else.
 fn clip_in_folder(shared: &Shared, path: &Path) -> Result<(), String> {
+    in_folder(shared, path, &["mp4"])
+}
+
+/// A clip, or a frame or gif saved from one.
+fn saved_in_folder(shared: &Shared, path: &Path) -> Result<(), String> {
+    in_folder(shared, path, &["mp4", "png", "gif"])
+}
+
+fn in_folder(shared: &Shared, path: &Path, kinds: &[&str]) -> Result<(), String> {
     let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
     let parent = path.parent();
     let inside = !path.components().any(|part| part == Component::ParentDir)
         && (parent == Some(folder.as_path()) || parent.and_then(Path::parent) == Some(folder.as_path()))
-        && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+        && path.extension().is_some_and(|e| kinds.iter().any(|kind| e.eq_ignore_ascii_case(kind)))
         && path.is_file();
     if inside {
         Ok(())
@@ -1335,13 +1347,13 @@ fn clip_in_folder(shared: &Shared, path: &Path) -> Result<(), String> {
 
 #[tauri::command]
 fn open(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    clip_in_folder(&shared, &path)?;
+    saved_in_folder(&shared, &path)?;
     Command::new("explorer").arg(&path).spawn().map(drop).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn reveal(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    clip_in_folder(&shared, &path)?;
+    saved_in_folder(&shared, &path)?;
     // explorer reads /select, with the path quoted after the comma, which std's quoting can't produce
     Command::new("explorer")
         .raw_arg(format!("/select,\"{}\"", path.display()))
