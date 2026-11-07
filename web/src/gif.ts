@@ -54,7 +54,7 @@ export async function gif(src: string, cut: Cut, progress: (pct: number) => void
       video.onloadeddata = done;
       video.onerror = () => fail("couldn't open the clip");
     });
-    let rung = 0;
+    let rung = cut.fit ? 1 : 0;
     for (;;) {
       const { edge, fps } = RUNGS[rung];
       const out = await encode(video, cut, edge, fps, progress, cancelled);
