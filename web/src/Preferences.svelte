@@ -181,11 +181,14 @@
 
   const known = (dir: string) => others.find((other) => other.path === dir)?.name ?? dir.split(/[\\/]/).filter(Boolean).pop() ?? dir;
 
+  const slashed = (dir: string) => dir.replace(/[\\/]*$/, '\\').toLowerCase();
+  const inside = (dir: string) => slashed(dir).startsWith(slashed(draft!.folder));
+
   async function addSource() {
     if (!draft) return;
     const picked = await open({ directory: true });
     if (typeof picked !== 'string') return;
-    if (picked === draft.folder) say(`That's the clips folder`, true);
+    if (inside(picked)) say(`${known(picked)} is in the clips folder, so it's listed already`, true);
     else if (draft.sources.includes(picked)) say(`${known(picked)} is listed already`, true);
     else draft.sources.push(picked);
   }
@@ -523,7 +526,7 @@
                   <button class="gel" disabled={importing === dir} onclick={() => draft!.sources.splice(i, 1)}>Remove</button>
                 </div>
               {/each}
-              {#each others.filter((other) => !draft!.sources.includes(other.path) && other.path !== draft!.folder) as other (other.path)}
+              {#each others.filter((other) => !draft!.sources.includes(other.path) && !inside(other.path)) as other (other.path)}
                 <div class="row">
                   <span class="row-label">{other.name}<small class="row-path mono">{other.path}</small></span>
                   <button class="gel" onclick={() => draft!.sources.push(other.path)}>Add</button>

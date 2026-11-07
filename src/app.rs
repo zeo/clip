@@ -1173,6 +1173,11 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
     if let Some(bad) = settings.sources.iter().find(|dir| !dir.is_absolute()) {
         return Err(format!("{} isn't a whole path", bad.display()));
     }
+    // clip's own files can be deleted by cleanup, so a folder inside it can't be read only
+    let low = |dir: &Path| format!("{}\\", dir.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase());
+    if let Some(inside) = settings.sources.iter().find(|dir| low(dir).starts_with(&low(&settings.folder))) {
+        return Err(format!("{} is in the clips folder, so it's listed already", inside.display()));
+    }
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     if let Some(dir) = shared.file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
