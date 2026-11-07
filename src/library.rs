@@ -341,12 +341,16 @@ pub fn home(folder: &Path, path: &Path) -> PathBuf {
 /// names, leaving the originals and skipping any already there. Returns how many were copied.
 pub fn import(source: &Path, folder: &Path, progress: impl Fn(usize, usize)) -> Result<usize, String> {
     let found = scan(source, &folder_name(source));
+    // windows paths match in any case, which Path::starts_with doesn't
+    let low = |dir: &Path| dir.to_string_lossy().to_lowercase();
+    let own = format!("{}\\", low(folder).trim_end_matches(['\\', '/']));
     let mut copied = 0;
     for (i, (entry, app)) in found.iter().enumerate() {
         progress(i, found.len());
         let dir = folder.join(crate::focus::folder_safe(app));
         let to = dir.join(entry.file_name());
-        if to.exists() || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        // a folder holding the clips folder, like Videos, would hand clip its own files back
+        if to.exists() || low(&entry.path()).starts_with(&own) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
         let mut part = to.clone().into_os_string();
@@ -517,6 +521,15 @@ mod tests {
             "copies show once"
         );
         assert_eq!(import(&medal, &folder, |_, _| {}), Ok(0));
+        write(folder.join("desktop.mp4"), b"55555");
+        assert_eq!(
+            import(&root, &folder, |_, _| {}),
+            Ok(0),
+            "a folder around the clips folder copies none of its files"
+        );
+        assert!(!folder.join("clips").exists());
+        let shouted = PathBuf::from(folder.to_string_lossy().to_uppercase());
+        assert_eq!(import(&root, &shouted, |_, _| {}), Ok(0), "the clips folder is found in any case");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
