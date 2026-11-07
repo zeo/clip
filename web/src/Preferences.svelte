@@ -4,7 +4,7 @@
   import { getVersion } from '@tauri-apps/api/app';
   import { open } from '@tauri-apps/plugin-dialog';
   import Bind from './Bind.svelte';
-  import { length, ramMB, size, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
+  import { ACTIONS, PRESETS, chord, length, ramMB, size, type Corner, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
   import { radios, reduced, say, view, zooms } from './view.svelte';
 
   let {
@@ -20,7 +20,7 @@
     {
       name: 'Recording',
       pages: [
-        { id: 'hotkeys', title: 'Hotkeys', blurb: 'Keys that save or mark a clip from inside a game', path: 'M2.5 6h15v9h-15zM5.5 9h1M8.5 9h1M11.5 9h1M14.5 9h0M6.5 12h7' },
+        { id: 'hotkeys', title: 'Hotkeys', blurb: 'Keys that save clips, mark, record and take screenshots from inside a game', path: 'M2.5 6h15v9h-15zM5.5 9h1M8.5 9h1M11.5 9h1M14.5 9h0M6.5 12h7' },
         { id: 'recorder', title: 'Recorder', blurb: 'What clip records and how much it keeps', path: 'M10 3.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM10 8a2 2 0 1 0 0 4 2 2 0 0 0 0-4z' },
         { id: 'quality', title: 'Quality', blurb: 'Resolution, frame rate and bitrate of the video', path: 'M3 4.5h14v10H3zM7 14.5v2M13 14.5v2M5.5 16.5h9' },
         { id: 'audio', title: 'Audio', blurb: 'A track for each source, its volume and the microphone', path: 'M3.5 8h3l4-3.5v11l-4-3.5h-3zM13.5 7.5c1.2 1.4 1.2 3.6 0 5M15.5 5.5c2.4 2.6 2.4 6.4 0 9' }
@@ -34,7 +34,7 @@
       name: 'App',
       pages: [
         { id: 'appearance', title: 'Appearance', blurb: 'How big everything is, and clips playing on hover', path: 'M2.5 15 6.5 5l4 10M4 11.5h5M12 15l2.75-6.5L17.5 15M13 12.8h3.5' },
-        { id: 'sounds', title: 'Sound alerts', blurb: 'The sound that says a clip was saved', path: 'M6 13V9a4 4 0 0 1 8 0v4l1.5 1.5h-11zM8.5 16.5h3' },
+        { id: 'sounds', title: 'Alerts', blurb: 'The sound and the note on screen that say a clip was saved', path: 'M6 13V9a4 4 0 0 1 8 0v4l1.5 1.5h-11zM8.5 16.5h3' },
         { id: 'notifications', title: 'Notifications', blurb: 'A Windows notification for each saved clip', path: 'M3.5 4h13v9h-6l-3.5 3v-3H3.5z' },
         { id: 'startup', title: 'Startup and window', blurb: 'When clip opens and what closing the window does', path: 'M10 3v6M6.2 5.8a6 6 0 1 0 7.6 0' },
         { id: 'art', title: 'Game art', blurb: 'Covers and banners for the library', path: 'M3 4.5h14v11H3zM3 13l4-4 3 3 2-2 5 5' }
@@ -51,6 +51,13 @@
     { name: 'Max', height: 4320, fps: 120, mbps: 80 }
   ];
   const buffers = [15, 30, 60, 120, 300];
+  const corners: [Corner, string][] = [
+    ['top-left', 'Top left'],
+    ['top-right', 'Top right'],
+    ['bottom-left', 'Bottom left'],
+    ['bottom-right', 'Bottom right']
+  ];
+  let from = $state('');
   const heights = [720, 1080, 1440, 4320];
   const rates = [30, 60, 120, 144, 240];
 
@@ -250,18 +257,34 @@
           <section class="group">
             <p class="form-hint">Click a key box, then press the keys. Backspace clears one. A save key can keep less than the whole buffer.</p>
             <div class="rows">
+              <div class="row">
+                <span class="row-label">Coming from another app<small>Uses the keys it ships with. Close it first, or it keeps the keys.</small></span>
+                <select class="field" aria-label="App to copy keys from" bind:value={from}>
+                  <option value="">Pick an app</option>
+                  {#each PRESETS as preset (preset.name)}
+                    <option value={preset.name}>{preset.name}: {preset.hotkeys.map(chord).join(', ')}</option>
+                  {/each}
+                </select>
+                <button
+                  class="gel"
+                  disabled={!from}
+                  onclick={() => {
+                    draft!.hotkeys = structuredClone(PRESETS.find((p) => p.name === from)!.hotkeys);
+                    say(`Keys from ${from}, apply to keep them`);
+                  }}>Use keys</button
+                >
+              </div>
               {#each draft.hotkeys as hotkey, i (i)}
                 <div class="row">
                   <span class="row-label">
-                    {hotkey.action === 'save' ? 'Save hotkey' : 'Mark hotkey'}
-                    <small class:bad={taken(hotkey)}>{taken(hotkey) ? 'Another app holds this key' : hotkey.action === 'save' ? 'Saves what the buffer holds' : 'Marks now and saves 15 s later'}</small>
+                    {ACTIONS[hotkey.action].key} hotkey
+                    <small class:bad={taken(hotkey)}>{taken(hotkey) ? 'Another app holds this key' : ACTIONS[hotkey.action].does}</small>
                   </span>
                   <Bind bind:mods={hotkey.mods} bind:key={hotkey.key} label="Keys for hotkey {i + 1}" />
                   <select class="field" aria-label="Action" bind:value={hotkey.action}>
-                    <option value="save">Save a clip</option>
-                    <option value="mark">Mark a moment</option>
+                    {#each Object.entries(ACTIONS) as [value, action] (value)}<option {value}>{action.name}</option>{/each}
                   </select>
-                  <select class="field" aria-label="Length" bind:value={hotkey.seconds} disabled={hotkey.action === 'mark'}>
+                  <select class="field" aria-label="Length" bind:value={hotkey.seconds} disabled={hotkey.action !== 'save'}>
                     <option value={0}>Whole buffer</option>
                     {#each buffers.filter((b) => b < draft!.buffer) as b (b)}<option value={b}>Last {length(b)}</option>{/each}
                   </select>
@@ -269,7 +292,7 @@
                 </div>
               {/each}
               <div class="row">
-                <span class="row-label">Add hotkey<small>Another key that saves or marks</small></span>
+                <span class="row-label">Add hotkey<small>A key for any of the actions above</small></span>
                 <button class="gel" onclick={() => draft!.hotkeys.push({ action: 'save', mods: 1, key: 0, seconds: 0 })}>Add</button>
               </div>
             </div>
@@ -506,6 +529,22 @@
                 <span class="mono readout">{draft.soundVolume}%</span>
                 <button class="gel" onclick={() => invoke('preview_sound', { percent: draft!.soundVolume })}>Play</button>
               </div>
+            </div>
+          </section>
+          <section class="group">
+            <h2 class="group-head">Note on screen</h2>
+            <p class="form-hint">A small note over the game for a few seconds. It never takes focus and stays out of recordings and screen shares.</p>
+            <div class="rows">
+              <label class="row">
+                <span class="row-label">Show a note on saves and key presses<small>Clip saved, screenshot, mic muted, recording started</small></span>
+                <input type="checkbox" bind:checked={draft.notice} />
+              </label>
+              <label class="row">
+                <span class="row-label">Corner</span>
+                <select class="field" bind:value={draft.noticeCorner} disabled={!draft.notice}>
+                  {#each corners as [value, name] (value)}<option {value}>{name}</option>{/each}
+                </select>
+              </label>
             </div>
           </section>
         </section>

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, Result};
@@ -387,7 +387,103 @@ pub fn output_size(source: (u32, u32), max_height: u32) -> (u32, u32) {
     (width.max(2) & !1, height & !1)
 }
 
-/// Captures `target` into `ring` at a constant frame rate until `stop` is set.
+/// A frame as it was captured, rows packed tight: 8 bit BGRA, or on an hdr display FP16 scRGB.
+#[derive(Clone)]
+pub struct Still {
+    pub width: u32,
+    pub height: u32,
+    hdr: bool,
+    /// nits sdr white sat at, for bringing scRGB down to 8 bit
+    white: f32,
+    data: Vec<u8>,
+}
+
+/// Whoever waits for the next captured frame.
+pub type Shots = Arc<Mutex<Vec<mpsc::Sender<std::result::Result<Still, String>>>>>;
+
+impl Still {
+    /// Opaque 8 bit BGRA. Hdr frames keep sdr white as white, and anything brighter clips.
+    pub fn bgra(&self) -> Vec<u8> {
+        if !self.hdr {
+            let mut out = self.data.clone();
+            out.iter_mut().skip(3).step_by(4).for_each(|alpha| *alpha = 255);
+            return out;
+        }
+        // scRGB 1.0 is 80 nits
+        let scale = 80.0 / self.white.max(1.0);
+        let encode: Vec<u8> = (0..=4096).map(|i| (srgb(i as f32 / 4096.0) * 255.0 + 0.5) as u8).collect();
+        let level = |bytes: &[u8]| {
+            encode[((half(u16::from_le_bytes([bytes[0], bytes[1]])) * scale).clamp(0.0, 1.0) * 4096.0) as usize]
+        };
+        self.data
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .flat_map(|px| [level(&px[4..6]), level(&px[2..4]), level(&px[0..2]), 255])
+            .collect()
+    }
+}
+
+fn srgb(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn half(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let (exponent, fraction) = ((bits >> 10) & 0x1f, (bits & 0x3ff) as f32 / 1024.0);
+    sign * match exponent {
+        0 => fraction * 2f32.powi(-14),
+        31 => f32::INFINITY,
+        e => (1.0 + fraction) * 2f32.powi(e as i32 - 15),
+    }
+}
+
+/// Copies the `content` corner of a captured frame back to the cpu.
+fn still(frame: &ID3D11Texture2D, content: (u32, u32), white: f32) -> Result<Still> {
+    unsafe {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        frame.GetDesc(&mut desc);
+        let (width, height) = (content.0.min(desc.Width), content.1.min(desc.Height));
+        let device = frame.GetDevice()?;
+        let context = device.GetImmediateContext()?;
+        let staging = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: desc.Format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut copy = None;
+        device.CreateTexture2D(&staging, None, Some(&mut copy))?;
+        let copy = copy.ok_or(windows::core::Error::from(E_FAIL))?;
+        let region = D3D11_BOX { left: 0, top: 0, front: 0, right: width, bottom: height, back: 1 };
+        context.CopySubresourceRegion(&copy, 0, 0, 0, 0, frame, 0, Some(&region));
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context.Map(&copy, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let row = width as usize * if hdr { 8 } else { 4 };
+        let mut data = Vec::with_capacity(row * height as usize);
+        for y in 0..height as usize {
+            let at = mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize);
+            data.extend_from_slice(std::slice::from_raw_parts(at, row));
+        }
+        context.Unmap(&copy, 0);
+        Ok(Still { width, height, hdr, white, data })
+    }
+}
+
+/// Captures `target` into `ring` at a constant frame rate until `stop` is set, handing a copy of
+/// the next frame to whoever waits in `shots`.
+#[allow(clippy::too_many_arguments)] // the capture thread owns the first four, the rest are shared with the session
 /// Each frame shows from the slot nearest the moment the compositor drew it, and when the source
 /// sends nothing new the last frame repeats, so every clip is constant frame rate.
 pub fn record(
@@ -398,6 +494,7 @@ pub fn record(
     clock: Clock,
     ring: &Arc<Mutex<Ring>>,
     stop: &AtomicBool,
+    shots: &Shots,
 ) -> Result<()> {
     let period = Duration::from_nanos(1_000_000_000 / format.fps as u64);
     let started = clock.started;
@@ -448,6 +545,14 @@ pub fn record(
         if let Some(frame) = newest {
             let content = frame.ContentSize()?;
             let content = (content.Width as u32, content.Height as u32);
+            let waiting = std::mem::take(&mut *shots.lock().expect("shots poisoned"));
+            if !waiting.is_empty() {
+                let white = if pipeline.display.hdr { pipeline.display.sdr_white } else { 80.0 };
+                let taken = still(&texture(&frame)?, content, white).map_err(|e| e.to_string());
+                for waiter in waiting {
+                    let _ = waiter.send(taken.clone());
+                }
+            }
             last = Some(pipeline.convert(&texture(&frame)?, content, format.fps)?);
             let _ = frame.Close();
         }
@@ -469,6 +574,21 @@ pub fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stills_come_out_opaque_bgra() {
+        let sdr = Still { width: 1, height: 1, hdr: false, white: 80.0, data: vec![10, 20, 30, 0] };
+        assert_eq!(sdr.bgra(), [10, 20, 30, 255]);
+        // scRGB red at sdr white, green at half of it, blue past it, as r, g, b, a halves
+        let halves = [0x3c00u16, 0x3800, 0x4400, 0x3c00];
+        let data = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let hdr = Still { width: 1, height: 1, hdr: true, white: 80.0, data };
+        let [b, g, r, a] = hdr.bgra()[..] else { panic!("one pixel") };
+        assert_eq!((b, r, a), (255, 255, 255));
+        assert!(g.abs_diff(188) <= 1, "half of white is sRGB 188, got {g}");
+        assert_eq!(half(0xc000), -2.0);
+        assert_eq!(half(0x0001), 2f32.powi(-24));
+    }
 
     #[test]
     fn letterbox_centers_a_narrow_window() {

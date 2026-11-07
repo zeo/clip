@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use windows::core::{Result, HSTRING};
@@ -26,77 +26,111 @@ pub fn write_mp4(
         .first()
         .filter(|p| p.key)
         .ok_or(windows::core::Error::new(MF_E_INVALIDREQUEST, "a clip has to start on a keyframe"))?;
-    let partial = path.with_extension("mp4.part");
-    let written = unsafe { write(&partial, packets, first, format, audio) }.and_then(|()| {
-        label(&partial, names, mastering).map_err(|e| windows::core::Error::new(E_LABEL, e.to_string()))
-    });
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&partial);
-        return Err(e);
-    }
-    std::fs::rename(&partial, path).map_err(|e| windows::core::Error::new(E_RENAME, e.to_string()))
+    let end = packets.iter().map(|p| p.pts + p.duration).max().unwrap_or(first.pts);
+    let audio: Vec<Vec<Arc<Packet>>> =
+        audio.iter().map(|lane| lane.iter().filter(|p| p.pts >= first.pts && p.pts < end).cloned().collect()).collect();
+    let writer = Writer::open(path, first, format, audio.len())?;
+    writer.write(packets, &audio)?;
+    writer.finish(names, mastering)
 }
 
 const E_RENAME: windows::core::HRESULT = windows::core::HRESULT(0x8007_0050_u32 as i32);
 const E_LABEL: windows::core::HRESULT = windows::core::HRESULT(0x8007_000D_u32 as i32);
 
-unsafe fn write(
-    path: &Path,
-    packets: &[Arc<Packet>],
-    first: &Packet,
-    format: Format,
-    audio: &[Vec<Arc<Packet>>],
-) -> Result<()> {
-    unsafe {
-        let mut attributes = None;
-        MFCreateAttributes(&mut attributes, 2)?;
-        let attributes = attributes.expect("created");
-        // the container comes from this attribute, so the .part extension is fine
-        attributes.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)?;
-        attributes.SetUINT32(&MF_READWRITE_DISABLE_CONVERTERS, 1)?;
-        let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attributes)?;
+/// An MP4 written a stretch at a time under a .part name, which a writer dropped unfinished deletes.
+pub struct Writer {
+    sink: Option<IMFSinkWriter>,
+    video: u32,
+    lanes: Vec<u32>,
+    base: i64,
+    path: PathBuf,
+    partial: PathBuf,
+}
 
-        let video = MFCreateMediaType()?;
-        video.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        video.SetGUID(&MF_MT_SUBTYPE, &format.codec.subtype())?;
-        video.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate)?;
-        describe(&video, format)?;
-        let headers = parameter_sets(format.codec, &first.data);
-        if !headers.is_empty() {
-            video.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &headers)?;
-        }
-        let stream = writer.AddStream(&video)?;
-        writer.SetInputMediaType(stream, &video, None)?;
-        let mut lanes = Vec::new();
-        if !audio.is_empty() {
-            let aac = Aac::new()?.output_type()?;
-            for _ in audio {
-                let lane = writer.AddStream(&aac)?;
-                writer.SetInputMediaType(lane, &aac, None)?;
-                lanes.push(lane);
+impl Writer {
+    /// Opens a file for video starting on the keyframe `first`, with `lanes` audio tracks.
+    pub fn open(path: &Path, first: &Packet, format: Format, lanes: usize) -> Result<Self> {
+        let partial = path.with_extension("mp4.part");
+        unsafe {
+            let mut attributes = None;
+            MFCreateAttributes(&mut attributes, 2)?;
+            let attributes = attributes.expect("created");
+            // the container comes from this attribute, so the .part extension is fine
+            attributes.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)?;
+            attributes.SetUINT32(&MF_READWRITE_DISABLE_CONVERTERS, 1)?;
+            let sink = MFCreateSinkWriterFromURL(&HSTRING::from(partial.as_os_str()), None, &attributes)?;
+            let mut writer =
+                Self { sink: Some(sink), video: 0, lanes: Vec::new(), base: first.pts, path: path.into(), partial };
+            let sink = writer.sink.as_ref().expect("just opened");
+
+            let video = MFCreateMediaType()?;
+            video.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            video.SetGUID(&MF_MT_SUBTYPE, &format.codec.subtype())?;
+            video.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate)?;
+            describe(&video, format)?;
+            let headers = parameter_sets(format.codec, &first.data);
+            if !headers.is_empty() {
+                video.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &headers)?;
             }
+            writer.video = sink.AddStream(&video)?;
+            sink.SetInputMediaType(writer.video, &video, None)?;
+            if lanes > 0 {
+                let aac = Aac::new()?.output_type()?;
+                for _ in 0..lanes {
+                    let lane = sink.AddStream(&aac)?;
+                    sink.SetInputMediaType(lane, &aac, None)?;
+                    writer.lanes.push(lane);
+                }
+            }
+            sink.BeginWriting()?;
+            Ok(writer)
         }
-        writer.BeginWriting()?;
+    }
 
-        let base = first.pts;
-        let end = packets.iter().map(|p| p.pts + p.duration).max().unwrap_or(base);
+    /// Writes video packets in decode order with each lane's sound, interleaved by time so players
+    /// never wait on one track to reach another.
+    pub fn write(&self, packets: &[Arc<Packet>], audio: &[Vec<Arc<Packet>>]) -> Result<()> {
+        let sink = self.sink.as_ref().expect("open until finished");
         let mut sound: Vec<(u32, &Packet)> = Vec::new();
-        for (&lane, packets) in lanes.iter().zip(audio) {
-            sound.extend(packets.iter().filter(|p| p.pts >= base && p.pts < end).map(|p| (lane, &**p)));
+        for (&lane, packets) in self.lanes.iter().zip(audio) {
+            sound.extend(packets.iter().filter(|p| p.pts >= self.base).map(|p| (lane, &**p)));
         }
         sound.sort_by_key(|(_, p)| p.pts);
-        // interleaved by time so players never wait on one track to reach another, video kept in decode order
         let mut sound = sound.into_iter().peekable();
         for packet in packets {
             while let Some((lane, p)) = sound.next_if(|(_, p)| p.pts <= packet.pts) {
-                write_sample(&writer, lane, p, base)?;
+                unsafe { write_sample(sink, lane, p, self.base)? };
             }
-            write_sample(&writer, stream, packet, base)?;
+            unsafe { write_sample(sink, self.video, packet, self.base)? };
         }
-        for (lane, p) in sound {
-            write_sample(&writer, lane, p, base)?;
+        sound.try_for_each(|(lane, p)| unsafe { write_sample(sink, lane, p, self.base) })
+    }
+
+    /// Closes the file, names its tracks, and moves it to its final name.
+    pub fn finish(mut self, names: &[&str], mastering: Option<Mastering>) -> Result<()> {
+        let sink = self.sink.take().expect("open until finished");
+        let finalized = unsafe { sink.Finalize() };
+        drop(sink);
+        let done = finalized
+            .and_then(|()| {
+                label(&self.partial, names, mastering).map_err(|e| windows::core::Error::new(E_LABEL, e.to_string()))
+            })
+            .and_then(|()| {
+                std::fs::rename(&self.partial, &self.path)
+                    .map_err(|e| windows::core::Error::new(E_RENAME, e.to_string()))
+            });
+        if done.is_err() {
+            let _ = std::fs::remove_file(&self.partial);
         }
-        writer.Finalize()
+        done
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if self.sink.take().is_some() {
+            let _ = std::fs::remove_file(&self.partial);
+        }
     }
 }
 

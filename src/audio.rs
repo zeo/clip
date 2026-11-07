@@ -434,11 +434,15 @@ impl Channel {
     }
 }
 
+/// Silences every microphone feed while set, without reopening a session.
+pub static MIC_MUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Input {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     /// a virtual key the feed is silent without, 0 for none
     hold: u32,
+    mic: bool,
 }
 
 impl Input {
@@ -468,8 +472,8 @@ impl Input {
             client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, DEVICE_BUFFER, 0, &wave(), None)?;
             let capture = client.GetService()?;
             client.Start()?;
-            let hold = if let Source::Microphone { hold, .. } = source { *hold } else { 0 };
-            Ok(Self { client, capture, hold })
+            let (hold, mic) = if let Source::Microphone { hold, .. } = source { (*hold, true) } else { (0, false) };
+            Ok(Self { client, capture, hold, mic })
         }
     }
 
@@ -484,7 +488,8 @@ impl Input {
                     qpc => clock.at(qpc as i64),
                 };
                 let held = self.hold == 0 || GetAsyncKeyState(self.hold as i32) < 0;
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || !held {
+                let muted = self.mic && MIC_MUTED.load(std::sync::atomic::Ordering::Relaxed);
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || !held || muted {
                     timeline.push(at, &vec![0; length]);
                 } else {
                     timeline.push(at, std::slice::from_raw_parts(data, length));

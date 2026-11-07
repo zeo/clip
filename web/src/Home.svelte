@@ -8,8 +8,17 @@
     status,
     grouped,
     buffer,
-    onopen
-  }: { clips: Clip[]; shown: Clip[]; status: Status; grouped: boolean; buffer: number; onopen: (clip: Clip, list: Clip[]) => void } = $props();
+    onopen,
+    onkeys
+  }: {
+    clips: Clip[];
+    shown: Clip[];
+    status: Status;
+    grouped: boolean;
+    buffer: number;
+    onopen: (clip: Clip, list: Clip[]) => void;
+    onkeys: () => void;
+  } = $props();
   const since = Date.now() - 7 * 864e5;
   const recent = $derived(clips.filter((clip) => clip.modified >= since));
   const feed = $derived(shown.filter((clip) => clip.modified >= since));
@@ -39,6 +48,7 @@
         {#if keyFor(status, 'mark')}<kbd>{keyFor(status, 'mark')}</kbd> marks a moment and saves it 15 s later, so the moment sits
           in the middle of the clip.{/if}
       </p>
+      <p>Coming from Medal, the NVIDIA App, SteelSeries Moments or AMD? <button class="link" onclick={onkeys}>Use the keys you know</button></p>
       <p class="live" class:on={status.recording}>
         <span class="dot"></span>
         <span>{#if status.recording}Recording {status.app}{:else}{sentence(status.message)}{/if}</span>

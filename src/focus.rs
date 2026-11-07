@@ -7,7 +7,8 @@ use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_ContainerFormatPng, IWICImagingFactory, WICBitmapEncoderNoCache,
+    CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat24bppBGR, GUID_WICPixelFormat32bppBGRA,
+    IWICBitmapSource, IWICImagingFactory, WICBitmapEncoderNoCache,
 };
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
@@ -123,6 +124,11 @@ fn covers(window: RECT, monitor: RECT) -> bool {
         && window.bottom >= monitor.bottom
 }
 
+/// Whether `window` is one of clip's own.
+pub fn ours(window: HWND) -> bool {
+    pid(window) == std::process::id()
+}
+
 pub fn pid(window: HWND) -> u32 {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
@@ -145,7 +151,6 @@ pub fn save_icon(pid: u32, to: &Path) -> Result<(), String> {
     if let Some(dir) = to.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let part = to.with_extension("part");
     unsafe {
         let mut icon = HICON::default();
         SHDefExtractIconW(&HSTRING::from(exe.as_path()), 0, 0, Some(&mut icon), None, 256)
@@ -154,25 +159,58 @@ pub fn save_icon(pid: u32, to: &Path) -> Result<(), String> {
         if icon.is_invalid() {
             return Err(format!("{} has no icon", exe.display()));
         }
-        let written = (|| -> windows::core::Result<()> {
+        let written = (|| {
             let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
             let bitmap = factory.CreateBitmapFromHICON(icon)?;
-            let stream = factory.CreateStream()?;
-            stream.InitializeFromFilename(&HSTRING::from(part.as_path()), GENERIC_WRITE.0)?;
-            let encoder = factory.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
-            encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
-            let mut frame = None;
-            encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
-            let frame = frame.ok_or_else(windows::core::Error::empty)?;
-            frame.Initialize(None)?;
-            frame.WriteSource(&bitmap, std::ptr::null())?;
-            frame.Commit()?;
-            encoder.Commit()
+            write_png(&factory, &bitmap, None, to)
         })();
         let _ = DestroyIcon(icon);
-        written.map_err(|e| e.to_string())?;
+        written.map_err(|e| e.to_string())
     }
-    std::fs::rename(&part, to).map_err(|e| e.to_string())
+}
+
+/// Saves tightly packed 8 bit BGRA pixels as an opaque png.
+pub fn png(width: u32, height: u32, bgra: &[u8], to: &Path) -> windows::core::Result<()> {
+    unsafe {
+        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let bitmap = factory.CreateBitmapFromMemory(width, height, &GUID_WICPixelFormat32bppBGRA, width * 4, bgra)?;
+        // the alpha is all opaque, and dropping it saves a quarter of the file
+        write_png(&factory, &bitmap, Some(GUID_WICPixelFormat24bppBGR), to)
+    }
+}
+
+unsafe fn write_png(
+    factory: &IWICImagingFactory,
+    source: &IWICBitmapSource,
+    pixels: Option<windows::core::GUID>,
+    to: &Path,
+) -> windows::core::Result<()> {
+    let mut part = to.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let written = (|| {
+        let stream = factory.CreateStream()?;
+        stream.InitializeFromFilename(&HSTRING::from(part.as_path()), GENERIC_WRITE.0)?;
+        let encoder = factory.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+        let mut frame = None;
+        encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
+        let frame = frame.ok_or_else(windows::core::Error::empty)?;
+        frame.Initialize(None)?;
+        if let Some(mut pixels) = pixels {
+            frame.SetPixelFormat(&mut pixels)?;
+        }
+        frame.WriteSource(source, std::ptr::null())?;
+        frame.Commit()?;
+        encoder.Commit()
+    })();
+    match written.and_then(|()| std::fs::rename(&part, to).map_err(windows::core::Error::from)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
 }
 
 pub fn exe_name(pid: u32) -> Option<String> {

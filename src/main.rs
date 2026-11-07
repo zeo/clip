@@ -9,6 +9,7 @@ mod encode;
 mod export;
 mod focus;
 mod library;
+mod notice;
 use hdrkit as hdr;
 mod ring;
 mod save;
@@ -198,6 +199,7 @@ pub struct Session {
     ring: Arc<Mutex<Ring>>,
     rings: Vec<Arc<Mutex<Ring>>>,
     stop: Arc<AtomicBool>,
+    shots: capture::Shots,
     video: Option<std::thread::JoinHandle<Result<()>>>,
     sound: Option<audio::Recording>,
 }
@@ -207,16 +209,17 @@ impl Session {
         let span = options.buffer.max(1) as i64 * SECOND;
         let ring = Arc::new(Mutex::new(Ring::new(span)));
         let stop = Arc::new(AtomicBool::new(false));
+        let shots = capture::Shots::default();
         let (opened, ready) = std::sync::mpsc::sync_channel(1);
         let video = {
-            let (options, ring, stop) = (options.clone(), ring.clone(), stop.clone());
+            let (options, ring, stop, shots) = (options.clone(), ring.clone(), stop.clone(), shots.clone());
             std::thread::spawn(move || -> Result<()> {
                 unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
                 match prepare(&options, target) {
                     Ok((source, pipeline, encoder, format, mastering, summary)) => {
                         let clock = Clock::start();
                         let _ = opened.send(Ok((format, mastering, summary, clock)));
-                        capture::record(source, pipeline, encoder, format, clock, &ring, &stop)
+                        capture::record(source, pipeline, encoder, format, clock, &ring, &stop, &shots)
                     }
                     Err(message) => {
                         let _ = opened.send(Err(message));
@@ -249,6 +252,7 @@ impl Session {
             ring,
             rings: sound.rings.clone(),
             stop,
+            shots,
             video: Some(video),
             sound: Some(sound),
         })
@@ -272,6 +276,42 @@ impl Session {
         Ok(Saved { seconds: (end - start) as f64 / SECOND as f64, frames: packets.len(), bytes, start })
     }
 
+    /// The next frame the game draws, as captured.
+    pub fn still(&self) -> std::result::Result<capture::Still, String> {
+        let (taken, took) = std::sync::mpsc::channel();
+        self.shots.lock().expect("shots poisoned").push(taken);
+        match took.recv_timeout(Duration::from_millis(1500)) {
+            Ok(still) => still.map_err(|e| format!("couldn't take the screenshot: {e}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("the game drew nothing new to take".into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("the recording stopped".into()),
+        }
+    }
+
+    /// Starts writing everything from the newest keyframe on to `out`, for as long as it's pulled.
+    pub fn tape(&self, out: &std::path::Path) -> std::result::Result<Tape, String> {
+        let first = {
+            let ring = self.ring.lock().expect("ring poisoned");
+            ring.since(ring.end().ok_or("nothing is recorded yet")?)
+                .into_iter()
+                .next()
+                .ok_or("nothing is recorded yet")?
+        };
+        let writer = save::Writer::open(out, &first, self.format, self.rings.len())
+            .map_err(|e| format!("can't start the recording: {e}"))?;
+        Ok(Tape {
+            writer,
+            ring: self.ring.clone(),
+            rings: self.rings.clone(),
+            names: self.names.clone(),
+            mastering: self.mastering,
+            video: first.pts - 1,
+            audio: vec![first.pts - 1; self.rings.len()],
+            start: first.pts,
+            frames: 0,
+            bytes: 0,
+        })
+    }
+
     /// Stops recording and flushes the encoders into the rings, which can still be saved after.
     pub fn stop(&mut self) -> std::result::Result<(), String> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -290,6 +330,54 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+/// A recording written out as it goes, from the rings of a session that may have ended since.
+pub struct Tape {
+    writer: save::Writer,
+    ring: Arc<Mutex<Ring>>,
+    rings: Vec<Arc<Mutex<Ring>>>,
+    names: Vec<String>,
+    mastering: Option<hdr::Mastering>,
+    /// pts of the newest packet written, per stream
+    video: i64,
+    audio: Vec<i64>,
+    start: i64,
+    frames: usize,
+    bytes: usize,
+}
+
+impl Tape {
+    /// Writes what the rings gained since the last pull.
+    pub fn pull(&mut self) -> std::result::Result<(), String> {
+        let fresh = |ring: &Mutex<Ring>, after: i64| -> Vec<Arc<ring::Packet>> {
+            let ring = ring.lock().expect("ring poisoned");
+            ring.since(after).into_iter().filter(|p| p.pts > after).collect()
+        };
+        let packets = fresh(&self.ring, self.video);
+        let Some(newest) = packets.last().map(|p| p.pts) else { return Ok(()) };
+        // sound only up to the newest frame, so the next pull's frames never land before it
+        let audio: Vec<_> = (self.rings.iter().zip(&self.audio))
+            .map(|(ring, &after)| fresh(ring, after).into_iter().filter(|p| p.pts <= newest).collect::<Vec<_>>())
+            .collect();
+        self.writer.write(&packets, &audio).map_err(|e| format!("recording failed: {e}"))?;
+        for (at, lane) in self.audio.iter_mut().zip(&audio) {
+            *at = lane.last().map_or(*at, |p| p.pts);
+        }
+        self.video = newest;
+        self.frames += packets.len();
+        self.bytes += packets.iter().map(|p| p.data.len()).sum::<usize>();
+        Ok(())
+    }
+
+    /// Writes the rest and closes the file.
+    pub fn finish(mut self) -> std::result::Result<Saved, String> {
+        self.pull()?;
+        let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
+        let Self { writer, video, start, frames, bytes, mastering, .. } = self;
+        writer.finish(&names, mastering).map_err(|e| format!("saving the recording failed: {e}"))?;
+        Ok(Saved { seconds: (video - start) as f64 / SECOND as f64, frames, bytes, start })
     }
 }
 
@@ -545,11 +633,121 @@ fn self_test() -> Result<()> {
             }
         }
     }
+    match check_tape(&gpu, &lanes, &dir) {
+        Ok(report) => println!("ok   tape: {report}"),
+        Err(e) => {
+            failures += 1;
+            println!("FAIL tape: {}", e.message())
+        }
+    }
+    match check_png(&dir) {
+        Ok(report) => println!("ok   png: {report}"),
+        Err(e) => {
+            failures += 1;
+            println!("FAIL png: {}", e.message())
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
     if failures > 0 {
         return Err(windows::core::Error::new(E_SELF_TEST, format!("{failures} check(s) failed")));
     }
     Ok(())
+}
+
+/// Feeds rings a few frames at a time while a tape pulls from them, the way a long recording runs,
+/// and checks the file holds every packet once.
+fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::path::Path) -> Result<String> {
+    let fail = |what: String| windows::core::Error::new(E_SELF_TEST, what);
+    let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec: Codec::H264 };
+    let choice = encode::encoders(Codec::H264, Some(gpu.adapter))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| fail("no h.264 encoder".into()))?;
+    let mut pipeline = capture::Pipeline::new(gpu, SDR_DISPLAY, format, hdr::Filter::Area).map_err(at("pipeline"))?;
+    let mut encoder =
+        encode::Encoder::open(&choice, &gpu.device, format, encode::Purpose::Capture).map_err(at("open"))?;
+    let mut video = Vec::new();
+    let frames = 3 * format.fps as i64;
+    for i in 0..frames {
+        let source = pattern(&gpu.device, 800, 600, i as u32, false).map_err(at("pattern"))?;
+        let frame = pipeline.convert(&source, (800, 600), format.fps).map_err(at("convert"))?;
+        video.extend(encoder.encode(&frame, format.time(i)).map_err(at("encode"))?);
+    }
+    video.extend(encoder.finish().map_err(at("drain"))?);
+    // a short ring, so the tape has to keep up for nothing to fall out of it
+    let ring = Arc::new(Mutex::new(Ring::new(SECOND)));
+    let rings: Vec<_> = lanes.iter().map(|_| Arc::new(Mutex::new(Ring::new(SECOND)))).collect();
+    let path = dir.join("tape.mp4");
+    let mut sent = vec![0; lanes.len()];
+    let mut feed = |upto: usize| {
+        let mut ring = ring.lock().expect("ring poisoned");
+        let mut newest = 0;
+        for p in video.drain(..upto.min(video.len())) {
+            newest = p.pts;
+            ring.push(p);
+        }
+        for ((lane, sent), out) in lanes.iter().zip(&mut sent).zip(&rings) {
+            let mut out = out.lock().expect("ring poisoned");
+            while let Some(p) = lane.get(*sent).filter(|p| p.pts <= newest) {
+                out.push(ring::Packet { pts: p.pts, duration: p.duration, key: p.key, data: p.data.clone() });
+                *sent += 1;
+            }
+        }
+        !video.is_empty()
+    };
+    feed(5);
+    let first = ring.lock().expect("ring poisoned").since(i64::MIN)[0].clone();
+    let mut tape = Tape {
+        writer: save::Writer::open(&path, &first, format, rings.len()).map_err(at("open tape"))?,
+        ring: ring.clone(),
+        rings: rings.clone(),
+        names: vec!["tone 440".into(), "tone 660".into()],
+        mastering: None,
+        video: first.pts - 1,
+        audio: vec![first.pts - 1; rings.len()],
+        start: first.pts,
+        frames: 0,
+        bytes: 0,
+    };
+    for chunk in [1, 7, 3, 12, 30, 2] {
+        tape.pull().map_err(fail)?;
+        feed(chunk);
+    }
+    while feed(8) {
+        tape.pull().map_err(fail)?;
+    }
+    let saved = tape.finish().map_err(fail)?;
+    let streams = read_back(&path).map_err(at("read back"))?;
+    let end = format.time(frames - 1);
+    let sound: Vec<usize> = lanes.iter().map(|lane| lane.iter().filter(|p| p.pts <= end).count()).collect();
+    match streams.as_slice() {
+        [(count, true, last), heard @ ..]
+            if *count as i64 == frames
+                && saved.frames as i64 == frames
+                && *last == end
+                && heard.iter().map(|s| s.0 as usize).eq(sound.iter().copied()) =>
+        {
+            Ok(format!("{count} frames and aac packets {sound:?} written in pulls, none twice or missing"))
+        }
+        other => Err(fail(format!("want {frames} frames to {end} and aac packets {sound:?}, got {other:?}"))),
+    }
+}
+
+/// Writes a screenshot and checks the png's header.
+fn check_png(dir: &std::path::Path) -> Result<String> {
+    let path = dir.join("shot.png");
+    let (width, height) = (33, 7);
+    let pixels: Vec<u8> = (0..width * height * 4).map(|i| (i * 7) as u8).collect();
+    focus::png(width, height, &pixels, &path).map_err(at("write"))?;
+    let bytes = std::fs::read(&path).map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
+    let be = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+    // ihdr: width, height, then 8 bits a channel in color type 2, rgb with no alpha
+    match bytes.get(..8) == Some(b"\x89PNG\r\n\x1a\n")
+        && (be(16), be(20), bytes[24], bytes[25]) == (width, height, 8, 2)
+    {
+        true => Ok(format!("{width}x{height} rgb, {} bytes", bytes.len())),
+        false => Err(windows::core::Error::new(E_SELF_TEST, format!("bad header {:?}", &bytes[..26.min(bytes.len())]))),
+    }
 }
 
 fn at(stage: &'static str) -> impl Fn(windows::core::Error) -> windows::core::Error {

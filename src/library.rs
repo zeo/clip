@@ -237,8 +237,14 @@ pub fn settle(folder: &Path) {
     let dirs = std::iter::once(folder.to_path_buf()).chain(dirs.filter(|dir| dir.is_dir()));
     let originals =
         dirs.flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()));
-    let originals: Vec<PathBuf> =
-        originals.filter(|path| path.to_string_lossy().to_ascii_lowercase().ends_with(".mp4.orig")).collect();
+    let lower = |path: &Path| path.to_string_lossy().to_ascii_lowercase();
+    let part = |path: &Path| [".mp4.part", ".png.part"].iter().any(|tail| lower(path).ends_with(tail));
+    let (parts, originals): (Vec<PathBuf>, Vec<PathBuf>) =
+        originals.filter(|path| part(path) || lower(path).ends_with(".mp4.orig")).partition(|path| part(path));
+    // a write cut off by a crash or power loss can't be played, its index is only written at the end
+    for part in parts {
+        let _ = std::fs::remove_file(part);
+    }
     let (kept, lost): (Vec<PathBuf>, Vec<PathBuf>) =
         originals.into_iter().partition(|path| path.with_extension("").exists());
     for path in lost {

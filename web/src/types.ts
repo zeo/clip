@@ -22,10 +22,42 @@ export type Settings = {
   openOnStart: boolean;
   closeToTray: boolean;
   ignore: string[];
+  notice: boolean;
+  noticeCorner: Corner;
 };
 
+export type Corner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+
 // mods are MOD_ALT 1, MOD_CONTROL 2, MOD_SHIFT 4 and MOD_WIN 8, key is a virtual key code with 0 for none
-export type Hotkey = { action: 'save' | 'mark'; mods: number; key: number; seconds: number };
+export type Hotkey = { action: Action; mods: number; key: number; seconds: number };
+export type Action = 'save' | 'mark' | 'shot' | 'mic' | 'record';
+
+export const ACTIONS: Record<Action, { name: string; does: string; key: string }> = {
+  save: { name: 'Save a clip', does: 'Saves what the buffer holds', key: 'Save' },
+  mark: { name: 'Mark a moment', does: 'Marks now and saves 15 s later', key: 'Mark' },
+  shot: { name: 'Take a screenshot', does: 'Saves the next frame as a png', key: 'Screenshot' },
+  mic: { name: 'Mute the mic', does: 'Mutes or unmutes the mic in clips', key: 'Mic' },
+  record: { name: 'Start or stop recording', does: 'Records until pressed again', key: 'Record' }
+};
+
+const ALT = 1;
+const CTRL = 2;
+const SHIFT = 4;
+const F = (n: number) => 0x6f + n;
+const hot = (action: Action, mods: number, key: number): Hotkey => ({ action, mods, key, seconds: 0 });
+
+// each app's keys as it ships them, so people coming over keep their muscle memory
+export const PRESETS: { name: string; hotkeys: Hotkey[] }[] = [
+  { name: 'clip', hotkeys: [hot('save', ALT, F(9)), hot('mark', ALT, F(10))] },
+  { name: 'Medal', hotkeys: [hot('save', 0, F(8)), hot('record', ALT, F(7))] },
+  { name: 'NVIDIA App', hotkeys: [hot('save', ALT, F(10)), hot('record', ALT, F(9)), hot('shot', ALT, F(1))] },
+  { name: 'SteelSeries Moments', hotkeys: [hot('save', ALT, 0x53), hot('mic', ALT, 0x4d)] },
+  {
+    name: 'AMD Software',
+    hotkeys: [hot('save', CTRL | SHIFT, 0x53), hot('record', CTRL | SHIFT, 0x45), hot('shot', CTRL | SHIFT, 0x49)]
+  }
+];
+
 
 export type Status = {
   recording: boolean;
@@ -34,6 +66,9 @@ export type Status = {
   message: string;
   paused: boolean;
   hotkeys: (Hotkey & { taken: boolean })[];
+  mic_muted: boolean;
+  // ms since 1970 a long recording started, 0 when none runs
+  taping: number;
 };
 
 const named: Record<number, string> = {

@@ -11,7 +11,7 @@
   import Home from './Home.svelte';
   import Icon from './Icon.svelte';
   import Preferences from './Preferences.svelte';
-  import { choose, chord, games, length, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
+  import { ACTIONS, choose, chord, games, length, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
   import { cards, gone, radios, say, toasts, view, zooms } from './view.svelte';
 
   type Area = 'home' | 'library' | 'settings';
@@ -34,7 +34,7 @@
   let game = $state<string | null>(null);
   let opened = $state<string | null>(null);
   let page = $state('hotkeys');
-  let status = $state<Status>({ recording: false, app: '', exe: '', message: 'starting', paused: false, hotkeys: [] });
+  let status = $state<Status>({ recording: false, app: '', exe: '', message: 'starting', paused: false, hotkeys: [], mic_muted: false, taping: 0 });
   let settings = $state<Settings | null>(null);
   let found = $state<Clip[]>([]);
   const clips = $derived(found.filter((clip) => !gone.has(clip.path)));
@@ -76,7 +76,18 @@
   const switchable = $derived(settings ? [...new Set([status.exe, ...settings.ignore])].filter(Boolean) : []);
   const cap = $derived(settings?.cap ? settings.cap * 1e9 : null);
   const room = $derived(cap ?? (disk ? used + disk.free : null));
-  const does = (h: Hotkey) => (h.action === 'mark' ? 'Mark' : h.seconds ? `Save ${length(h.seconds)}` : 'Save');
+  const does = (h: Hotkey) => (h.action === 'save' && h.seconds ? `Save ${length(h.seconds)}` : ACTIONS[h.action].key);
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!status.taping) return;
+    now = Date.now();
+    const timer = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+  const taped = $derived.by(() => {
+    const s = Math.max(0, Math.floor((now - status.taping) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  });
   const sheetRows = $derived<[string, [string[], string][]][]>([
     [
       'Anywhere in clip',
@@ -126,7 +137,7 @@
       'In games',
       status.hotkeys
         .filter((h) => h.key)
-        .map((h): [string[], string] => [[chord(h)], h.action === 'mark' ? 'Mark a moment, saved 15 s later' : `${does(h)} clip`])
+        .map((h): [string[], string] => [[chord(h)], h.action === 'save' ? `${does(h)} clip` : ACTIONS[h.action].does])
     ]
   ]);
 
@@ -277,6 +288,12 @@
         <span class="now-text">
           {#if status.recording}Recording <b>{status.app}</b>{:else if status.paused}Paused{:else}{sentence(status.message)}{/if}
         </span>
+        {#if status.taping}<span class="tape mono">REC {taped}</span>{/if}
+        {#if status.mic_muted}
+          <svg class="muted" viewBox="0 0 20 20" role="img" aria-label="Mic muted">
+            <path d="M10 3a2.5 2.5 0 0 0-2.5 2.5v4a2.5 2.5 0 0 0 5 0v-4A2.5 2.5 0 0 0 10 3zM5.5 9.5a4.5 4.5 0 0 0 9 0M10 14v3M4 4l12 12" />
+          </svg>
+        {/if}
         <svg class="caret" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5l3-3" /></svg>
       </button>
       {#if quick && settings}
@@ -291,6 +308,16 @@
               <input type="checkbox" class="switch" checked={!settings.ignore.includes(exe)} onchange={(e) => record(exe, e.currentTarget.checked)} />
             </label>
           {/each}
+          <div class="quick-row">
+            <span class="grow">Long recording<small>{status.taping ? `Recording for ${taped}` : 'Records until stopped, as long as you play'}</small></span>
+            <button class="gel" class:default={!!status.taping} disabled={!status.taping && !status.recording} onclick={() => invoke('toggle_recording')}>
+              {status.taping ? 'Stop' : 'Start'}
+            </button>
+          </div>
+          <div class="quick-row">
+            <span class="grow">Screenshot<small>Saved as a png next to the clips</small></span>
+            <button class="gel" disabled={!status.recording} onclick={() => invoke('take_shot')}>Take</button>
+          </div>
           <button class="quick-row" onclick={() => settle('quality')}>
             <span class="grow">Quality<small class="mono">
                 {settings.height >= 4320 ? 'native' : `${settings.height}p`}{settings.fps}, {settings.mbps} Mbps, last {length(settings.buffer)}
@@ -312,6 +339,12 @@
               {#each mics as mic (mic.id)}<option value={mic.id}>{mic.name}</option>{/each}
             </select>
           </label>
+          {#if settings.mic}
+            <label class="quick-row">
+              <span class="grow">Mute mic<small>{status.mic_muted ? 'Clips get silence from the mic' : 'Clips hear the mic'}</small></span>
+              <input type="checkbox" class="switch" checked={status.mic_muted} onchange={() => invoke('toggle_mic')} />
+            </label>
+          {/if}
           <button class="quick-row" onclick={() => settle('audio')}>
             <span class="grow">Audio<small>Tracks, volumes and push to talk</small></span>
             <span class="go">›</span>
@@ -466,7 +499,7 @@
           <input class="field search" type="search" placeholder="Search" aria-label="Search clips and games" bind:value={query.search} />
         </div>
         {#if area === 'home'}
-          <Home {clips} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={open} />
+          <Home {clips} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={open} onkeys={() => settle('hotkeys')} />
         {:else if game || shelf === 'games'}
           <Games {clips} {shown} app={game} grouped={view.sort === 'newest'} onpick={(app) => browse('games', app)} onopen={open} />
         {:else}

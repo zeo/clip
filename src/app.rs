@@ -28,8 +28,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, VK_F10, VK_F9,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, IsWindow, MessageBoxW, PeekMessageW, PostThreadMessageW, SetTimer, MB_ICONERROR, MB_ICONHAND, MSG,
-    PM_NOREMOVE, WM_APP, WM_HOTKEY, WM_TIMER,
+    DispatchMessageW, GetForegroundWindow, GetMessageW, IsWindow, MessageBoxW, PeekMessageW, PostThreadMessageW,
+    SetTimer, MB_ICONERROR, MB_ICONHAND, MSG, PM_NOREMOVE, WM_APP, WM_HOTKEY, WM_TIMER,
 };
 
 use crate::art::{self, Art};
@@ -37,7 +37,7 @@ use crate::capture::Target;
 use crate::focus::{self, Follow};
 use crate::library::{self, Clip, Marks};
 use crate::ring::SECOND;
-use crate::{hdr, toast, Options, Session};
+use crate::{hdr, notice, toast, Options, Session, Tape};
 
 // capscr's capture sound
 static SAVED: &[u8] = include_bytes!("../assets/saved.wav");
@@ -52,6 +52,9 @@ const WAITING: &str = "waiting for a game";
 const PAUSED: &str = "paused";
 const SAVE: usize = 1;
 const MARK: usize = 2;
+const SHOT: usize = 3;
+const MIC: usize = 4;
+const RECORD: usize = 5;
 // hotkey ids from here on are indexes into the settings' hotkeys
 const HOTKEY: usize = 100;
 // a marked clip saves itself this long after the newest mark, so the moment sits mid clip
@@ -95,6 +98,9 @@ pub struct Settings {
     close_to_tray: bool,
     /// lowercase exe names never recorded
     ignore: Vec<String>,
+    /// a note in a corner of the game's screen on saves and key presses
+    notice: bool,
+    notice_corner: notice::Corner,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -113,6 +119,9 @@ struct Hotkey {
 enum Action {
     Save,
     Mark,
+    Shot,
+    Mic,
+    Record,
 }
 
 impl Default for Settings {
@@ -144,6 +153,8 @@ impl Default for Settings {
             open_on_start: false,
             close_to_tray: true,
             ignore: Vec::new(),
+            notice: true,
+            notice_corner: notice::Corner::TopRight,
         }
     }
 }
@@ -178,6 +189,9 @@ struct Status {
     message: String,
     paused: bool,
     hotkeys: Vec<Bound>,
+    mic_muted: bool,
+    /// ms since 1970 a long recording started at, 0 when none runs
+    taping: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -235,6 +249,9 @@ fn serve() -> Result<(), String> {
             clips,
             save_clip,
             mark_clip,
+            take_shot,
+            toggle_mic,
+            toggle_recording,
             open,
             reveal,
             audio_apps,
@@ -300,10 +317,16 @@ fn serve() -> Result<(), String> {
                 let _ = run_at_login(&name, true);
             }
             let pause = CheckMenuItem::with_id(app, "pause", "pause recording", true, false, None::<&str>)?;
+            let taping = MenuItem::with_id(app, "record", "start recording", true, None::<&str>)?;
+            let mute = CheckMenuItem::with_id(app, "mic", "mute microphone", true, false, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
                 &[
                     &MenuItem::with_id(app, "save", "save clip", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "shot", "take screenshot", true, None::<&str>)?,
+                    &taping,
+                    &PredefinedMenuItem::separator(app)?,
+                    &mute,
                     &pause,
                     &MenuItem::with_id(app, "show", "open clip", true, None::<&str>)?,
                     &MenuItem::with_id(app, "folder", "open clips folder", true, None::<&str>)?,
@@ -333,7 +356,7 @@ fn serve() -> Result<(), String> {
             {
                 let (app, settings, status) = (app.handle().clone(), settings.clone(), status.clone());
                 let library = (marks.clone(), marks_file.clone(), cache.join("thumbs"));
-                let tray = (tray, pause);
+                let tray = Tray { icon: tray, pause, taping, mute };
                 std::thread::spawn(move || record(&app, &tray, &settings, &status, &library, ready));
             }
             let first = stored.is_none();
@@ -354,6 +377,9 @@ fn serve() -> Result<(), String> {
                 let shared = app.state::<Shared>();
                 match event.id.as_ref() {
                     "save" => post(shared.recorder, WM_HOTKEY, SAVE),
+                    "shot" => post(shared.recorder, WM_HOTKEY, SHOT),
+                    "record" => post(shared.recorder, WM_HOTKEY, RECORD),
+                    "mic" => post(shared.recorder, WM_HOTKEY, MIC),
                     "pause" => {
                         let paused = shared.status.lock().expect("status poisoned").paused;
                         post(shared.recorder, WM_PAUSE, !paused as usize);
@@ -391,6 +417,18 @@ fn serve() -> Result<(), String> {
             }
             // closing the window only hides clip in the tray, quitting from the tray passes a code
             RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            // a long recording only plays once it's closed, so quitting closes it first
+            RunEvent::Exit => {
+                let shared = app.state::<Shared>();
+                let taping = || shared.status.lock().expect("status poisoned").taping != 0;
+                if taping() {
+                    post(shared.recorder, WM_HOTKEY, RECORD);
+                    let until = Instant::now() + Duration::from_secs(10);
+                    while taping() && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
             _ => {}
         });
     Ok(())
@@ -478,6 +516,28 @@ fn on_screen(app: &AppHandle, x: f64, y: f64) -> bool {
     })
 }
 
+/// The tray menu items the recorder keeps up to date.
+struct Tray {
+    icon: TrayIcon,
+    pause: CheckMenuItem<Wry>,
+    taping: MenuItem<Wry>,
+    mute: CheckMenuItem<Wry>,
+}
+
+/// A long recording, written as it goes for as long as the session it follows lives.
+struct Taping {
+    tape: Tape,
+    recording: std::rc::Weak<Recording>,
+    app: String,
+    window: HWND,
+    /// where it's written, for the drive's free space
+    out: PathBuf,
+    checked: Instant,
+}
+
+// a long recording stops before the drive fills up
+const ROOM: u64 = 2_000_000_000;
+
 /// A session and the app window it records.
 struct Recording {
     session: Session,
@@ -517,7 +577,7 @@ type Library = (Arc<Mutex<Marks>>, PathBuf, PathBuf);
 /// hotkeys, and starting over on WM_RESTART.
 fn record(
     app: &AppHandle,
-    (tray, pause): &(TrayIcon, CheckMenuItem<Wry>),
+    menu: &Tray,
     settings: &Mutex<Settings>,
     status: &Mutex<Status>,
     (marks, marks_file, thumbs): &Library,
@@ -528,6 +588,8 @@ fn record(
     let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
     let _ = ready.send(unsafe { GetCurrentThreadId() });
     let (bound, held, paused) = (RefCell::new(Vec::<Bound>::new()), Cell::new(false), Cell::new(false));
+    let (tray, pause) = (&menu.icon, &menu.pause);
+    let taping_since = Cell::new(0u64);
     let rebind = || {
         let mut bound = bound.borrow_mut();
         for id in HOTKEY..HOTKEY + bound.len() {
@@ -548,6 +610,9 @@ fn record(
     let pressed = |msg: &MSG| match msg.wParam.0 {
         SAVE => Some((Action::Save, 0)),
         MARK => Some((Action::Mark, 0)),
+        SHOT => Some((Action::Shot, 0)),
+        MIC => Some((Action::Mic, 0)),
+        RECORD => Some((Action::Record, 0)),
         id => bound.borrow().get(id.wrapping_sub(HOTKEY)).map(|bound| (bound.hotkey.action, bound.hotkey.seconds)),
     };
     unsafe { SetTimer(None, 0, 250, None) };
@@ -578,8 +643,16 @@ fn record(
         let buffer = settings.lock().expect("settings poisoned").options().buffer;
         let hotkeys = bound.borrow().clone();
         let taken = if hotkeys.iter().any(|bound| bound.taken) { ", a hotkey is taken by another app" } else { "" };
+        let (mic_muted, taping) = (crate::audio::MIC_MUTED.load(Ordering::Relaxed), taping_since.get());
         let next = match recording {
-            Err(e) => Status { message: format!("{e}{taken}"), paused: paused.get(), hotkeys, ..Status::default() },
+            Err(e) => Status {
+                message: format!("{e}{taken}"),
+                paused: paused.get(),
+                hotkeys,
+                mic_muted,
+                taping,
+                ..Status::default()
+            },
             Ok(recording) => Status {
                 recording: true,
                 app: recording.app.clone(),
@@ -587,15 +660,48 @@ fn record(
                 message: format!("keeping the last {buffer} s{taken}"),
                 paused: false,
                 hotkeys,
+                mic_muted,
+                taping,
             },
         };
         let _ = pause.set_checked(next.paused);
+        let _ = menu.mute.set_checked(next.mic_muted);
+        let _ = menu.taping.set_text(if next.taping == 0 { "start recording" } else { "stop recording" });
         let _ = tray.set_tooltip(Some(match next.recording {
             true => format!("clip: recording {}, {}", next.app, next.message),
             false => format!("clip: {}", next.message),
         }));
         let _ = app.emit("status", &next);
         *status.lock().expect("status poisoned") = next;
+    };
+    // nothing shows over clip's own window, where the window says it
+    let note = |text: &str, bad: bool, game: HWND| {
+        let corner = {
+            let settings = settings.lock().expect("settings poisoned");
+            settings.notice.then_some(settings.notice_corner)
+        };
+        if let Some(corner) = corner.filter(|_| !focus::ours(unsafe { GetForegroundWindow() })) {
+            let text: String = match text.chars().count() {
+                ..=90 => text.into(),
+                _ => text.chars().take(89).chain(['\u{2026}']).collect(),
+            };
+            notice::show(&text, bad, corner, game);
+        }
+    };
+    let feedback = |text: String, bad: bool, game: HWND| {
+        let sound = {
+            let settings = settings.lock().expect("settings poisoned");
+            settings.sound.then_some(settings.sound_volume)
+        };
+        match (bad, sound) {
+            (true, _) => {
+                let _ = unsafe { MessageBeep(MB_ICONHAND) };
+            }
+            (false, Some(volume)) => play_saved(volume),
+            (false, None) => {}
+        }
+        note(&text, bad, game);
+        let _ = app.emit("saved", (text, bad));
     };
     let save = |recording: &Recording, marked: &[i64], seconds: Option<u32>| {
         let (folder, cap, keep_days, sound, notify) = {
@@ -606,7 +712,7 @@ fn record(
         let dir = folder.join(&recording.app);
         let saved = std::fs::create_dir_all(&dir)
             .map_err(|e| format!("can't make {}: {e}", dir.display()))
-            .map(|()| free(&dir))
+            .map(|()| free(&dir, "", "mp4"))
             .and_then(|out| Ok((recording.session.save(&out, seconds)?, out)));
         match &saved {
             Ok(_) => {
@@ -638,6 +744,12 @@ fn record(
                 Err(e) => (format!("Clip not saved: {e}"), true),
             },
         );
+        match &saved {
+            Ok((saved, _)) => {
+                note(&format!("Saved {:.0} s of {}", saved.seconds, recording.app), false, recording.window)
+            }
+            Err(e) => note(&format!("Clip not saved: {e}"), true, recording.window),
+        }
         match saved {
             Ok((saved, out)) => {
                 let mut marks = marks.lock().expect("marks poisoned");
@@ -668,6 +780,50 @@ fn record(
         library::settle(&folder);
         trim(&folder, &marks.lock().expect("marks poisoned"), thumbs, cap, keep_days);
     }
+    let shoot = |recording: &Recording| {
+        let folder = settings.lock().expect("settings poisoned").folder.clone();
+        let dir = folder.join(&recording.app);
+        let taken = recording.session.still().and_then(|still| {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+            let out = free(&dir, "", "png");
+            focus::png(still.width, still.height, &still.bgra(), &out).map_err(|e| e.to_string())?;
+            Ok(still)
+        });
+        match taken {
+            Ok(still) => {
+                feedback(
+                    format!("Screenshot of {} saved, {}x{}", recording.app, still.width, still.height),
+                    false,
+                    recording.window,
+                );
+                let _ = app.emit("clips", ());
+            }
+            Err(e) => feedback(format!("Screenshot not saved: {e}"), true, recording.window),
+        }
+    };
+    let mut taping: Option<Taping> = None;
+    let stop_tape = |taping: Taping, why: Option<&str>| {
+        let Taping { tape, app: game, window, .. } = taping;
+        taping_since.set(0);
+        match tape.finish() {
+            Ok(saved) => {
+                let length = saved.seconds as u64;
+                let length = format!("{}:{:02}", length / 60, length % 60);
+                let text = match why {
+                    Some(why) => format!("Recording saved, {length} of {game}, {why}"),
+                    None => format!("Recording saved, {length} of {game}"),
+                };
+                feedback(text, false, window);
+                let (folder, cap, keep_days) = {
+                    let settings = settings.lock().expect("settings poisoned");
+                    (settings.folder.clone(), settings.cap, settings.keep_days)
+                };
+                trim(&folder, &marks.lock().expect("marks poisoned"), thumbs, cap, keep_days);
+                let _ = app.emit("clips", ());
+            }
+            Err(e) => feedback(format!("Recording not saved: {e}"), true, window),
+        }
+    };
     let mut current: Result<Rc<Recording>, String> = Err(WAITING.into());
     let mut previous: Option<(Rc<Recording>, Instant)> = None;
     let mut pending: Option<Pending> = None;
@@ -692,6 +848,33 @@ fn record(
         }
         if unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 <= 0 {
             break;
+        }
+        // the notice's own paints and timers
+        if !msg.hwnd.is_invalid() {
+            unsafe { DispatchMessageW(&msg) };
+            continue;
+        }
+        if msg.message == WM_TIMER {
+            if let Some(mut running) = taping.take() {
+                let gone = running.recording.upgrade().is_none();
+                let left = (running.checked.elapsed() > Duration::from_secs(5)).then(|| {
+                    running.checked = Instant::now();
+                    room(&running.out)
+                });
+                let why = match running.tape.pull() {
+                    Err(e) => Some(e),
+                    Ok(()) if left.is_some_and(|left| left < ROOM) => Some("the drive is nearly full".into()),
+                    Ok(()) if gone => Some("its recording ended".into()),
+                    Ok(()) => None,
+                };
+                match why {
+                    Some(why) => {
+                        stop_tape(running, Some(&why));
+                        report(&current);
+                    }
+                    None => taping = Some(running),
+                }
+            }
         }
         let gone = |w: HWND| !unsafe { IsWindow(Some(w)) }.as_bool();
         let recorded = current.as_ref().ok().map(|r| r.window);
@@ -729,6 +912,63 @@ fn record(
                 }
                 let candidate = focused().filter(|&w| Some(w) != refused);
                 follow.tick(candidate, recorded, back, Instant::now())
+            }
+            WM_HOTKEY if pressed(&msg).is_some_and(|(action, _)| action == Action::Shot) => {
+                match &current {
+                    Ok(recording) => shoot(recording),
+                    Err(e) => feedback(format!("Screenshot not taken: {e}"), true, HWND::default()),
+                }
+                None
+            }
+            WM_HOTKEY if pressed(&msg).is_some_and(|(action, _)| action == Action::Mic) => {
+                let window = current.as_ref().map_or(HWND::default(), |r| r.window);
+                if settings.lock().expect("settings poisoned").mic {
+                    let muted = !crate::audio::MIC_MUTED.fetch_xor(true, Ordering::Relaxed);
+                    note(if muted { "Mic muted" } else { "Mic on" }, false, window);
+                    let _ = app.emit("saved", (if muted { "Mic muted" } else { "Mic on" }, false));
+                    report(&current);
+                } else {
+                    feedback("The mic isn't recorded, turn it on in Audio".into(), true, window);
+                }
+                None
+            }
+            WM_HOTKEY if pressed(&msg).is_some_and(|(action, _)| action == Action::Record) => {
+                match (taping.take(), &current) {
+                    (Some(running), _) => stop_tape(running, None),
+                    (None, Ok(recording)) => {
+                        let folder = settings.lock().expect("settings poisoned").folder.clone();
+                        let dir = folder.join(&recording.app);
+                        let started = std::fs::create_dir_all(&dir)
+                            .map_err(|e| format!("can't make {}: {e}", dir.display()))
+                            .map(|()| free(&dir, " recording", "mp4"))
+                            .and_then(|out| match room(&out) {
+                                room if room < ROOM => Err("the drive is nearly full".to_string()),
+                                _ => Ok((recording.session.tape(&out)?, out)),
+                            });
+                        match started {
+                            Ok((tape, out)) => {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map_or(1, |d| d.as_millis() as u64);
+                                taping_since.set(now);
+                                taping = Some(Taping {
+                                    tape,
+                                    recording: Rc::downgrade(recording),
+                                    app: recording.app.clone(),
+                                    window: recording.window,
+                                    out,
+                                    checked: Instant::now(),
+                                });
+                                note(&format!("Recording {}", recording.app), false, recording.window);
+                                let _ = app.emit("saved", (format!("Recording {}", recording.app), false));
+                            }
+                            Err(e) => feedback(format!("Recording not started: {e}"), true, recording.window),
+                        }
+                    }
+                    (None, Err(e)) => feedback(format!("Recording not started: {e}"), true, HWND::default()),
+                }
+                report(&current);
+                None
             }
             WM_HOTKEY if pressed(&msg).is_some_and(|(action, _)| action == Action::Mark) => {
                 match &current {
@@ -813,14 +1053,14 @@ fn switch(
     Ok(())
 }
 
-/// A clip path in `dir` named after the time, numbered when a clip from the same second is there.
-fn free(dir: &Path) -> PathBuf {
+/// A path in `dir` named after the time and `tail`, numbered when one from the same second is there.
+fn free(dir: &Path, tail: &str, ext: &str) -> PathBuf {
     let t = unsafe { GetLocalTime() };
     let stamp = format!("{}-{:02}-{:02} {:02}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     (1..)
         .map(|n| match n {
-            1 => dir.join(format!("{stamp}.mp4")),
-            n => dir.join(format!("{stamp} {n}.mp4")),
+            1 => dir.join(format!("{stamp}{tail}.{ext}")),
+            n => dir.join(format!("{stamp}{tail} {n}.{ext}")),
         })
         .find(|out| !out.exists())
         .expect("some name is free")
@@ -1293,6 +1533,16 @@ struct Disk {
     total: u64,
 }
 
+/// Free bytes on the drive `path` is on, or as many as it takes when the drive can't say.
+fn room(path: &Path) -> u64 {
+    let found = path.ancestors().find(|dir| dir.is_dir());
+    let mut free = u64::MAX;
+    if let Some(dir) = found {
+        let _ = unsafe { GetDiskFreeSpaceExW(&HSTRING::from(dir), Some(&mut free), None, None) };
+    }
+    free
+}
+
 /// Space on the drive a folder is on, which may not exist yet.
 #[tauri::command]
 fn disk(folder: PathBuf) -> Result<Disk, String> {
@@ -1319,6 +1569,21 @@ fn save_clip(shared: State<Shared>) {
 #[tauri::command]
 fn mark_clip(shared: State<Shared>) {
     post(shared.recorder, WM_HOTKEY, MARK);
+}
+
+#[tauri::command]
+fn take_shot(shared: State<Shared>) {
+    post(shared.recorder, WM_HOTKEY, SHOT);
+}
+
+#[tauri::command]
+fn toggle_mic(shared: State<Shared>) {
+    post(shared.recorder, WM_HOTKEY, MIC);
+}
+
+#[tauri::command]
+fn toggle_recording(shared: State<Shared>) {
+    post(shared.recorder, WM_HOTKEY, RECORD);
 }
 
 /// Only clips in the clips folder get handed to explorer, which would run anything else.
