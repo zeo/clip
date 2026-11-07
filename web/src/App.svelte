@@ -4,6 +4,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWebview } from '@tauri-apps/api/webview';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import appIcon from '../../icons/icon.png';
   import { art } from './art.svelte';
   import ClipPage from './Clip.svelte';
   import Shot from './Shot.svelte';
@@ -271,10 +272,7 @@
 <div class="shell">
   <header class="bar">
     <span class="glyph" data-tauri-drag-region>
-      <svg viewBox="0 0 18 18" aria-hidden="true">
-        <rect x="1.5" y="1.5" width="15" height="15" rx="4" fill="none" stroke="#e6e6e6" stroke-width="1.2" />
-        <circle cx="9" cy="9" r="3.4" fill="#e6e6e6" />
-      </svg>
+      <img src={appIcon} alt="" draggable="false" />
     </span>
     <div class="now-wrap">
       <button
