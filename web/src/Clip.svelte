@@ -285,7 +285,7 @@
             class="mark"
             style:left={pct(at)}
             aria-label="Mark at {clock(at, true)}"
-            title="Alt+F10 at {clock(at, true)}"
+            title="Marked at {clock(at, true)}"
             onpointerdown={(e) => e.stopPropagation()}
             onclick={() => (video?.pause(), seek(at))}
           ></button>

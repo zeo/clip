@@ -8,7 +8,7 @@
   import Games from './Games.svelte';
   import Home from './Home.svelte';
   import Preferences from './Preferences.svelte';
-  import { choose, games, sentence, type Clip, type Query, type Settings, type Status } from './types';
+  import { choose, games, keyFor, sentence, type Clip, type Query, type Settings, type Status } from './types';
 
   type Page = 'home' | 'games' | 'starred' | 'settings';
   const pages: { id: Page; label: string }[] = [
@@ -28,7 +28,7 @@
   let page = $state<Page>('home');
   let game = $state<string | null>(null);
   let opened = $state<string | null>(null);
-  let status = $state<Status>({ recording: false, app: '', message: 'starting' });
+  let status = $state<Status>({ recording: false, app: '', exe: '', message: 'starting', paused: false, hotkeys: [] });
   let settings = $state<Settings | null>(null);
   let clips = $state<Clip[]>([]);
   let first = $state(false);
@@ -110,10 +110,10 @@
     </div>
     <div class="bar-actions">
       <button class="gel" disabled={!status.recording} onclick={() => invoke('mark_clip')} title="Marks now and saves 15 s later">
-        Mark <kbd>Alt+F10</kbd>
+        Mark{#if keyFor(status, 'mark')}<kbd>{keyFor(status, 'mark')}</kbd>{/if}
       </button>
       <button class="gel default" disabled={!status.recording} onclick={() => invoke('save_clip')}>
-        Save clip <kbd>Alt+F9</kbd>
+        Save clip{#if keyFor(status, 'save')}<kbd>{keyFor(status, 'save')}</kbd>{/if}
       </button>
     </div>
     <div class="controls">

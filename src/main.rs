@@ -251,14 +251,18 @@ impl Session {
         })
     }
 
-    /// Writes what the rings hold right now to `out`.
-    pub fn save(&self, out: &std::path::Path) -> std::result::Result<Saved, String> {
-        let audio: Vec<_> = self.rings.iter().map(|ring| ring.lock().expect("ring poisoned").since(i64::MIN)).collect();
-        let (packets, end, bytes) = {
+    /// Writes what the rings hold right now to `out`, or only about the last `seconds` of it, from
+    /// the keyframe before.
+    pub fn save(&self, out: &std::path::Path, seconds: Option<u32>) -> std::result::Result<Saved, String> {
+        let (packets, end) = {
             let ring = self.ring.lock().expect("ring poisoned");
-            (ring.since(i64::MIN), ring.end().unwrap_or(0), ring.bytes())
+            let end = ring.end().unwrap_or(0);
+            (ring.since(seconds.map_or(i64::MIN, |s| end - s as i64 * SECOND)), end)
         };
         let start = packets.first().map_or(0, |p| p.pts);
+        let from = if seconds.is_some() { start } else { i64::MIN };
+        let audio: Vec<_> = self.rings.iter().map(|ring| ring.lock().expect("ring poisoned").since(from)).collect();
+        let bytes = packets.iter().map(|p| p.data.len()).sum();
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         save::write_mp4(out, &packets, self.format, &audio, &names, self.mastering)
             .map_err(|e| format!("saving failed: {e}"))?;
@@ -300,7 +304,7 @@ fn record_clip<T>(
     println!("audio: {}", lanes.iter().map(|lane| lane.name.as_str()).collect::<Vec<_>>().join(", "));
     let result = work(session.clock);
     session.stop()?;
-    let saved = session.save(out)?;
+    let saved = session.save(out, None)?;
     println!(
         "saved {:.1} s, {} frames, {:.1} MB to {}",
         saved.seconds,

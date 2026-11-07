@@ -1,6 +1,6 @@
 <script lang="ts">
   import Clips from './Clips.svelte';
-  import { sentence, sessionCount, size, type Clip, type Status } from './types';
+  import { keyFor, sentence, sessionCount, size, type Clip, type Status } from './types';
 
   let {
     clips,
@@ -33,10 +33,11 @@
     {/if}
   {:else}
     <section class="welcome">
-      <h1>Play something, then press <kbd>Alt+F9</kbd></h1>
+      <h1>Play something, then press <kbd>{keyFor(status, 'save') ?? 'Save clip'}</kbd></h1>
       <p>
-        The last {buffer} s of the game in focus land here. <kbd>Alt+F10</kbd> marks a moment and saves it 15 s later, so the moment
-        sits in the middle of the clip.
+        The last {buffer} s of the game in focus land here.
+        {#if keyFor(status, 'mark')}<kbd>{keyFor(status, 'mark')}</kbd> marks a moment and saves it 15 s later, so the moment sits
+          in the middle of the clip.{/if}
       </p>
       <p class="live" class:on={status.recording}>
         <span class="dot"></span>

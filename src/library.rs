@@ -209,13 +209,13 @@ pub fn recycle(paths: &[PathBuf]) -> Result<(), String> {
     }
 }
 
-/// Deletes the oldest unstarred clips, never the newest, until the folder holds at most `cap` bytes.
-/// Returns the paths deleted.
-pub fn trim_to(clips: &[Clip], cap: u64) -> Vec<PathBuf> {
+/// Deletes the oldest unstarred clips, never the newest, until the folder holds at most `cap` bytes
+/// and none is older than `before`, in ms since 1970. Returns the paths deleted.
+pub fn trim(clips: &[Clip], cap: u64, before: u64) -> Vec<PathBuf> {
     let mut total: u64 = clips.iter().map(|clip| clip.bytes).sum();
     let mut deleted = Vec::new();
     for clip in clips.iter().skip(1).rev().filter(|clip| !clip.starred) {
-        if total <= cap {
+        if total <= cap && clip.modified >= before {
             break;
         }
         if std::fs::remove_file(&clip.path).is_ok() {
@@ -298,10 +298,22 @@ mod tests {
         for clip in &clips {
             std::fs::write(&clip.path, b"x").unwrap();
         }
-        let deleted = trim_to(&clips, 120);
+        let deleted = trim(&clips, 120, 0);
         assert_eq!(deleted, [clips[3].path.clone(), clips[2].path.clone()]);
         assert!(clips[0].path.exists() && clips[1].path.exists());
+        assert!(trim(&clips[..2], u64::MAX, u64::MAX).is_empty(), "the newest and the starred stay at any age");
         let _ = std::fs::remove_file(&clips[0].path);
         let _ = std::fs::remove_file(&clips[1].path);
+    }
+
+    #[test]
+    fn trimming_by_age_keeps_the_newer_clips() {
+        let mut clips = [clip("age-new", 1, false), clip("age-mid", 1, false), clip("age-old", 1, false)];
+        for (clip, at) in clips.iter_mut().zip([300, 200, 100]) {
+            clip.modified = at;
+            std::fs::write(&clip.path, b"x").unwrap();
+        }
+        assert_eq!(trim(&clips, u64::MAX, 150), [clips[2].path.clone()]);
+        clips.iter().for_each(|clip| drop(std::fs::remove_file(&clip.path)));
     }
 }

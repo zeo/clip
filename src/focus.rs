@@ -40,15 +40,19 @@ const SHELL: [&str; 10] = [
 ];
 
 /// The focused window when it is worth recording: an app's window covering its whole monitor,
-/// fullscreen or borderless, or one of `also`, lowercase exe names recorded in a window too.
-pub fn focused(also: &[String]) -> Option<HWND> {
+/// fullscreen or borderless, or one of `also`, lowercase exe names recorded in a window too. Apps in
+/// `ignore` never are.
+pub fn focused(also: &[String], ignore: &[String]) -> Option<HWND> {
     let window = unsafe { GetForegroundWindow() };
     if unsafe { IsIconic(window) }.as_bool() {
         return None;
     }
     let pid = app_pid(window)?;
-    (fills_monitor(window) || (!also.is_empty() && exe_name(pid).is_some_and(|name| also.contains(&name))))
-        .then_some(window)
+    let name = (!also.is_empty() || !ignore.is_empty()).then(|| exe_name(pid)).flatten();
+    if name.as_ref().is_some_and(|name| ignore.contains(name)) {
+        return None;
+    }
+    (fills_monitor(window) || name.is_some_and(|name| also.contains(&name))).then_some(window)
 }
 
 /// The lowercase exe names of apps with a window open, for picking which to record in a window.
@@ -171,7 +175,7 @@ pub fn save_icon(pid: u32, to: &Path) -> Result<(), String> {
     std::fs::rename(&part, to).map_err(|e| e.to_string())
 }
 
-fn exe_name(pid: u32) -> Option<String> {
+pub fn exe_name(pid: u32) -> Option<String> {
     Some(exe(pid)?.file_name()?.to_string_lossy().to_lowercase())
 }
 

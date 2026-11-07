@@ -53,12 +53,11 @@ pub struct Ring {
     packets: VecDeque<Arc<Packet>>,
     keys: VecDeque<i64>,
     span: i64,
-    bytes: usize,
 }
 
 impl Ring {
     pub fn new(span: i64) -> Self {
-        Self { packets: VecDeque::new(), keys: VecDeque::new(), span, bytes: 0 }
+        Self { packets: VecDeque::new(), keys: VecDeque::new(), span }
     }
 
     pub fn push(&mut self, packet: Packet) {
@@ -68,14 +67,12 @@ impl Ring {
         if packet.key {
             self.keys.push_back(packet.pts);
         }
-        self.bytes += packet.data.len();
         let end = packet.pts + packet.duration;
         self.packets.push_back(Arc::new(packet));
         while self.keys.len() > 1 && end - self.keys[1] >= self.span {
             self.keys.pop_front();
             while self.packets.front().is_some_and(|p| p.pts < self.keys[0]) {
-                let dropped = self.packets.pop_front().expect("front checked");
-                self.bytes -= dropped.data.len();
+                self.packets.pop_front();
             }
         }
     }
@@ -91,10 +88,6 @@ impl Ring {
 
     pub fn end(&self) -> Option<i64> {
         self.packets.back().map(|p| p.pts + p.duration)
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.bytes
     }
 }
 
@@ -119,7 +112,6 @@ mod tests {
         let covered = ring.end().unwrap() - all[0].pts;
         assert!(covered >= 3 * SECOND, "covered {covered}");
         assert!(covered < 4 * SECOND, "kept a whole extra gop: {covered}");
-        assert_eq!(ring.bytes(), all.len() * 100);
     }
 
     #[test]

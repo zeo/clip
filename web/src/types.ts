@@ -11,9 +11,57 @@ export type Settings = {
   startWithWindows: boolean;
   cap: number;
   steamgriddb: string;
+  hotkeys: Hotkey[];
+  volumes: Record<string, number>;
+  micDevice: string;
+  pushToTalk: number;
+  sound: boolean;
+  soundVolume: number;
+  notify: boolean;
+  keepDays: number;
+  openOnStart: boolean;
+  closeToTray: boolean;
+  ignore: string[];
 };
 
-export type Status = { recording: boolean; app: string; message: string };
+// mods are MOD_ALT 1, MOD_CONTROL 2, MOD_SHIFT 4 and MOD_WIN 8, key is a virtual key code with 0 for none
+export type Hotkey = { action: 'save' | 'mark'; mods: number; key: number; seconds: number };
+
+export type Status = {
+  recording: boolean;
+  app: string;
+  exe: string;
+  message: string;
+  paused: boolean;
+  hotkeys: (Hotkey & { taken: boolean })[];
+};
+
+const named: Record<number, string> = {
+  0x08: 'Backspace', 0x09: 'Tab', 0x0d: 'Enter', 0x13: 'Pause', 0x14: 'Caps Lock', 0x1b: 'Esc', 0x20: 'Space',
+  0x21: 'Page Up', 0x22: 'Page Down', 0x23: 'End', 0x24: 'Home', 0x25: 'Left', 0x26: 'Up', 0x27: 'Right', 0x28: 'Down',
+  0x2c: 'Print Screen', 0x2d: 'Insert', 0x2e: 'Delete', 0x6a: 'Num *', 0x6b: 'Num +', 0x6d: 'Num -', 0x6e: 'Num .',
+  0x6f: 'Num /', 0x90: 'Num Lock', 0x91: 'Scroll Lock', 0xba: ';', 0xbb: '=', 0xbc: ',', 0xbd: '-', 0xbe: '.', 0xbf: '/',
+  0xc0: '`', 0xdb: '[', 0xdc: '\\', 0xdd: ']', 0xde: "'"
+};
+
+export function keyName(vk: number): string {
+  if (vk >= 0x70 && vk <= 0x87) return `F${vk - 0x6f}`;
+  if ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5a)) return String.fromCharCode(vk);
+  if (vk >= 0x60 && vk <= 0x69) return `Num ${vk - 0x60}`;
+  return named[vk] ?? `Key ${vk}`;
+}
+
+export function chord(hotkey: Pick<Hotkey, 'mods' | 'key'>): string {
+  if (!hotkey.key) return 'None';
+  const mods = ([[2, 'Ctrl'], [4, 'Shift'], [1, 'Alt'], [8, 'Win']] as const).filter(([bit]) => hotkey.mods & bit);
+  return [...mods.map(([, name]) => name), keyName(hotkey.key)].join('+');
+}
+
+// the first working key of an action, for labels that name it
+export function keyFor(status: Status, action: Hotkey['action']): string | null {
+  const hotkey = status.hotkeys.find((h) => h.action === action && h.key && !h.taken);
+  return hotkey ? chord(hotkey) : null;
+}
 
 export type Clip = {
   path: string;

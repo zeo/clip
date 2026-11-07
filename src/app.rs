@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -7,12 +9,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HWND, LPARAM, WPARAM};
-use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
@@ -21,7 +23,9 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThreadId, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_F10, VK_F9};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, VK_F10, VK_F9,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, IsWindow, MessageBoxW, PeekMessageW, PostThreadMessageW, SetTimer, MB_ICONERROR, MB_ICONHAND, MSG,
     PM_NOREMOVE, WM_APP, WM_HOTKEY, WM_TIMER,
@@ -38,9 +42,17 @@ use crate::{hdr, Options, Session};
 static SAVED: &[u8] = include_bytes!("../assets/saved.wav");
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const WM_RESTART: u32 = WM_APP;
+const WM_HOTKEYS: u32 = WM_APP + 1;
+// wparam 1 lets go of every hotkey so the keys of one being bound reach the window, 0 takes them back
+const WM_HOLD: u32 = WM_APP + 2;
+// wparam 1 pauses, 0 resumes
+const WM_PAUSE: u32 = WM_APP + 3;
 const WAITING: &str = "waiting for a game";
+const PAUSED: &str = "paused";
 const SAVE: usize = 1;
 const MARK: usize = 2;
+// hotkey ids from here on are indexes into the settings' hotkeys
+const HOTKEY: usize = 100;
 // a marked clip saves itself this long after the newest mark, so the moment sits mid clip
 const LEAD: Duration = Duration::from_secs(15);
 // an app left a moment ago keeps recording this long, so alt+tabbing back finds its buffer whole
@@ -65,6 +77,41 @@ pub struct Settings {
     cap: u32,
     /// a steamgriddb api key, for art of games steam doesn't have
     steamgriddb: String,
+    hotkeys: Vec<Hotkey>,
+    /// track name to volume in percent, 100 when missing
+    volumes: BTreeMap<String, u32>,
+    /// a capture endpoint id, empty for the default microphone
+    mic_device: String,
+    /// a virtual key the microphone is only heard while held, 0 for always
+    push_to_talk: u32,
+    sound: bool,
+    /// percent of the saved sound's own level
+    sound_volume: u32,
+    notify: bool,
+    /// days an unstarred clip is kept, 0 for ever
+    keep_days: u32,
+    open_on_start: bool,
+    close_to_tray: bool,
+    /// lowercase exe names never recorded
+    ignore: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+struct Hotkey {
+    action: Action,
+    /// MOD_ALT, MOD_CONTROL, MOD_SHIFT and MOD_WIN bits
+    mods: u32,
+    /// a virtual key code, 0 for none
+    key: u32,
+    /// how much of the buffer a save keeps, 0 for all of it
+    seconds: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Action {
+    Save,
+    Mark,
 }
 
 impl Default for Settings {
@@ -82,6 +129,20 @@ impl Default for Settings {
             start_with_windows: false,
             cap: 0,
             steamgriddb: String::new(),
+            hotkeys: vec![
+                Hotkey { action: Action::Save, mods: MOD_ALT.0, key: VK_F9.0 as u32, seconds: 0 },
+                Hotkey { action: Action::Mark, mods: MOD_ALT.0, key: VK_F10.0 as u32, seconds: 0 },
+            ],
+            volumes: BTreeMap::new(),
+            mic_device: String::new(),
+            push_to_talk: 0,
+            sound: true,
+            sound_volume: 100,
+            notify: false,
+            keep_days: 0,
+            open_on_start: false,
+            close_to_tray: true,
+            ignore: Vec::new(),
         }
     }
 }
@@ -101,8 +162,8 @@ impl Settings {
 
     /// Whether moving from `self` to `next` needs a new session.
     fn records_differently(&self, next: &Self) -> bool {
-        (self.buffer, self.fps, self.height, self.mbps, self.hdr10, self.mic, &self.apps)
-            != (next.buffer, next.fps, next.height, next.mbps, next.hdr10, next.mic, &next.apps)
+        (self.buffer, self.fps, self.height, self.mbps, self.hdr10, self.mic, &self.apps, &self.ignore)
+            != (next.buffer, next.fps, next.height, next.mbps, next.hdr10, next.mic, &next.apps, &next.ignore)
     }
 }
 
@@ -110,7 +171,19 @@ impl Settings {
 struct Status {
     recording: bool,
     app: String,
+    /// the recorded app's lowercase exe name
+    exe: String,
     message: String,
+    paused: bool,
+    hotkeys: Vec<Bound>,
+}
+
+#[derive(Serialize, Clone)]
+struct Bound {
+    #[serde(flatten)]
+    hotkey: Hotkey,
+    /// another app holds the key
+    taken: bool,
 }
 
 struct Shared {
@@ -168,7 +241,10 @@ fn serve() -> Result<(), String> {
             save_thumb,
             track_audio,
             export,
-            game_art
+            game_art,
+            pause,
+            hold_hotkeys,
+            preview_sound
         ])
         .setup(move |app| {
             let paths = app.path();
@@ -205,10 +281,12 @@ fn serve() -> Result<(), String> {
             if settings.start_with_windows {
                 let _ = run_at_login(&name, true);
             }
+            let pause = CheckMenuItem::with_id(app, "pause", "pause recording", true, false, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
                 &[
-                    &MenuItem::with_id(app, "save", "save clip   alt+f9", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "save", "save clip", true, None::<&str>)?,
+                    &pause,
                     &MenuItem::with_id(app, "show", "open clip", true, None::<&str>)?,
                     &MenuItem::with_id(app, "folder", "open clips folder", true, None::<&str>)?,
                     &PredefinedMenuItem::separator(app)?,
@@ -237,9 +315,11 @@ fn serve() -> Result<(), String> {
             {
                 let (app, settings, status) = (app.handle().clone(), settings.clone(), status.clone());
                 let library = (marks.clone(), marks_file.clone(), cache.join("thumbs"));
+                let tray = (tray, pause);
                 std::thread::spawn(move || record(&app, &tray, &settings, &status, &library, ready));
             }
             let first = stored.is_none();
+            let open_on_start = settings.lock().expect("settings poisoned").open_on_start;
             let recorder = recorder.recv()?;
             app.manage(Shared {
                 settings,
@@ -256,6 +336,10 @@ fn serve() -> Result<(), String> {
                 let shared = app.state::<Shared>();
                 match event.id.as_ref() {
                     "save" => post(shared.recorder, WM_HOTKEY, SAVE),
+                    "pause" => {
+                        let paused = shared.status.lock().expect("status poisoned").paused;
+                        post(shared.recorder, WM_PAUSE, !paused as usize);
+                    }
                     "show" => show(app),
                     "folder" => {
                         let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
@@ -271,7 +355,7 @@ fn serve() -> Result<(), String> {
                     _ => {}
                 }
             });
-            if first {
+            if first || open_on_start {
                 show(app.handle());
             }
             Ok(())
@@ -282,6 +366,9 @@ fn serve() -> Result<(), String> {
             RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { .. }, .. } => {
                 if let Some(window) = app.get_webview_window(&label) {
                     remember(app, &window);
+                }
+                if !app.state::<Shared>().settings.lock().expect("settings poisoned").close_to_tray {
+                    app.exit(0);
                 }
             }
             // closing the window only hides clip in the tray, quitting from the tray passes a code
@@ -378,6 +465,7 @@ struct Recording {
     session: Session,
     window: HWND,
     app: String,
+    exe: String,
 }
 
 /// A clip that saves itself once `due`, holding on to its recording until then.
@@ -407,11 +495,11 @@ fn due(first: Instant, now: Instant, buffer: Duration) -> Instant {
 /// Library paths and stills, shared with the window.
 type Library = (Arc<Mutex<Marks>>, PathBuf, PathBuf);
 
-/// Records on this thread's message loop, following the focused game, saving a clip on alt+f9,
-/// marking one on alt+f10, and starting over on WM_RESTART.
+/// Records on this thread's message loop, following the focused game, saving or marking a clip on its
+/// hotkeys, and starting over on WM_RESTART.
 fn record(
     app: &AppHandle,
-    tray: &TrayIcon,
+    (tray, pause): &(TrayIcon, CheckMenuItem<Wry>),
     settings: &Mutex<Settings>,
     status: &Mutex<Status>,
     (marks, marks_file, thumbs): &Library,
@@ -421,13 +509,28 @@ fn record(
     // the queue has to exist before anything is posted to it
     let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
     let _ = ready.send(unsafe { GetCurrentThreadId() });
-    let hotkey = unsafe { RegisterHotKey(None, SAVE as i32, MOD_ALT | MOD_NOREPEAT, VK_F9.0 as u32) }.is_ok();
-    let marker = unsafe { RegisterHotKey(None, MARK as i32, MOD_ALT | MOD_NOREPEAT, VK_F10.0 as u32) }.is_ok();
-    let keys = match (hotkey, marker) {
-        (true, true) => "alt+f9 saves, alt+f10 marks",
-        (true, false) => "alt+f9 saves, alt+f10 is taken by another app",
-        (false, true) => "alt+f9 is taken by another app, alt+f10 marks",
-        (false, false) => "alt+f9 and alt+f10 are taken by other apps",
+    let (bound, held, paused) = (RefCell::new(Vec::<Bound>::new()), Cell::new(false), Cell::new(false));
+    let rebind = || {
+        let mut bound = bound.borrow_mut();
+        for id in HOTKEY..HOTKEY + bound.len() {
+            let _ = unsafe { UnregisterHotKey(None, id as i32) };
+        }
+        let hotkeys = settings.lock().expect("settings poisoned").hotkeys.clone();
+        *bound = (hotkeys.into_iter().enumerate())
+            .map(|(i, hotkey)| {
+                let mods = HOT_KEY_MODIFIERS(hotkey.mods & 0xF) | MOD_NOREPEAT;
+                let id = (HOTKEY + i) as i32;
+                let taken =
+                    !held.get() && hotkey.key != 0 && unsafe { RegisterHotKey(None, id, mods, hotkey.key) }.is_err();
+                Bound { hotkey, taken }
+            })
+            .collect();
+    };
+    rebind();
+    let pressed = |msg: &MSG| match msg.wParam.0 {
+        SAVE => Some((Action::Save, 0)),
+        MARK => Some((Action::Mark, 0)),
+        id => bound.borrow().get(id.wrapping_sub(HOTKEY)).map(|bound| (bound.hotkey.action, bound.hotkey.seconds)),
     };
     unsafe { SetTimer(None, 0, 250, None) };
     let media = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }
@@ -445,19 +548,29 @@ fn record(
         if let Some(exe) = focus::exe(pid) {
             let _ = art::remember(&exe, &art::dir(thumbs, &app));
         }
-        Ok(Rc::new(Recording { session, window, app }))
+        let exe = focus::exe_name(pid).unwrap_or_default();
+        Ok(Rc::new(Recording { session, window, app, exe }))
     };
-    let focused = || focus::focused(&settings.lock().expect("settings poisoned").record);
+    let focused = || {
+        let settings = settings.lock().expect("settings poisoned");
+        focus::focused(&settings.record, &settings.ignore)
+    };
     let report = |recording: &Result<Rc<Recording>, String>| {
         let buffer = settings.lock().expect("settings poisoned").options().buffer;
+        let hotkeys = bound.borrow().clone();
+        let taken = if hotkeys.iter().any(|bound| bound.taken) { ", a hotkey is taken by another app" } else { "" };
         let next = match recording {
-            Err(e) => Status { recording: false, app: String::new(), message: e.clone() },
+            Err(e) => Status { message: format!("{e}{taken}"), paused: paused.get(), hotkeys, ..Status::default() },
             Ok(recording) => Status {
                 recording: true,
                 app: recording.app.clone(),
-                message: format!("keeping the last {buffer} s, {keys}"),
+                exe: recording.exe.clone(),
+                message: format!("keeping the last {buffer} s{taken}"),
+                paused: false,
+                hotkeys,
             },
         };
+        let _ = pause.set_checked(next.paused);
         let _ = tray.set_tooltip(Some(match next.recording {
             true => format!("clip: recording {}, {}", next.app, next.message),
             false => format!("clip: {}", next.message),
@@ -465,20 +578,22 @@ fn record(
         let _ = app.emit("status", &next);
         *status.lock().expect("status poisoned") = next;
     };
-    let save = |recording: &Recording, marked: &[i64]| {
-        let (folder, cap) = {
+    let save = |recording: &Recording, marked: &[i64], seconds: Option<u32>| {
+        let (folder, cap, keep_days, sound) = {
             let settings = settings.lock().expect("settings poisoned");
-            (settings.folder.clone(), settings.cap)
+            (settings.folder.clone(), settings.cap, settings.keep_days, settings.sound.then_some(settings.sound_volume))
         };
         let dir = folder.join(&recording.app);
         let saved = std::fs::create_dir_all(&dir)
             .map_err(|e| format!("can't make {}: {e}", dir.display()))
             .map(|()| free(&dir))
-            .and_then(|out| Ok((recording.session.save(&out)?, out)));
+            .and_then(|out| Ok((recording.session.save(&out, seconds)?, out)));
         match &saved {
-            Ok(_) => unsafe {
-                let _ = PlaySoundW(PCWSTR(SAVED.as_ptr().cast()), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-            },
+            Ok(_) => {
+                if let Some(volume) = sound {
+                    play_saved(volume);
+                }
+            }
             Err(_) => {
                 let _ = unsafe { MessageBeep(MB_ICONHAND) };
             }
@@ -497,9 +612,7 @@ fn record(
                         let _ = tray.set_tooltip(Some(format!("clip: {e}")));
                     }
                 }
-                if cap > 0 {
-                    library::trim_to(&library::list(&folder, &marks, thumbs), cap as u64 * 1_000_000_000);
-                }
+                trim(&folder, &marks, thumbs, cap, keep_days);
                 let _ = app.emit("clips", ());
             }
             Err(e) => {
@@ -507,6 +620,13 @@ fn record(
             }
         }
     };
+    {
+        let (folder, cap, keep_days) = {
+            let settings = settings.lock().expect("settings poisoned");
+            (settings.folder.clone(), settings.cap, settings.keep_days)
+        };
+        trim(&folder, &marks.lock().expect("marks poisoned"), thumbs, cap, keep_days);
+    }
     let mut current: Result<Rc<Recording>, String> = Err(WAITING.into());
     let mut previous: Option<(Rc<Recording>, Instant)> = None;
     let mut pending: Option<Pending> = None;
@@ -517,13 +637,13 @@ fn record(
         if restart {
             restart = false;
             if let Some(early) = pending.take() {
-                save(&early.recording, &early.marks);
+                save(&early.recording, &early.marks, None);
             }
             // the old sessions let go of the encoder before the new one opens its own
             previous = None;
-            drop(std::mem::replace(&mut current, Err(WAITING.into())));
+            drop(std::mem::replace(&mut current, Err(if paused.get() { PAUSED } else { WAITING }.into())));
             refused = None;
-            if let Some(window) = focused() {
+            if let Some(window) = focused().filter(|_| !paused.get()) {
                 current = begin(window);
                 refused = current.is_err().then_some(window);
             }
@@ -540,6 +660,20 @@ fn record(
                 restart = true;
                 None
             }
+            WM_HOTKEYS | WM_HOLD => {
+                if msg.message == WM_HOLD {
+                    held.set(msg.wParam.0 == 1);
+                }
+                rebind();
+                report(&current);
+                None
+            }
+            WM_PAUSE => {
+                let on = msg.wParam.0 == 1;
+                restart = paused.replace(on) != on;
+                None
+            }
+            WM_TIMER if paused.get() => None,
             WM_TIMER => {
                 if previous.as_ref().is_some_and(|(r, left)| left.elapsed() > GRACE || gone(r.window)) {
                     previous = None;
@@ -550,12 +684,12 @@ fn record(
                     report(&current);
                 }
                 if let Some(due) = pending.take_if(|due| due.due <= Instant::now()) {
-                    save(&due.recording, &due.marks);
+                    save(&due.recording, &due.marks, None);
                 }
                 let candidate = focused().filter(|&w| Some(w) != refused);
                 follow.tick(candidate, recorded, back, Instant::now())
             }
-            WM_HOTKEY if msg.wParam.0 == MARK => {
+            WM_HOTKEY if pressed(&msg).is_some_and(|(action, _)| action == Action::Mark) => {
                 match &current {
                     Ok(recording) => {
                         let (now, at) = (Instant::now(), recording.session.clock.now());
@@ -563,7 +697,7 @@ fn record(
                             Duration::from_secs(settings.lock().expect("settings poisoned").options().buffer as u64);
                         // marks in another app's recording make their clip now
                         if let Some(other) = pending.take_if(|p| !Rc::ptr_eq(&p.recording, recording)) {
-                            save(&other.recording, &other.marks);
+                            save(&other.recording, &other.marks, None);
                         }
                         pending
                             .get_or_insert_with(|| Pending {
@@ -581,6 +715,7 @@ fn record(
                 None
             }
             WM_HOTKEY => {
+                let seconds = pressed(&msg).map(|(_, seconds)| seconds).filter(|&seconds| seconds > 0);
                 // pressed straight after coming back to an app, the clip is of that app
                 if let Some(back) = back.filter(|&back| focused() == Some(back)) {
                     if switch(back, &mut current, &mut previous, &begin).is_ok() {
@@ -591,7 +726,7 @@ fn record(
                     // a save while a marked clip waits keeps its marks, and the marked clip still comes
                     Ok(recording) => {
                         let marked = pending.as_ref().filter(|p| Rc::ptr_eq(&p.recording, recording));
-                        save(recording, marked.map_or(&[], |p| &p.marks));
+                        save(recording, marked.map_or(&[], |p| &p.marks), seconds);
                     }
                     Err(e) => {
                         let _ = unsafe { MessageBeep(MB_ICONHAND) };
@@ -659,6 +794,48 @@ fn migrate(moves: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Deletes the oldest unstarred clips past `cap` GB or older than `keep_days`, 0 being no limit.
+fn trim(folder: &Path, marks: &Marks, thumbs: &Path, cap: u32, keep_days: u32) {
+    if cap == 0 && keep_days == 0 {
+        return;
+    }
+    let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |now| now.as_millis() as u64);
+    let before = match keep_days {
+        0 => 0,
+        days => now.saturating_sub(days as u64 * 86_400_000),
+    };
+    let cap = if cap == 0 { u64::MAX } else { cap as u64 * 1_000_000_000 };
+    library::trim(&library::list(folder, marks, thumbs), cap, before);
+}
+
+/// Plays the saved sound at `percent` of its level, on a thread of its own that keeps the scaled copy.
+fn play_saved(percent: u32) {
+    let wav = louder(SAVED, percent.min(150));
+    std::thread::spawn(move || unsafe {
+        let _ = PlaySoundW(PCWSTR(wav.as_ptr().cast()), None, SND_MEMORY | SND_NODEFAULT);
+    });
+}
+
+/// A 16 bit pcm wav with its samples scaled to `percent`, clipping instead of wrapping.
+fn louder(wav: &[u8], percent: u32) -> Vec<u8> {
+    let mut out = wav.to_vec();
+    let mut at = 12;
+    while at + 8 <= out.len() {
+        let size = u32::from_le_bytes(out[at + 4..at + 8].try_into().expect("four bytes")) as usize;
+        let body = at + 8..(at + 8 + size).min(out.len());
+        if &out[at..at + 4] == b"data" {
+            for sample in out[body].as_chunks_mut::<2>().0 {
+                let scaled = i16::from_le_bytes(*sample) as i32 * percent as i32 / 100;
+                sample.copy_from_slice(&(scaled.clamp(i16::MIN.into(), i16::MAX.into()) as i16).to_le_bytes());
+            }
+            break;
+        }
+        // chunks are padded to an even length
+        at = body.end + (size & 1);
+    }
+    out
+}
+
 fn run_at_login(name: &str, on: bool) -> windows::core::Result<()> {
     let name = HSTRING::from(name);
     let result = if on {
@@ -713,12 +890,15 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
         .map_err(|e| format!("can't change start with windows: {e}"))?;
     app.asset_protocol_scope().allow_directory(&settings.folder, true).map_err(|e| e.to_string())?;
     shared.first.store(false, Ordering::Relaxed);
-    let restart = {
+    let (restart, rebind) = {
         let mut current = shared.settings.lock().expect("settings poisoned");
-        let restart = current.records_differently(&settings);
+        let changed = (current.records_differently(&settings), current.hotkeys != settings.hotkeys);
         *current = settings;
-        restart
+        changed
     };
+    if rebind {
+        post(shared.recorder, WM_HOTKEYS, 0);
+    }
     if restart {
         post(shared.recorder, WM_RESTART, 0);
     }
@@ -897,6 +1077,21 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + 
 }
 
 #[tauri::command]
+fn pause(shared: State<Shared>, on: bool) {
+    post(shared.recorder, WM_PAUSE, on as usize);
+}
+
+#[tauri::command]
+fn hold_hotkeys(shared: State<Shared>, on: bool) {
+    post(shared.recorder, WM_HOLD, on as usize);
+}
+
+#[tauri::command]
+fn preview_sound(percent: u32) {
+    play_saved(percent);
+}
+
+#[tauri::command]
 fn save_clip(shared: State<Shared>) {
     post(shared.recorder, WM_HOTKEY, SAVE);
 }
@@ -961,6 +1156,21 @@ mod tests {
         assert_eq!(due(first, first + 20 * s, buffer), first + 28 * s);
         assert_eq!(due(first, first + 29 * s, buffer), first + 29 * s);
         assert_eq!(due(first, first, 10 * s), first + 5 * s);
+    }
+
+    #[test]
+    fn the_saved_sound_scales_and_clips() {
+        let wav = |samples: &[i16]| {
+            let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+            let mut wav = b"RIFF\0\0\0\0WAVEfmt \x02\0\0\0abLIST\x03\0\0\0xyz\0data".to_vec();
+            wav.extend((data.len() as u32).to_le_bytes());
+            wav.extend(data);
+            wav
+        };
+        let input = wav(&[1000, -1000, 30000, -30000]);
+        assert_eq!(louder(&input, 100), input);
+        assert_eq!(louder(&input, 50), wav(&[500, -500, 15000, -15000]));
+        assert_eq!(louder(&input, 150), wav(&[1500, -1500, i16::MAX, i16::MIN]));
     }
 
     #[test]
