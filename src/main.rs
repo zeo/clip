@@ -12,6 +12,7 @@ use hdrkit as hdr;
 mod ring;
 mod save;
 mod sync;
+mod toast;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;

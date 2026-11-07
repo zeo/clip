@@ -16,6 +16,7 @@ use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HWND, LPARAM, WPARAM};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MF_VERSION};
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
@@ -36,7 +37,7 @@ use crate::capture::Target;
 use crate::focus::{self, Follow};
 use crate::library::{self, Clip, Marks};
 use crate::ring::SECOND;
-use crate::{hdr, Options, Session};
+use crate::{hdr, toast, Options, Session};
 
 // capscr's shutter played backwards, so the two apps are told apart by ear
 static SAVED: &[u8] = include_bytes!("../assets/saved.wav");
@@ -247,7 +248,9 @@ fn serve() -> Result<(), String> {
             hold_hotkeys,
             preview_sound,
             mics,
-            mic_level
+            mic_level,
+            test_notification,
+            disk
         ])
         .setup(move |app| {
             let paths = app.path();
@@ -273,6 +276,10 @@ fn serve() -> Result<(), String> {
             let marks = Arc::new(Mutex::new(Marks::load(&marks_file)));
             let cache = app.path().cache_dir()?.join(&name);
             app.asset_protocol_scope().allow_directory(&cache, true)?;
+            let icon = cache.join("icon.png");
+            let _ = std::fs::create_dir_all(&cache)
+                .and_then(|()| std::fs::write(&icon, include_bytes!("../icons/icon.png")));
+            let _ = toast::register(&app.config().identifier, "clip", &icon);
             let stored = std::fs::read_to_string(&file).ok();
             let mut settings: Settings =
                 stored.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
@@ -583,9 +590,10 @@ fn record(
         *status.lock().expect("status poisoned") = next;
     };
     let save = |recording: &Recording, marked: &[i64], seconds: Option<u32>| {
-        let (folder, cap, keep_days, sound) = {
+        let (folder, cap, keep_days, sound, notify) = {
             let settings = settings.lock().expect("settings poisoned");
-            (settings.folder.clone(), settings.cap, settings.keep_days, settings.sound.then_some(settings.sound_volume))
+            let sound = settings.sound.then_some(settings.sound_volume);
+            (settings.folder.clone(), settings.cap, settings.keep_days, sound, settings.notify)
         };
         let dir = folder.join(&recording.app);
         let saved = std::fs::create_dir_all(&dir)
@@ -601,6 +609,16 @@ fn record(
             Err(_) => {
                 let _ = unsafe { MessageBeep(MB_ICONHAND) };
             }
+        }
+        if notify {
+            let id = &app.config().identifier;
+            let _ = match &saved {
+                Ok((saved, out)) => {
+                    let body = format!("{}, {:.0} s, {}", recording.app, saved.seconds, size(saved.bytes as u64));
+                    toast::show(id, "Clip saved", &body, Some(out), true)
+                }
+                Err(e) => toast::show(id, "Clip not saved", e, None, true),
+            };
         }
         match saved {
             Ok((saved, out)) => {
@@ -1093,6 +1111,36 @@ fn hold_hotkeys(shared: State<Shared>, on: bool) {
 #[tauri::command]
 fn preview_sound(percent: u32) {
     play_saved(percent);
+}
+
+#[tauri::command]
+fn test_notification(app: AppHandle) -> Result<(), String> {
+    let body = "Saved clips show up like this";
+    toast::show(&app.config().identifier, "Clip saved", body, None, true)
+}
+
+#[derive(Serialize)]
+struct Disk {
+    free: u64,
+    total: u64,
+}
+
+/// Space on the drive a folder is on, which may not exist yet.
+#[tauri::command]
+fn disk(folder: PathBuf) -> Result<Disk, String> {
+    let found =
+        folder.ancestors().find(|dir| dir.is_dir()).ok_or_else(|| format!("{} is on no drive", folder.display()))?;
+    let (mut free, mut total) = (0, 0);
+    unsafe { GetDiskFreeSpaceExW(&HSTRING::from(found), Some(&mut free), Some(&mut total), None) }
+        .map_err(|e| e.to_string())?;
+    Ok(Disk { free, total })
+}
+
+fn size(bytes: u64) -> String {
+    match bytes {
+        1_000_000_000.. => format!("{:.2} GB", bytes as f64 / 1e9),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    }
 }
 
 #[tauri::command]
