@@ -6,6 +6,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { art } from './art.svelte';
   import ClipPage from './Clip.svelte';
+  import Shot from './Shot.svelte';
   import Clips from './Clips.svelte';
   import Games from './Games.svelte';
   import Home from './Home.svelte';
@@ -25,7 +26,8 @@
     ['all', 'All clips'],
     ['starred', 'Starred'],
     ['today', 'Today'],
-    ['week', 'This week']
+    ['week', 'This week'],
+    ['images', 'Screenshots and GIFs']
   ];
 
   const win = getCurrentWindow();
@@ -65,7 +67,9 @@
   const side = $derived(area === 'home' ? 'home' : 'library');
   const sided = $derived(!current && view.side[side]);
   const covers = $derived(area === 'library' && !game && shelf === 'games');
-  const used = $derived(clips.reduce((sum, clip) => sum + clip.bytes, 0));
+  // what's in the clips folder, which the storage limit and the meter are about
+  const ours = $derived(clips.filter((clip) => !clip.source));
+  const used = $derived(ours.reduce((sum, clip) => sum + clip.bytes, 0));
   const counts = $derived(Object.fromEntries(shelves.map(([id]) => [id, choose(clips, { show: id, sort: 'newest', search: '' }).length])));
   const failed = $derived(!status.recording && !status.paused && !['starting', 'waiting for a game'].includes(status.message));
   const hero = $derived(status.recording ? art(status.app)?.hero : null);
@@ -396,7 +400,7 @@
   </nav>
 
   {#if area === 'settings'}
-    <Preferences {first} {used} {status} count={clips.length} bind:page onapplied={applied} />
+    <Preferences {first} {used} {status} count={ours.filter((clip) => clip.kind === 'clip').length} bind:page onapplied={applied} />
   {:else}
     {#if sided}<aside class="side">
       <div class="side-list">
@@ -428,6 +432,9 @@
     <main class="stage" class:wide={!sided}>
       {#if current}
         {#key current.path}
+          {#if current.kind === 'image'}
+            <Shot clip={current} prev={step.prev} next={step.next} onopen={open} onclose={() => (opened = null)} />
+          {:else}
           <ClipPage
             clip={current}
             prev={step.prev}
@@ -440,6 +447,7 @@
               opened = to;
             }}
           />
+          {/if}
         {/key}
       {:else}
         <div class="toolbar">
@@ -499,14 +507,20 @@
           <input class="field search" type="search" placeholder="Search" aria-label="Search clips and games" bind:value={query.search} />
         </div>
         {#if area === 'home'}
-          <Home {clips} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={open} onkeys={() => settle('hotkeys')} />
+          <Home clips={clips.filter((clip) => clip.kind === 'clip')} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={open} onkeys={() => settle('hotkeys')} />
         {:else if game || shelf === 'games'}
           <Games {clips} {shown} app={game} grouped={view.sort === 'newest'} onpick={(app) => browse('games', app)} onopen={open} />
         {:else}
           <div class="view">
             {#if shown.length === 0}
               <p class="empty">
-                {query.search ? 'No clips match.' : shelf === 'starred' ? 'Star a clip and it stays here. The storage limit never deletes it.' : 'No clips here yet.'}
+                {query.search
+                  ? 'No clips match.'
+                  : shelf === 'starred'
+                    ? 'Star a clip and it stays here. The storage limit never deletes it.'
+                    : shelf === 'images'
+                      ? 'Screenshots from the screenshot key, and frames and GIFs saved from clips, show up here.'
+                      : 'No clips here yet.'}
               </p>
             {:else}
               <Clips clips={shown} grouped={view.sort === 'newest'} onopen={open} />

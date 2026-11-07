@@ -5,8 +5,8 @@
   // stills are made one at a time, so the library holds at most one media player of its own
   let queue: Promise<unknown> = Promise.resolve();
 
-  function still(path: string): Promise<string> {
-    const next = queue.then(() => grab(path));
+  function still(path: string, image: boolean): Promise<string> {
+    const next = queue.then(() => (image ? picture(path) : grab(path)));
     queue = next.catch(() => {});
     return next;
   }
@@ -16,6 +16,26 @@
       video.addEventListener(event, () => done(), { once: true });
       video.addEventListener('error', () => fail(new Error(`can't read ${video.src}`)), { once: true });
     });
+  }
+
+  async function picture(path: string): Promise<string> {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = convertFileSrc(path);
+    await img.decode();
+    return keep(path, img, img.naturalWidth, img.naturalHeight);
+  }
+
+  async function keep(path: string, from: CanvasImageSource, width: number, height: number): Promise<string> {
+    const scale = Math.min(1, LONG_SIDE / Math.max(width, height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    canvas.getContext('2d')?.drawImage(from, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise<Blob | null>((done) => canvas.toBlob(done, 'image/jpeg', 0.82));
+    if (!blob) throw new Error('no still');
+    const jpeg = Array.from(new Uint8Array(await blob.arrayBuffer()));
+    return await invoke<string>('save_thumb', { path, jpeg });
   }
 
   async function grab(path: string): Promise<string> {
@@ -30,15 +50,7 @@
       const seeked = once(video, 'seeked');
       video.currentTime = Math.min(1, video.duration / 2);
       await seeked;
-      const scale = LONG_SIDE / Math.max(video.videoWidth, video.videoHeight);
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.round(video.videoWidth * scale);
-      canvas.height = Math.round(video.videoHeight * scale);
-      canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise<Blob | null>((done) => canvas.toBlob(done, 'image/jpeg', 0.82));
-      if (!blob) throw new Error('no still');
-      const jpeg = Array.from(new Uint8Array(await blob.arrayBuffer()));
-      return await invoke<string>('save_thumb', { path, jpeg });
+      return await keep(path, video, video.videoWidth, video.videoHeight);
     } finally {
       video.removeAttribute('src');
       video.load();
@@ -60,7 +72,7 @@
       ([entry]) => {
         if (!entry.isIntersecting) return;
         io.disconnect();
-        still(clip.path).then(
+        still(clip.path, clip.kind === 'image').then(
           (thumb) => (made = thumb),
           () => (failed = true)
         );
@@ -74,9 +86,9 @@
 
 <div class="thumb" use:watch>
   {#if shown}<img src={convertFileSrc(shown)} alt="" draggable="false" />{:else if failed}<span class="thumb-none">No preview</span>{/if}
-  {#if live}
+  {#if live && clip.kind === 'clip'}
     <!-- svelte-ignore a11y_media_has_caption -->
     <video src={convertFileSrc(clip.path)} autoplay muted loop></video>
   {/if}
-  {#if badge && clip.seconds > 0}<span class="duration mono">{clock(clip.seconds)}</span>{/if}
+  {#if badge && clip.seconds > 0}<span class="duration mono">{clock(clip.seconds)}</span>{:else if badge && clip.path.toLowerCase().endsWith('.gif')}<span class="duration mono">GIF</span>{/if}
 </div>

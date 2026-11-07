@@ -12,9 +12,20 @@ use windows::Win32::UI::Shell::{
 /// Clips of one app saved less than this far apart belong to one session.
 const SESSION_GAP: u64 = 30 * 60 * 1000;
 
+#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Clip,
+    /// a screenshot, a saved frame or a gif
+    Image,
+}
+
 #[derive(Serialize)]
 pub struct Clip {
     pub path: PathBuf,
+    pub kind: Kind,
+    /// the folder name, for clips in another app's folder that clip only reads
+    pub source: Option<String>,
     pub app: String,
     pub name: String,
     pub bytes: u64,
@@ -96,36 +107,79 @@ fn key(folder: &Path, path: &Path) -> String {
     path.strip_prefix(folder).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
-/// Every clip in `folder` and its app folders, newest first, grouped into sessions.
-pub fn list(folder: &Path, marks: &Marks, thumbs: &Path) -> Vec<Clip> {
+/// What a file is by its extension, if the library shows it.
+pub fn kind(path: &Path) -> Option<Kind> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match ext.as_str() {
+        "mp4" => Some(Kind::Clip),
+        "png" | "gif" => Some(Kind::Image),
+        _ => None,
+    }
+}
+
+/// The files of `dir` and its app folders, with the app each belongs to. Files straight in `dir` go
+/// to `flat`.
+fn scan(dir: &Path, flat: &str) -> Vec<(std::fs::DirEntry, String)> {
     let entries = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten();
     let mut found = Vec::new();
-    for entry in entries(folder) {
+    for entry in entries(dir) {
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             let app = entry.file_name().to_string_lossy().into_owned();
             found.extend(entries(&entry.path()).map(|inner| (inner, app.clone())));
         } else {
-            // clips saved before clip sorted them by app were all of the desktop
-            found.push((entry, "desktop".to_string()));
+            found.push((entry, flat.to_string()));
+        }
+    }
+    found.retain(|(entry, _)| kind(&entry.path()).is_some());
+    found
+}
+
+fn folder_name(dir: &Path) -> String {
+    dir.file_name().map_or_else(|| dir.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+/// Every clip and image in `folder` and its app folders, then in each of `sources` that clip only
+/// reads, newest first and grouped into sessions. A file in a source that the clips folder has a copy
+/// of, by name and size, shows once.
+pub fn list(folder: &Path, sources: &[PathBuf], marks: &Marks, thumbs: &Path) -> Vec<Clip> {
+    // clips saved before clip sorted them by app were all of the desktop
+    let mut found: Vec<_> = scan(folder, "desktop").into_iter().map(|(entry, app)| (entry, app, None)).collect();
+    let mut seen: HashSet<PathBuf> = found.iter().map(|(entry, ..)| entry.path()).collect();
+    let mut copies: HashSet<(String, u64)> = found
+        .iter()
+        .filter_map(|(entry, ..)| {
+            Some((entry.file_name().to_string_lossy().to_lowercase(), entry.metadata().ok()?.len()))
+        })
+        .collect();
+    for source in sources {
+        let name = folder_name(source);
+        for (entry, app) in scan(source, &name) {
+            let copy =
+                (entry.file_name().to_string_lossy().to_lowercase(), entry.metadata().map_or(0, |meta| meta.len()));
+            if seen.insert(entry.path()) && copies.insert(copy) {
+                found.push((entry, app, Some(name.clone())));
+            }
         }
     }
     let mut clips: Vec<Clip> = found
         .into_iter()
-        .filter(|(entry, _)| entry.path().extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")))
-        .filter_map(|(entry, app)| {
+        .filter_map(|(entry, app, source)| {
             let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
             let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
             let path = entry.path();
+            let kind = kind(&path)?;
             let name = path.file_stem()?.to_string_lossy().into_owned();
-            let probe = crate::save::probe(&path);
+            let probe = (kind == Kind::Clip).then(|| crate::save::probe(&path)).and_then(Result::ok);
             let (seconds, fps) = probe.as_ref().map_or((0.0, 0.0), |probe| (probe.seconds, probe.fps));
-            let hdr = probe.is_ok_and(|probe| probe.mastering.is_some());
+            let hdr = probe.is_some_and(|probe| probe.mastering.is_some());
             let (starred, at) = (marks.starred(folder, &path), marks.marks(folder, &path));
             let thumb = Some(thumb(thumbs, &path, modified, meta.len())).filter(|thumb| thumb.is_file());
             let icon = Some(icon(thumbs, &app)).filter(|icon| icon.is_file());
             let bytes = meta.len();
             Some(Clip {
                 path,
+                kind,
+                source,
                 app,
                 name,
                 bytes,
@@ -238,7 +292,7 @@ pub fn settle(folder: &Path) {
     let originals =
         dirs.flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()));
     let lower = |path: &Path| path.to_string_lossy().to_ascii_lowercase();
-    let part = |path: &Path| [".mp4.part", ".png.part"].iter().any(|tail| lower(path).ends_with(tail));
+    let part = |path: &Path| [".mp4.part", ".png.part", ".gif.part"].iter().any(|tail| lower(path).ends_with(tail));
     let (parts, originals): (Vec<PathBuf>, Vec<PathBuf>) =
         originals.filter(|path| part(path) || lower(path).ends_with(".mp4.orig")).partition(|path| part(path));
     // a write cut off by a crash or power loss can't be played, its index is only written at the end
@@ -253,12 +307,14 @@ pub fn settle(folder: &Path) {
     let _ = recycle(&kept);
 }
 
-/// Deletes the oldest unstarred clips, never the newest, until the folder holds at most `cap` bytes
-/// and none is older than `before`, in ms since 1970. Returns the paths deleted.
+/// Deletes the oldest unstarred clips, never the newest, until the folder's clips take at most `cap`
+/// bytes and none is older than `before`, in ms since 1970. Images and clips in other apps' folders
+/// are never touched. Returns the paths deleted.
 pub fn trim(clips: &[Clip], cap: u64, before: u64) -> Vec<PathBuf> {
-    let mut total: u64 = clips.iter().map(|clip| clip.bytes).sum();
+    let ours: Vec<&Clip> = clips.iter().filter(|clip| clip.kind == Kind::Clip && clip.source.is_none()).collect();
+    let mut total: u64 = ours.iter().map(|clip| clip.bytes).sum();
     let mut deleted = Vec::new();
-    for clip in clips.iter().skip(1).rev().filter(|clip| !clip.starred) {
+    for clip in ours.into_iter().skip(1).rev().filter(|clip| !clip.starred) {
         if total <= cap && clip.modified >= before {
             break;
         }
@@ -268,6 +324,45 @@ pub fn trim(clips: &[Clip], cap: u64, before: u64) -> Vec<PathBuf> {
         }
     }
     deleted
+}
+
+/// Where files made from a clip go: beside it when it's in the clips folder, or in the clips folder
+/// under its app when it's in another app's folder.
+pub fn home(folder: &Path, path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or(folder);
+    if dir == folder || dir.parent() == Some(folder) {
+        dir.to_path_buf()
+    } else {
+        folder.join(folder_name(dir))
+    }
+}
+
+/// Copies the clips and images of another app's folder into the clips folder under the same app
+/// names, leaving the originals and skipping any already there. Returns how many were copied.
+pub fn import(source: &Path, folder: &Path, progress: impl Fn(usize, usize)) -> Result<usize, String> {
+    let found = scan(source, &folder_name(source));
+    let mut copied = 0;
+    for (i, (entry, app)) in found.iter().enumerate() {
+        progress(i, found.len());
+        let dir = folder.join(crate::focus::folder_safe(app));
+        let to = dir.join(entry.file_name());
+        if to.exists() || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let mut part = to.clone().into_os_string();
+        part.push(".part");
+        // a copy cut off half way is left as a part, which the next start clears
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::copy(entry.path(), &part))
+            .and_then(|_| std::fs::rename(&part, &to))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&part);
+                format!("couldn't copy {}: {e}", entry.path().display())
+            })?;
+        copied += 1;
+    }
+    progress(found.len(), found.len());
+    Ok(copied)
 }
 
 #[cfg(test)]
@@ -321,6 +416,8 @@ mod tests {
     fn clip(name: &str, bytes: u64, starred: bool) -> Clip {
         Clip {
             path: std::env::temp_dir().join(format!("clip-trim-{}-{name}.mp4", std::process::id())),
+            kind: Kind::Clip,
+            source: None,
             app: "a".into(),
             name: name.into(),
             bytes,
@@ -360,5 +457,66 @@ mod tests {
         }
         assert_eq!(trim(&clips, u64::MAX, 150), [clips[2].path.clone()]);
         clips.iter().for_each(|clip| drop(std::fs::remove_file(&clip.path)));
+    }
+
+    #[test]
+    fn trimming_leaves_images_and_other_apps_folders_alone() {
+        let mut clips = [clip("kept-new", 1, false), clip("kept-shot", 1, false), clip("kept-medal", 1, false)];
+        clips[1].kind = Kind::Image;
+        clips[2].source = Some("Medal".into());
+        for clip in &clips {
+            std::fs::write(&clip.path, b"x").unwrap();
+        }
+        assert!(trim(&clips, 0, u64::MAX).is_empty());
+        assert!(clips.iter().all(|clip| clip.path.exists()));
+        clips.iter().for_each(|clip| drop(std::fs::remove_file(&clip.path)));
+    }
+
+    #[test]
+    fn other_apps_clips_list_once_and_copy_in() {
+        let root = std::env::temp_dir().join(format!("clip-sources-{}", std::process::id()));
+        let (folder, medal) = (root.join("clips"), root.join("Medal"));
+        let write = |path: PathBuf, bytes: &[u8]| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        write(folder.join(r"Fortnite\ours.mp4"), b"1");
+        write(medal.join(r"Fortnite\theirs.mp4"), b"22");
+        write(medal.join(r"Fortnite\ours.mp4"), b"1");
+        write(medal.join("loose.png"), b"333");
+        write(medal.join("notes.txt"), b"4");
+        let thumbs = root.join("thumbs");
+        let listed = |sources: &[PathBuf]| {
+            let mut names: Vec<_> = list(&folder, sources, &Marks::default(), &thumbs)
+                .into_iter()
+                .map(|clip| (clip.name, clip.app, clip.source, clip.kind))
+                .collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            names
+        };
+        let medal_name = Some("Medal".to_string());
+        assert_eq!(
+            listed(std::slice::from_ref(&medal)),
+            [
+                ("loose".into(), "Medal".into(), medal_name.clone(), Kind::Image),
+                ("ours".into(), "Fortnite".into(), None, Kind::Clip),
+                ("theirs".into(), "Fortnite".into(), medal_name, Kind::Clip),
+            ]
+        );
+        assert_eq!(listed(&[folder.clone(), medal.clone(), medal.clone()]).len(), 3, "overlapping folders list once");
+        assert_eq!(home(&folder, &medal.join(r"Fortnite\theirs.mp4")), folder.join("Fortnite"));
+        assert_eq!(home(&folder, &medal.join("loose.png")), folder.join("Medal"));
+        assert_eq!(home(&folder, &folder.join(r"Fortnite\ours.mp4")), folder.join("Fortnite"));
+
+        assert_eq!(import(&medal, &folder, |_, _| {}), Ok(2));
+        assert_eq!(std::fs::read(folder.join(r"Fortnite\ours.mp4")).unwrap(), b"1", "a clip already there stays");
+        assert!(folder.join(r"Fortnite\theirs.mp4").is_file() && folder.join(r"Medal\loose.png").is_file());
+        assert!(medal.join(r"Fortnite\theirs.mp4").is_file(), "the originals stay");
+        assert!(
+            listed(std::slice::from_ref(&medal)).iter().all(|(.., source, _)| source.is_none()),
+            "copies show once"
+        );
+        assert_eq!(import(&medal, &folder, |_, _| {}), Ok(0));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { getVersion } from '@tauri-apps/api/app';
   import { open } from '@tauri-apps/plugin-dialog';
   import Bind from './Bind.svelte';
@@ -63,6 +64,10 @@
 
   let draft = $state<Settings | null>(null);
   let saved = $state('');
+  // other clipping apps' usual folders that this pc has
+  let others = $state<{ name: string; path: string }[]>([]);
+  let importing = $state<string | null>(null);
+  let percent = $state(0);
   let error = $state('');
   let busy = $state(false);
   let playing = $state<string[]>([]);
@@ -96,6 +101,7 @@
     saved = JSON.stringify(s);
     draft = s;
     getVersion().then((v) => (version = v));
+    invoke<typeof others>('other_folders').then((found) => (others = found));
     await look();
   });
 
@@ -170,6 +176,32 @@
       sent = 'Sent';
     } catch (e) {
       sent = String(e).replace(/^./, (c) => c.toUpperCase());
+    }
+  }
+
+  const known = (dir: string) => others.find((other) => other.path === dir)?.name ?? dir.split(/[\\/]/).filter(Boolean).pop() ?? dir;
+
+  async function addSource() {
+    if (!draft) return;
+    const picked = await open({ directory: true });
+    if (typeof picked !== 'string') return;
+    if (picked === draft.folder) say(`That's the clips folder`, true);
+    else if (draft.sources.includes(picked)) say(`${known(picked)} is listed already`, true);
+    else draft.sources.push(picked);
+  }
+
+  async function copyIn(dir: string) {
+    importing = dir;
+    percent = 0;
+    const heard = await listen<number>('import-progress', (e) => (percent = e.payload));
+    try {
+      const n = await invoke<number>('import_folder', { source: dir });
+      say(n === 0 ? `Everything in ${known(dir)} is in clip already` : `Copied ${n} ${n === 1 ? 'file' : 'files'} from ${known(dir)} into clip`);
+    } catch (e) {
+      say(String(e), true);
+    } finally {
+      heard();
+      importing = null;
     }
   }
 
@@ -471,6 +503,35 @@
                 <span class="row-label">Space used<small>{count} {count === 1 ? 'clip' : 'clips'}{disk ? `, ${size(disk.free)} free of ${size(disk.total)} on this drive` : ''}</small></span>
                 {#if disk}<span class="meter"><span style:width="{Math.min(100, ((disk.total - disk.free) / disk.total) * 100)}%"></span><span class="ours" style:width="{Math.min(100, (used / disk.total) * 100)}%"></span></span>{/if}
                 <span class="mono">{size(used)}</span>
+              </div>
+            </div>
+          </section>
+          <section class="group">
+            <h2 class="group-head">Other apps' folders</h2>
+            <p class="form-hint">Clips, screenshots and GIFs from Medal, the NVIDIA App, Game Bar, Outplayed or any folder show in the library too. clip never changes or deletes them, cleanup included.</p>
+            <div class="rows">
+              {#each draft.sources as dir, i (dir)}
+                {@const applied = before?.sources.includes(dir)}
+                <div class="row">
+                  <span class="row-label">{known(dir)}<small class="row-path mono">{dir}</small></span>
+                  <button
+                    class="gel"
+                    disabled={importing !== null || !applied}
+                    title={applied ? 'Copies its clips into the clips folder and leaves the originals' : 'Apply first'}
+                    onclick={() => copyIn(dir)}>{importing === dir ? `Copying ${percent}%` : 'Copy into clip'}</button
+                  >
+                  <button class="gel" disabled={importing === dir} onclick={() => draft!.sources.splice(i, 1)}>Remove</button>
+                </div>
+              {/each}
+              {#each others.filter((other) => !draft!.sources.includes(other.path) && other.path !== draft!.folder) as other (other.path)}
+                <div class="row">
+                  <span class="row-label">{other.name}<small class="row-path mono">{other.path}</small></span>
+                  <button class="gel" onclick={() => draft!.sources.push(other.path)}>Add</button>
+                </div>
+              {/each}
+              <div class="row">
+                <span class="row-label">Another folder<small>Its folders become games in the library</small></span>
+                <button class="gel" onclick={addSource}>Add folder</button>
               </div>
             </div>
           </section>

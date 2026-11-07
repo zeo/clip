@@ -8,6 +8,7 @@ export type Settings = {
   apps: string[];
   record: string[];
   folder: string;
+  sources: string[];
   startWithWindows: boolean;
   cap: number;
   steamgriddb: string;
@@ -108,6 +109,9 @@ export function length(seconds: number): string {
 
 export type Clip = {
   path: string;
+  kind: 'clip' | 'image';
+  // the folder name when it's another app's, which clip only reads
+  source: string | null;
   app: string;
   name: string;
   bytes: number;
@@ -133,7 +137,8 @@ export function ramMB(s: Settings): number {
 }
 
 export function size(bytes: number): string {
-  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(2)} GB` : `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  return bytes >= 1e5 || bytes === 0 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.ceil(bytes / 1e3)} KB`;
 }
 
 export function clock(seconds: number, hundredths = false): string {
@@ -166,6 +171,7 @@ export function title(clip: Clip): string {
 export function games(clips: Clip[]): Game[] {
   const found = new Map<string, Game>();
   for (const clip of clips) {
+    if (clip.kind !== 'clip') continue;
     let game = found.get(clip.app);
     if (!game) found.set(clip.app, (game = { app: clip.app, icon: clip.icon, clips: [], bytes: 0 }));
     game.clips.push(clip);
@@ -179,7 +185,7 @@ export function sessionCount(clips: Clip[]): number {
 }
 
 export type Query = {
-  show: 'all' | 'starred' | 'today' | 'week';
+  show: 'all' | 'starred' | 'today' | 'week' | 'images';
   sort: 'newest' | 'oldest' | 'longest' | 'largest' | 'name' | 'game';
   search: string;
 };
@@ -193,11 +199,12 @@ const orders: Partial<Record<Query['sort'], (a: Clip, b: Clip) => number>> = {
 };
 
 export function choose(clips: Clip[], query: Query): Clip[] {
-  const since = { all: 0, starred: 0, today: new Date().setHours(0, 0, 0, 0), week: Date.now() - 7 * 864e5 }[query.show];
+  const since = { all: 0, starred: 0, images: 0, today: new Date().setHours(0, 0, 0, 0), week: Date.now() - 7 * 864e5 }[query.show];
   const words = query.search.trim().toLowerCase();
   const kept = clips.filter(
     (clip) =>
       clip.modified >= since &&
+      (clip.kind === 'image') === (query.show === 'images') &&
       (query.show !== 'starred' || clip.starred) &&
       (!words || `${title(clip)} ${clip.name} ${clip.app}`.toLowerCase().includes(words))
   );

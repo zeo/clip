@@ -76,6 +76,8 @@ pub struct Settings {
     /// exe names recorded in a window too, not only covering a monitor
     record: Vec<String>,
     folder: PathBuf,
+    /// other apps' clip folders the library lists and never changes
+    sources: Vec<PathBuf>,
     start_with_windows: bool,
     /// whole gigabytes the clips folder may hold, 0 for no limit
     cap: u32,
@@ -136,6 +138,7 @@ impl Default for Settings {
             apps: Vec::new(),
             record: Vec::new(),
             folder: PathBuf::new(),
+            sources: Vec::new(),
             start_with_windows: false,
             cap: 0,
             steamgriddb: String::new(),
@@ -275,7 +278,9 @@ fn serve() -> Result<(), String> {
             mics,
             mic_level,
             test_notification,
-            disk
+            disk,
+            other_folders,
+            import_folder
         ])
         .setup(move |app| {
             let paths = app.path();
@@ -312,6 +317,9 @@ fn serve() -> Result<(), String> {
                 settings.folder = app.path().video_dir()?.join("clip-recorder");
             }
             app.asset_protocol_scope().allow_directory(&settings.folder, true)?;
+            for source in &settings.sources {
+                app.asset_protocol_scope().allow_directory(source, true)?;
+            }
             let _ = run_at_login(&old, false);
             if settings.start_with_windows {
                 let _ = run_at_login(&name, true);
@@ -1086,7 +1094,7 @@ fn trim(folder: &Path, marks: &Marks, thumbs: &Path, cap: u32, keep_days: u32) {
         days => now.saturating_sub(days as u64 * 86_400_000),
     };
     let cap = if cap == 0 { u64::MAX } else { cap as u64 * 1_000_000_000 };
-    library::trim(&library::list(folder, marks, thumbs), cap, before);
+    library::trim(&library::list(folder, &[], marks, thumbs), cap, before);
 }
 
 /// Plays the saved sound at `percent` of its level, on a thread of its own that keeps the scaled copy.
@@ -1162,6 +1170,9 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
         return Err("pick a folder for clips".into());
     }
     std::fs::create_dir_all(&settings.folder).map_err(|e| format!("can't make {}: {e}", settings.folder.display()))?;
+    if let Some(bad) = settings.sources.iter().find(|dir| !dir.is_absolute()) {
+        return Err(format!("{} isn't a whole path", bad.display()));
+    }
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     if let Some(dir) = shared.file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1169,7 +1180,9 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
     std::fs::write(&shared.file, json).map_err(|e| format!("can't save settings: {e}"))?;
     run_at_login(&shared.login, settings.start_with_windows)
         .map_err(|e| format!("can't change start with windows: {e}"))?;
-    app.asset_protocol_scope().allow_directory(&settings.folder, true).map_err(|e| e.to_string())?;
+    for dir in std::iter::once(&settings.folder).chain(&settings.sources) {
+        app.asset_protocol_scope().allow_directory(dir, true).map_err(|e| e.to_string())?;
+    }
     shared.first.store(false, Ordering::Relaxed);
     let (restart, rebind) = {
         let mut current = shared.settings.lock().expect("settings poisoned");
@@ -1189,9 +1202,12 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
 
 #[tauri::command]
 fn clips(shared: State<Shared>) -> Vec<Clip> {
-    let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
+    let (folder, sources) = {
+        let settings = shared.settings.lock().expect("settings poisoned");
+        (settings.folder.clone(), settings.sources.clone())
+    };
     let thumbs = shared.cache.join("thumbs");
-    let clips = library::list(&folder, &shared.marks.lock().expect("marks poisoned"), &thumbs);
+    let clips = library::list(&folder, &sources, &shared.marks.lock().expect("marks poisoned"), &thumbs);
     library::prune(&thumbs, &clips);
     clips
 }
@@ -1205,7 +1221,7 @@ fn marked(shared: &Shared, change: impl FnOnce(&mut Marks, &Path)) -> Result<(),
 
 #[tauri::command]
 fn star(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>, on: bool) -> Result<(), String> {
-    paths.iter().try_for_each(|path| clip_in_folder(&shared, path))?;
+    paths.iter().try_for_each(|path| listed(&shared, path))?;
     marked(&shared, |marks, folder| paths.iter().for_each(|path| marks.star(folder, path, on)))?;
     let _ = app.emit("clips", ());
     Ok(())
@@ -1223,7 +1239,7 @@ fn rename(app: AppHandle, shared: State<Shared>, path: PathBuf, name: String) ->
 
 #[tauri::command]
 fn delete(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
-    paths.iter().try_for_each(|path| clip_in_folder(&shared, path))?;
+    paths.iter().try_for_each(|path| saved_in_folder(&shared, path))?;
     let recycled = library::recycle(&paths);
     // a cancelled operation can still have moved some of them
     let gone = paths.iter().filter(|path| !path.exists());
@@ -1234,7 +1250,7 @@ fn delete(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<
 
 #[tauri::command]
 fn set_marks(app: AppHandle, shared: State<Shared>, path: PathBuf, mut at: Vec<f64>) -> Result<(), String> {
-    clip_in_folder(&shared, &path)?;
+    listed(&shared, &path)?;
     at.retain(|t| t.is_finite() && *t >= 0.0);
     at.sort_by(f64::total_cmp);
     at.dedup_by(|a, b| (*a - *b).abs() < 0.05);
@@ -1254,7 +1270,8 @@ fn save_frame(shared: State<Shared>, request: tauri::ipc::Request) -> Result<Pat
     };
     let path = PathBuf::from(header("clip")?);
     let at: f64 = header("at")?.parse().map_err(|_| "the frame's time isn't a number")?;
-    clip_in_folder(&shared, &path)?;
+    listed(&shared, &path)?;
+    let dir = home(&shared, &path)?;
     let tauri::ipc::InvokeBody::Raw(image) = request.body() else {
         return Err("the frame has to come as bytes".into());
     };
@@ -1267,8 +1284,8 @@ fn save_frame(shared: State<Shared>, request: tauri::ipc::Request) -> Result<Pat
     let (minutes, seconds) = ((at / 60.0).floor(), at % 60.0);
     let out = (1..)
         .map(|n| match n {
-            1 => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s.{kind}")),
-            n => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s {n}.{kind}")),
+            1 => dir.join(format!("{stem} {minutes}m{seconds:05.2}s.{kind}")),
+            n => dir.join(format!("{stem} {minutes}m{seconds:05.2}s {n}.{kind}")),
         })
         .find(|out| !out.exists())
         .expect("some name is free");
@@ -1295,13 +1312,13 @@ fn unescape(text: &str) -> Option<String> {
 
 #[tauri::command]
 fn copy_files(window: WebviewWindow, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
-    paths.iter().try_for_each(|path| saved_in_folder(&shared, path))?;
+    paths.iter().try_for_each(|path| listed(&shared, path))?;
     crate::clipboard::copy_files(window.hwnd().map_err(|e| e.to_string())?, &paths)
 }
 
 #[tauri::command]
 fn save_thumb(shared: State<Shared>, path: PathBuf, jpeg: Vec<u8>) -> Result<PathBuf, String> {
-    clip_in_folder(&shared, &path)?;
+    listed(&shared, &path)?;
     if !jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Err("a still has to be a jpeg".into());
     }
@@ -1346,7 +1363,7 @@ struct Track {
 /// Decodes every audio track of a clip to its own wav, since the webview only plays the first.
 #[tauri::command]
 async fn track_audio(shared: State<'_, Shared>, path: PathBuf) -> Result<Vec<Track>, String> {
-    clip_in_folder(&shared, &path)?;
+    listed(&shared, &path)?;
     let audio = shared.cache.join("audio");
     blocking(move || {
         let tracks = crate::export::tracks(&path)?;
@@ -1388,7 +1405,11 @@ async fn export(
     portrait: Option<f64>,
     replace: bool,
 ) -> Result<PathBuf, String> {
-    clip_in_folder(&shared, &path)?;
+    match replace {
+        true => clip_in_folder(&shared, &path)?,
+        false => listed(&shared, &path)?,
+    }
+    let dir = home(&shared, &path)?;
     if !(start >= 0.0 && end > start) {
         return Err("the end has to come after the start".into());
     }
@@ -1407,8 +1428,8 @@ async fn export(
         };
         let out = (1..)
             .map(|n| match n {
-                1 => path.with_file_name(format!("{stem} {kind}.mp4")),
-                n => path.with_file_name(format!("{stem} {kind} {n}.mp4")),
+                1 => dir.join(format!("{stem} {kind}.mp4")),
+                n => dir.join(format!("{stem} {kind} {n}.mp4")),
             })
             .find(|out| !out.exists())
             .expect("some name is free");
@@ -1586,39 +1607,104 @@ fn toggle_recording(shared: State<Shared>) {
     post(shared.recorder, WM_HOTKEY, RECORD);
 }
 
-/// Only clips in the clips folder get handed to explorer, which would run anything else.
+/// A clip in the clips folder, which clip may change.
 fn clip_in_folder(shared: &Shared, path: &Path) -> Result<(), String> {
-    in_folder(shared, path, &["mp4"])
+    in_folder(shared, path, &["mp4"], false)
 }
 
-/// A clip, or a frame or gif saved from one.
+/// A clip, or an image saved from a game or a clip, in the clips folder.
 fn saved_in_folder(shared: &Shared, path: &Path) -> Result<(), String> {
-    in_folder(shared, path, &["mp4", "png", "gif"])
+    in_folder(shared, path, &["mp4", "png", "gif"], false)
 }
 
-fn in_folder(shared: &Shared, path: &Path, kinds: &[&str]) -> Result<(), String> {
-    let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
+/// Anything the library lists, also from other apps' folders, which clip only reads. Only these get
+/// handed to explorer, which would run anything else.
+fn listed(shared: &Shared, path: &Path) -> Result<(), String> {
+    in_folder(shared, path, &["mp4", "png", "gif"], true)
+}
+
+fn in_folder(shared: &Shared, path: &Path, kinds: &[&str], sources: bool) -> Result<(), String> {
+    let settings = shared.settings.lock().expect("settings poisoned");
     let parent = path.parent();
-    let inside = !path.components().any(|part| part == Component::ParentDir)
-        && (parent == Some(folder.as_path()) || parent.and_then(Path::parent) == Some(folder.as_path()))
+    let under =
+        |root: &PathBuf| parent == Some(root.as_path()) || parent.and_then(Path::parent) == Some(root.as_path());
+    let shown = !path.components().any(|part| part == Component::ParentDir)
         && path.extension().is_some_and(|e| kinds.iter().any(|kind| e.eq_ignore_ascii_case(kind)))
         && path.is_file();
-    if inside {
+    let theirs = settings.sources.iter().any(under);
+    if shown && (under(&settings.folder) || sources && theirs) {
         Ok(())
+    } else if shown && theirs {
+        Err(format!("{} is in another app's folder, clip only reads it", path.display()))
     } else {
         Err(format!("{} is not a clip", path.display()))
     }
 }
 
+/// The folder files made from `path` go in, made if it's new.
+fn home(shared: &Shared, path: &Path) -> Result<PathBuf, String> {
+    let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
+    let dir = library::home(&folder, path);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+#[derive(Serialize)]
+struct Found {
+    name: &'static str,
+    path: PathBuf,
+}
+
+/// The folders other clipping apps save to by default that this pc has.
+#[tauri::command]
+fn other_folders(app: AppHandle) -> Vec<Found> {
+    let paths = app.path();
+    let (videos, documents) = (paths.video_dir().unwrap_or_default(), paths.document_dir().unwrap_or_default());
+    let medal =
+        [PathBuf::from(r"C:\Medal\Clips"), PathBuf::from(r"C:\Medal"), videos.join("Medal"), documents.join("Medal")];
+    let real = |dir: &PathBuf| dir.is_absolute() && dir.is_dir();
+    [
+        ("Medal", medal.into_iter().find(real)),
+        ("Outplayed", Some(videos.join("Overwolf").join("Outplayed"))),
+        ("Xbox Game Bar", Some(videos.join("Captures"))),
+        ("NVIDIA App", Some(videos)),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| Some(Found { name, path: path.filter(real)? }))
+    .collect()
+}
+
+/// Copies the clips and images of one of the other folders into the clips folder, sending
+/// `import-progress` in percent. Returns how many were copied.
+#[tauri::command]
+async fn import_folder(app: AppHandle, shared: State<'_, Shared>, source: PathBuf) -> Result<usize, String> {
+    let folder = {
+        let settings = shared.settings.lock().expect("settings poisoned");
+        if !settings.sources.contains(&source) {
+            return Err(format!("{} isn't one of the other folders", source.display()));
+        }
+        settings.folder.clone()
+    };
+    let progress = app.clone();
+    let copied = blocking(move || {
+        library::import(&source, &folder, |done, total| {
+            let _ = progress.emit("import-progress", done * 100 / total.max(1));
+        })
+    })
+    .await;
+    let _ = app.emit("clips", ());
+    copied
+}
+
 #[tauri::command]
 fn open(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    saved_in_folder(&shared, &path)?;
+    listed(&shared, &path)?;
     Command::new("explorer").arg(&path).spawn().map(drop).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn reveal(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    saved_in_folder(&shared, &path)?;
+    listed(&shared, &path)?;
     // explorer reads /select, with the path quoted after the comma, which std's quoting can't produce
     Command::new("explorer")
         .raw_arg(format!("/select,\"{}\"", path.display()))

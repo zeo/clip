@@ -75,7 +75,10 @@
     );
   }
 
-  function remove(gone: Clip[]) {
+  function remove(chosen: Clip[]) {
+    const gone = chosen.filter((clip) => !clip.source);
+    if (gone.length < chosen.length) say(`Clips in other apps' folders stay, clip only reads them`, true);
+    if (gone.length === 0) return;
     const next = clips.find((clip, i) => !gone.includes(clip) && i > clips.indexOf(gone[gone.length - 1])) ?? clips.find((clip) => !gone.includes(clip));
     discard(
       gone.map((clip) => clip.path),
@@ -206,7 +209,7 @@
         <div class="session-head" id="{uid}-{n}">
           {#if showApp}<span>{newest.app}</span>{/if}
           <span class:session-when={showApp}>{span}</span>
-          <span class="mono">{session.length} {session.length === 1 ? 'clip' : 'clips'}</span>
+          <span class="mono">{session.length} {session[0].kind === 'image' ? 'image' : 'clip'}{session.length === 1 ? '' : 's'}</span>
         </div>
       {/if}
       <ul class="grid" class:picking={picked.length > 0} role="presentation">
@@ -227,14 +230,15 @@
             <!-- the title comes first, so it starts the name a screen reader gives the card, and css draws the still above it -->
             <span class="clip-name">{title(clip)}</span>
             {#if view.list}
-              {#if showApp}<span class="clip-cell">{clip.app}</span>{/if}
+              {#if showApp}<span class="clip-cell">{clip.app}{#if clip.source}<span class="clip-source">{clip.source}</span>{/if}</span>{/if}
               <span class="clip-cell">{when(clip)}</span>
-              <span class="clip-cell mono">{clock(clip.seconds)}</span>
+              <span class="clip-cell mono">{clip.kind === 'clip' ? clock(clip.seconds) : ''}</span>
               <span class="clip-cell mono">{size(clip.bytes)}</span>
               <span class="clip-cell mono">{#if clip.marks.length}{clip.marks.length}<span class="spoken"> marks</span>{/if}</span>
             {:else}
               <span class="clip-meta mono">
                 {#if clip.marks.length}<span class="clip-marks"><span aria-hidden="true">◆</span>{clip.marks.length}<span class="spoken"> marks</span></span>{/if}
+                {#if clip.source}<span class="clip-source" title="In {clip.source}'s folder, clip only reads it">{clip.source}</span>{/if}
                 <span class="clip-size">{size(clip.bytes)}</span>
               </span>
               {#if !grouped}<span class="clip-sub">{showApp ? `${clip.app}, ` : ''}{when(clip)}</span>{/if}

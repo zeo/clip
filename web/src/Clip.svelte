@@ -460,14 +460,20 @@
       onblur={rename}
     />
   {:else}
-    <h1 class="toolbar-title renamable" title="Double click to rename" ondblclick={() => (naming = clip.name)}>{title(clip)}</h1>
+    <h1 class="toolbar-title" class:renamable={!clip.source} title={clip.source ? undefined : 'Double click to rename'} ondblclick={() => !clip.source && (naming = clip.name)}>
+      {title(clip)}
+    </h1>
   {/if}
   <span class="grow"></span>
   <button class="gel" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred })}>
     {clip.starred ? 'Starred' : 'Star'}
   </button>
-  <button class="gel" onclick={() => (naming = clip.name)}>Rename</button>
-  <button class="gel danger" disabled={busy !== ''} onclick={remove}>Delete</button>
+  {#if clip.source}
+    <span class="form-hint" title="Exports and frames go to the clips folder">In {clip.source}'s folder, clip only reads it</span>
+  {:else}
+    <button class="gel" onclick={() => (naming = clip.name)}>Rename</button>
+    <button class="gel danger" disabled={busy !== ''} onclick={remove}>Delete</button>
+  {/if}
 </div>
 
 <div class="theater" class:full>
@@ -677,7 +683,7 @@
           <span id="save-label">Save as</span>
           <div class="seg" role="radiogroup" aria-labelledby="save-label" use:radios>
             <button role="radio" aria-checked={!replace} disabled={busy !== ''} onclick={() => (replace = false)}>New clip</button>
-            <button role="radio" aria-checked={replace} disabled={busy !== ''} onclick={() => (replace = true)}>Replace this one</button>
+            <button role="radio" aria-checked={replace} disabled={busy !== '' || !!clip.source} onclick={() => (replace = true)}>Replace this one</button>
           </div>
         </div>
       {/if}
