@@ -218,12 +218,11 @@ fn serve() -> Result<(), String> {
         _ => String::new(),
     };
     // clip was called memory, and its folders and start entry carry that name until moved
-    let (name, old) = (format!("clip{suffix}"), format!("memory{suffix}"));
-    // run value names ignore case, and sfmg's autostart already writes one named Clip
-    let login = format!("clip-recorder{suffix}");
+    let old = format!("memory{suffix}");
+    // sfmg, once called clip, holds Clip for its install and library folders, run value and lt.rot.clip, and windows ignores case
+    let name = format!("clip-recorder{suffix}");
     let mut context = tauri::generate_context!();
-    // lt.rot.clip belongs to a different app, and sharing it would share its webview folder and single instance
-    context.config_mut().identifier = format!("lt.rot.clip-recorder{suffix}");
+    context.config_mut().identifier = format!("lt.rot.{name}");
     tauri::Builder::default()
         // a second copy would record everything twice, so launching again opens the window instead
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
@@ -260,7 +259,7 @@ fn serve() -> Result<(), String> {
             let moves = [
                 (paths.config_dir()?, old.clone(), name.clone()),
                 (paths.cache_dir()?, old.clone(), name.clone()),
-                (paths.local_data_dir()?, format!("lt.rot.{old}"), app.config().identifier.clone()),
+                (paths.local_data_dir()?, format!("lt.rot.{old}"), format!("lt.rot.{name}")),
             ];
             if let Err(e) = migrate(&moves.map(|(root, from, to)| (root.join(from), root.join(to)))) {
                 // the old folders stay where they are, so nothing is lost by starting without them
@@ -287,12 +286,12 @@ fn serve() -> Result<(), String> {
             let mut settings: Settings =
                 stored.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
             if settings.folder.as_os_str().is_empty() {
-                settings.folder = app.path().video_dir()?.join("clip");
+                settings.folder = app.path().video_dir()?.join("clip-recorder");
             }
             app.asset_protocol_scope().allow_directory(&settings.folder, true)?;
             let _ = run_at_login(&old, false);
             if settings.start_with_windows {
-                let _ = run_at_login(&login, true);
+                let _ = run_at_login(&name, true);
             }
             let pause = CheckMenuItem::with_id(app, "pause", "pause recording", true, false, None::<&str>)?;
             let menu = Menu::with_items(
@@ -341,7 +340,7 @@ fn serve() -> Result<(), String> {
                 marks,
                 marks_file,
                 cache,
-                login: login.clone(),
+                login: name.clone(),
                 first: AtomicBool::new(first),
                 recorder,
             });
@@ -1256,8 +1255,8 @@ mod tests {
         }
         std::fs::create_dir_all(root.join("lt.rot.memory")).unwrap();
         let moves = [
-            ("memory", "clip"),
-            ("memory-test", "clip-test"),
+            ("memory", "clip-recorder"),
+            ("memory-test", "clip-recorder-test"),
             ("lt.rot.memory", "lt.rot.clip-recorder"),
             ("gone", "new"),
         ]
@@ -1265,7 +1264,7 @@ mod tests {
         migrate(&moves).unwrap();
         let read = |dir: &str| std::fs::read_to_string(root.join(dir).join("settings.json")).unwrap();
         assert_eq!(
-            (read("clip"), read("clip-test"), read("lt.rot.clip-recorder")),
+            (read("clip-recorder"), read("clip-recorder-test"), read("lt.rot.clip-recorder")),
             ("memory".into(), "memory-test".into(), "lt.rot.clip-recorder".into())
         );
         assert!(!root.join("memory").exists() && root.join("lt.rot.memory").exists() && !root.join("new").exists());
