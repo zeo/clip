@@ -2,8 +2,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { SvelteSet } from 'svelte/reactivity';
   import Thumb from './Thumb.svelte';
-  import { at, day, size, title, type Clip } from './types';
-  import { reduced, say, view } from './view.svelte';
+  import { at, clock, day, size, title, type Clip, type Query } from './types';
+  import { cards, discard, reduced, say, view } from './view.svelte';
 
   let {
     clips,
@@ -12,11 +12,24 @@
     grouped = true
   }: { clips: Clip[]; onopen: (clip: Clip) => void; showApp?: boolean; grouped?: boolean } = $props();
   let hovered = $state<string | null>(null);
+  let box = $state<HTMLElement>();
+  const uid = $props.id();
+  // the one clip in the tab order, the first until another takes focus
+  let focused = $state<string | null>(null);
   const selected = new SvelteSet<string>();
   // where a shift click's range starts
   let anchor: string | null = null;
   const picked = $derived(clips.filter((clip) => selected.has(clip.path)));
   const allStarred = $derived(picked.length > 0 && picked.every((clip) => clip.starred));
+  const stop = $derived(clips.some((clip) => clip.path === focused) ? focused : (clips[0]?.path ?? null));
+  const columns: [string, Query['sort'] | null][] = [
+    ['Name', 'name'],
+    ['Game', 'game'],
+    ['Saved', 'newest'],
+    ['Length', 'longest'],
+    ['Size', 'largest'],
+    ['Marks', null]
+  ];
 
   // clips come newest first and each session's clips sit together in that order, unless sorted otherwise
   const sessions = $derived.by(() => {
@@ -30,6 +43,8 @@
     return [...groups.values()];
   });
 
+  const when = (clip: Clip) => `${day(clip.modified)} ${at(clip.modified)}`;
+
   async function act(command: string, args: Record<string, unknown>) {
     try {
       await invoke(command, args);
@@ -39,10 +54,10 @@
   }
 
   // clips are in the order they're drawn, so a range runs across sessions as it looks
-  function pick(clip: Clip, e: MouseEvent) {
+  function pick(clip: Clip, range: boolean) {
     const from = anchor === null ? -1 : clips.findIndex((c) => c.path === anchor);
     const to = clips.indexOf(clip);
-    if (e.shiftKey && from >= 0) {
+    if (range && from >= 0) {
       for (const c of clips.slice(Math.min(from, to), Math.max(from, to) + 1)) selected.add(c.path);
     } else if (selected.has(clip.path)) {
       selected.delete(clip.path);
@@ -52,69 +67,210 @@
     anchor = clip.path;
   }
 
-  async function remove() {
-    const paths = picked.map((clip) => clip.path);
-    await act('delete', { paths });
-    for (const path of paths) selected.delete(path);
+  function remove(gone: Clip[]) {
+    const next = clips.find((clip, i) => !gone.includes(clip) && i > clips.indexOf(gone[gone.length - 1])) ?? clips.find((clip) => !gone.includes(clip));
+    discard(
+      gone.map((clip) => clip.path),
+      gone.length === 1 ? title(gone[0]) : `${gone.length} clips`
+    );
+    for (const clip of gone) selected.delete(clip.path);
+    if (next && box?.contains(document.activeElement)) move(next.path);
+  }
+
+  function move(path: string) {
+    focused = path;
+    box?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`)?.focus();
+  }
+
+  // up and down go to the nearest card in the row above or below, as drawn, so they cross sessions too
+  function vertical(from: HTMLElement, dir: 1 | -1, far = 0): HTMLElement {
+    const here = from.getBoundingClientRect();
+    const top = (el: HTMLElement) => Math.round(el.getBoundingClientRect().top);
+    const past = [...box!.querySelectorAll<HTMLElement>('[role="option"]')].filter((el) => dir * (top(el) - here.top) > 1);
+    const rows = [...new Set(past.map(top))].sort((a, b) => dir * (a - b));
+    const row = rows.find((t) => Math.abs(t - here.top) >= far) ?? rows[rows.length - 1];
+    const x = (el: HTMLElement) => Math.abs(el.getBoundingClientRect().left - here.left);
+    return past.filter((el) => top(el) === row).reduce((best, el) => (x(el) < x(best) ? el : best), from);
+  }
+
+  function keys(e: KeyboardEvent) {
+    const el = (e.target as HTMLElement).closest<HTMLElement>('[role="option"]');
+    const clip = el && clips.find((c) => c.path === el.dataset.path);
+    if (!el || !clip) return;
+    const i = clips.indexOf(clip);
+    const page = (box?.closest('.view')?.clientHeight ?? 600) * 0.8;
+    const mod = e.ctrlKey || e.metaKey;
+    const to =
+      e.altKey || mod
+        ? undefined
+        : ({
+            ArrowLeft: () => clips[i - 1]?.path,
+            ArrowRight: () => clips[i + 1]?.path,
+            ArrowUp: () => vertical(el, -1).dataset.path,
+            ArrowDown: () => vertical(el, 1).dataset.path,
+            PageUp: () => vertical(el, -1, page).dataset.path,
+            PageDown: () => vertical(el, 1, page).dataset.path,
+            Home: () => clips[0].path,
+            End: () => clips[clips.length - 1].path
+          } as Record<string, () => string | undefined>)[e.key];
+    if (to) {
+      e.preventDefault();
+      const path = to();
+      if (!path) return;
+      move(path);
+      if (!e.shiftKey) return;
+      anchor ??= clip.path;
+      pick(clips.find((c) => c.path === path)!, true);
+      return;
+    }
+    if (mod && e.key.toLowerCase() === 'a') {
+      e.preventDefault();
+      for (const c of clips) selected.add(c.path);
+    } else if (e.key === 'Enter' && !mod) {
+      onopen(clip);
+    } else if (e.key === ' ' && !mod) {
+      e.preventDefault();
+      pick(clip, e.shiftKey);
+    } else if (e.key.toLowerCase() === 's' && !mod && !e.altKey) {
+      act('star', { paths: [clip.path], on: !clip.starred });
+    } else if (e.key === 'Delete' && !mod) {
+      remove(picked.length > 0 ? picked : [clip]);
+    }
+  }
+
+  function wheel(e: WheelEvent) {
+    if (!e.ctrlKey || view.list) return;
+    e.preventDefault();
+    const at = cards.indexOf(view.card);
+    view.card = cards[Math.min(cards.length - 1, Math.max(0, (at < 0 ? 1 : at) + (e.deltaY < 0 ? 1 : -1)))];
+  }
+
+  function sortBy(sort: Query['sort']) {
+    view.sort = sort === 'newest' && view.sort === 'newest' ? 'oldest' : sort;
   }
 </script>
 
-<div class="sessions">
-  {#each sessions as session (session[0].path)}
+{#if view.list}
+  <div class="list-head" class:bare={!showApp} role="toolbar" aria-label="Sort by">
+    <span></span>
+    <span></span>
+    {#each columns as [label, sort] (label)}
+      {#if label !== 'Game' || showApp}
+        {#if sort}
+          {@const on = view.sort === sort || (sort === 'newest' && view.sort === 'oldest')}
+          <button class:on aria-pressed={on} onclick={() => sortBy(sort)}>
+            {label}{#if on}<span aria-hidden="true">{view.sort === 'oldest' ? ' ▴' : ' ▾'}</span>{/if}
+          </button>
+        {:else}
+          <span>{label}</span>
+        {/if}
+      {/if}
+    {/each}
+    <span></span>
+  </div>
+{/if}
+
+<!-- the pick and star spots are for the pointer, space and s do the same from the keys -->
+<!-- the cards take the keys, the box only hands them on -->
+<div
+  class="sessions"
+  class:listing={view.list}
+  class:tight={view.card === cards[0]}
+  class:bare={!showApp}
+  style:--card="{view.card}px"
+  role="listbox"
+  aria-multiselectable="true"
+  aria-label="Clips"
+  tabindex="-1"
+  bind:this={box}
+  onkeydown={keys}
+  onwheel={wheel}
+>
+  {#each sessions as session, n (session[0].path)}
     {@const newest = session[0]}
     {@const oldest = session[session.length - 1]}
-    <section class="session">
+    {@const span = `${day(oldest.modified)} ${at(oldest.modified)}${newest !== oldest ? ` to ${at(newest.modified)}` : ''}`}
+    <section class="session" role={grouped ? 'group' : 'presentation'} aria-labelledby={grouped ? `${uid}-${n}` : undefined}>
       {#if grouped}
-        <h3 class="session-head">
+        <div class="session-head" id="{uid}-{n}">
           {#if showApp}<span>{newest.app}</span>{/if}
-          <span class:session-when={showApp}>{day(oldest.modified)} {at(oldest.modified)}{newest !== oldest ? ` to ${at(newest.modified)}` : ''}</span>
+          <span class:session-when={showApp}>{span}</span>
           <span class="mono">{session.length} {session.length === 1 ? 'clip' : 'clips'}</span>
-        </h3>
+        </div>
       {/if}
-      <ul class="grid" class:picking={picked.length > 0}>
+      <ul class="grid" class:picking={picked.length > 0} role="presentation">
         {#each session as clip (clip.path)}
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
           <li
             class="clip"
             class:picked={selected.has(clip.path)}
+            role="option"
+            aria-selected={selected.has(clip.path)}
+            tabindex={clip.path === stop ? 0 : -1}
+            data-path={clip.path}
+            onfocus={() => (focused = clip.path)}
             onpointerenter={() => (hovered = clip.path)}
             onpointerleave={() => hovered === clip.path && (hovered = null)}
+            onclick={(e) => (picked.length > 0 || e.shiftKey || e.ctrlKey ? pick(clip, e.shiftKey) : onopen(clip))}
           >
-            <button
-              class="clip-open"
-              onclick={(e) => (picked.length > 0 || e.shiftKey || e.ctrlKey ? pick(clip, e) : onopen(clip))}
+            <!-- the title comes first, so it starts the name a screen reader gives the card, and css draws the still above it -->
+            <span class="clip-name">{title(clip)}</span>
+            {#if view.list}
+              {#if showApp}<span class="clip-cell">{clip.app}</span>{/if}
+              <span class="clip-cell">{when(clip)}</span>
+              <span class="clip-cell mono">{clock(clip.seconds)}</span>
+              <span class="clip-cell mono">{size(clip.bytes)}</span>
+              <span class="clip-cell mono">{#if clip.marks.length}{clip.marks.length}<span class="spoken"> marks</span>{/if}</span>
+            {:else}
+              <span class="clip-meta mono">
+                {#if clip.marks.length}<span class="clip-marks"><span aria-hidden="true">◆</span>{clip.marks.length}<span class="spoken"> marks</span></span>{/if}
+                <span class="clip-size">{size(clip.bytes)}</span>
+              </span>
+              {#if !grouped}<span class="clip-sub">{showApp ? `${clip.app}, ` : ''}{when(clip)}</span>{/if}
+            {/if}
+            <Thumb {clip} badge={!view.list} live={!view.list && view.previews && !reduced.current && hovered === clip.path} />
+            {#if clip.starred}<span class="spoken">, starred</span>{/if}
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <span
+              class="pick"
+              aria-hidden="true"
+              onclick={(e) => {
+                e.stopPropagation();
+                pick(clip, e.shiftKey);
+              }}
             >
-              <Thumb {clip} live={view.previews && !reduced.current && hovered === clip.path} />
-              <span class="clip-name">{title(clip)}</span>
-              <span class="clip-meta mono">{size(clip.bytes)}</span>
-            </button>
-            <button class="pick" aria-pressed={selected.has(clip.path)} aria-label="Select {title(clip)}" onclick={(e) => pick(clip, e)}>
-              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" /></svg>
-            </button>
-            <button
+              <svg viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" /></svg>
+            </span>
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <span
               class="star"
-              aria-pressed={clip.starred}
-              aria-label="Star {title(clip)}"
-              onclick={() => act('star', { paths: [clip.path], on: !clip.starred })}
+              class:on={clip.starred}
+              aria-hidden="true"
+              onclick={(e) => {
+                e.stopPropagation();
+                act('star', { paths: [clip.path], on: !clip.starred });
+              }}
             >
-              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.6l1.9 4 4.3.5-3.2 3 .9 4.3L8 11.2l-3.9 2.2.9-4.3-3.2-3 4.3-.5z" /></svg>
-            </button>
+              <svg viewBox="0 0 16 16"><path d="M8 1.6l1.9 4 4.3.5-3.2 3 .9 4.3L8 11.2l-3.9 2.2.9-4.3-3.2-3 4.3-.5z" /></svg>
+            </span>
           </li>
         {/each}
       </ul>
     </section>
   {/each}
-  {#if picked.length > 0}
-    <div class="selection" role="toolbar" aria-label="Selected clips">
-      <span class="mono">{picked.length} selected, {size(picked.reduce((total, clip) => total + clip.bytes, 0))}</span>
-      <span class="grow"></span>
-      <button class="gel" onclick={() => act('star', { paths: picked.map((clip) => clip.path), on: !allStarred })}>
-        {allStarred ? 'Unstar' : 'Star'}
-      </button>
-      <button class="gel danger" onclick={remove}>Delete</button>
-      <button class="gel" onclick={() => selected.clear()}>Clear <kbd>Esc</kbd></button>
-    </div>
-  {/if}
 </div>
+{#if picked.length > 0}
+  <div class="selection" role="toolbar" aria-label="Selected clips">
+    <span class="mono">{picked.length} selected, {size(picked.reduce((total, clip) => total + clip.bytes, 0))}</span>
+    <span class="grow"></span>
+    {#if picked.length < clips.length}<button class="gel" onclick={() => clips.forEach((clip) => selected.add(clip.path))}>Select all <kbd>Ctrl+A</kbd></button>{/if}
+    <button class="gel" onclick={() => act('star', { paths: picked.map((clip) => clip.path), on: !allStarred })}>
+      {allStarred ? 'Unstar' : 'Star'}
+    </button>
+    <button class="gel danger" onclick={() => remove(picked)}>Delete <kbd>Del</kbd></button>
+    <button class="gel" onclick={() => selected.clear()}>Clear <kbd>Esc</kbd></button>
+  </div>
+{/if}
 
 <svelte:window
   onkeydowncapture={(e) => {

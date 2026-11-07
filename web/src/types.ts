@@ -142,7 +142,19 @@ export function sessionCount(clips: Clip[]): number {
   return new Set(clips.map((clip) => clip.session)).size;
 }
 
-export type Query = { show: 'all' | 'starred' | 'today' | 'week'; sort: 'newest' | 'longest' | 'largest'; search: string };
+export type Query = {
+  show: 'all' | 'starred' | 'today' | 'week';
+  sort: 'newest' | 'oldest' | 'longest' | 'largest' | 'name' | 'game';
+  search: string;
+};
+
+const orders: Partial<Record<Query['sort'], (a: Clip, b: Clip) => number>> = {
+  oldest: (a, b) => a.modified - b.modified,
+  longest: (a, b) => b.seconds - a.seconds,
+  largest: (a, b) => b.bytes - a.bytes,
+  name: (a, b) => title(a).localeCompare(title(b), undefined, { numeric: true }),
+  game: (a, b) => a.app.localeCompare(b.app) || b.modified - a.modified
+};
 
 export function choose(clips: Clip[], query: Query): Clip[] {
   const since = { all: 0, starred: 0, today: new Date().setHours(0, 0, 0, 0), week: Date.now() - 7 * 864e5 }[query.show];
@@ -153,9 +165,8 @@ export function choose(clips: Clip[], query: Query): Clip[] {
       (query.show !== 'starred' || clip.starred) &&
       (!words || `${title(clip)} ${clip.name} ${clip.app}`.toLowerCase().includes(words))
   );
-  if (query.sort === 'longest') kept.sort((a, b) => b.seconds - a.seconds);
-  if (query.sort === 'largest') kept.sort((a, b) => b.bytes - a.bytes);
-  return kept;
+  const order = orders[query.sort];
+  return order ? kept.sort(order) : kept;
 }
 
 export function sentence(text: string): string {

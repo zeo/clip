@@ -12,7 +12,7 @@
   import Icon from './Icon.svelte';
   import Preferences from './Preferences.svelte';
   import { choose, chord, games, length, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
-  import { say, toasts, view, zooms } from './view.svelte';
+  import { cards, gone, radios, say, toasts, view, zooms } from './view.svelte';
 
   type Area = 'home' | 'library' | 'settings';
   type Shelf = Query['show'] | 'games';
@@ -36,7 +36,8 @@
   let page = $state('hotkeys');
   let status = $state<Status>({ recording: false, app: '', exe: '', message: 'starting', paused: false, hotkeys: [] });
   let settings = $state<Settings | null>(null);
-  let clips = $state<Clip[]>([]);
+  let found = $state<Clip[]>([]);
+  const clips = $derived(found.filter((clip) => !gone.has(clip.path)));
   let disk = $state<Disk | null>(null);
   let mics = $state<Mic[]>([]);
   let first = $state(false);
@@ -45,11 +46,14 @@
   let chip = $state<HTMLButtonElement>();
   let panel = $state<HTMLElement>();
   let sheet = $state<HTMLDialogElement>();
-  let query = $state<Omit<Query, 'show'>>({ sort: 'newest', search: '' });
+  let query = $state({ search: '' });
   const current = $derived(clips.find((clip) => clip.path === opened));
   const listed = $derived(games(clips));
   const show = $derived(game || shelf === 'games' ? 'all' : shelf);
-  const shown = $derived(choose(clips, { ...query, show }));
+  const shown = $derived(choose(clips, { ...query, sort: view.sort, show }));
+  const side = $derived(area === 'home' ? 'home' : 'library');
+  const sided = $derived(!current && view.side[side]);
+  const covers = $derived(area === 'library' && !game && shelf === 'games');
   const used = $derived(clips.reduce((sum, clip) => sum + clip.bytes, 0));
   const counts = $derived(Object.fromEntries(shelves.map(([id]) => [id, choose(clips, { show: id, sort: 'newest', search: '' }).length])));
   const failed = $derived(!status.recording && !status.paused && !['starting', 'waiting for a game'].includes(status.message));
@@ -77,9 +81,17 @@
     [
       'Clips',
       [
-        [['Ctrl+Click'], 'Select a clip'],
-        [['Shift+Click'], 'Select every clip up to it'],
-        [['Esc'], 'Clear the selection']
+        [['Arrows', 'Home', 'End'], 'Move between clips'],
+        [['Enter'], 'Open the clip'],
+        [['Space', 'Ctrl+Click'], 'Select a clip'],
+        [['Shift+Space', 'Shift+Click'], 'Select every clip up to it'],
+        [['Ctrl+A'], 'Select all'],
+        [['S'], 'Star or unstar'],
+        [['Del'], 'Delete, with a few seconds to undo'],
+        [['Ctrl+Z'], 'Undo the delete'],
+        [['Esc'], 'Clear the selection'],
+        [['Ctrl+B'], 'Show or hide the sidebar'],
+        [['Ctrl+Wheel'], 'Bigger or smaller cards']
       ]
     ],
     [
@@ -103,7 +115,9 @@
   });
 
   async function refresh() {
-    [settings, clips] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+    [settings, found] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+    // a clip in the recycle bin stops being listed, so it no longer needs hiding
+    for (const path of gone) if (!found.some((clip) => clip.path === path)) gone.delete(path);
     invoke<Disk>('disk', { folder: settings.folder }).then((d) => (disk = d), () => (disk = null));
   }
 
@@ -199,6 +213,11 @@
         e.preventDefault();
         return document.querySelector<HTMLInputElement>('input.search')?.focus();
       }
+      if (e.key.toLowerCase() === 'b' && area !== 'settings' && !current) {
+        e.preventDefault();
+        return (view.side[side] = !view.side[side]);
+      }
+      if (e.key.toLowerCase() === 'z' && !(e.target instanceof HTMLInputElement)) return toasts.filter((t) => t.undo).pop()?.undo?.();
     }
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.ctrlKey || e.altKey || e.metaKey) return;
     if (e.key === '?') return sheet?.showModal();
@@ -326,7 +345,7 @@
   {#if area === 'settings'}
     <Preferences {first} {used} {status} count={clips.length} bind:page onapplied={applied} />
   {:else}
-    {#if !current}<aside class="side">
+    {#if sided}<aside class="side">
       <div class="side-list">
         <button class="side-item" aria-current={area === 'library' && !game && shelf === 'games' ? 'page' : undefined} onclick={() => browse('games')}>
           <span class="grow">Games</span><span class="count">{listed.length}</span>
@@ -353,7 +372,7 @@
       </button>
     </aside>{/if}
 
-    <main class="stage" class:wide={!!current}>
+    <main class="stage" class:wide={!sided}>
       {#if current}
         {#key current.path}
           <ClipPage
@@ -367,6 +386,15 @@
         {/key}
       {:else}
         <div class="toolbar">
+          <button
+            class="gel icon"
+            aria-pressed={view.side[side]}
+            aria-label="Sidebar"
+            title="{view.side[side] ? 'Hide' : 'Show'} the sidebar (Ctrl+B)"
+            onclick={() => (view.side[side] = !view.side[side])}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11v9h-11zM6 3.5v9" /></svg>
+          </button>
           {#if game}
             <button class="gel back" title="Back (Esc)" onclick={back}>
               <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M6.5 1.5 3 5l3.5 3.5" /></svg><span>Back</span>
@@ -379,17 +407,44 @@
             {/each}
           </nav>
           <span class="grow"></span>
-          <select class="field" aria-label="Sort" bind:value={query.sort}>
+          {#if !covers}
+            {#if !view.list}
+              <input
+                class="size"
+                type="range"
+                min="0"
+                max={cards.length - 1}
+                step="1"
+                aria-label="Card size"
+                aria-valuetext="{['Smallest', 'Small', 'Large', 'Largest'][cards.indexOf(view.card)]} cards"
+                title="Card size (Ctrl+Wheel)"
+                value={Math.max(0, cards.indexOf(view.card))}
+                oninput={(e) => (view.card = cards[Number(e.currentTarget.value)])}
+              />
+            {/if}
+            <div class="seg" role="radiogroup" aria-label="Show clips as" use:radios>
+              <button role="radio" aria-checked={!view.list} aria-label="Grid" title="Grid" onclick={() => (view.list = false)}>
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 2.5h4.5v4.5h-4.5zM9 2.5h4.5v4.5H9zM2.5 9h4.5v4.5h-4.5zM9 9h4.5v4.5H9z" /></svg>
+              </button>
+              <button role="radio" aria-checked={view.list} aria-label="List" title="List" onclick={() => (view.list = true)}>
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11" /></svg>
+              </button>
+            </div>
+          {/if}
+          <select class="field" aria-label="Sort" bind:value={view.sort}>
             <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
             <option value="longest">Longest first</option>
             <option value="largest">Largest first</option>
+            <option value="name">Name</option>
+            <option value="game">Game</option>
           </select>
           <input class="field search" type="search" placeholder="Search" aria-label="Search clips and games" bind:value={query.search} />
         </div>
         {#if area === 'home'}
-          <Home {clips} {shown} {status} grouped={query.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={(clip) => (opened = clip.path)} />
+          <Home {clips} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={(clip) => (opened = clip.path)} />
         {:else if game || shelf === 'games'}
-          <Games {clips} {shown} app={game} grouped={query.sort === 'newest'} onpick={(app) => browse('games', app)} onopen={(clip) => (opened = clip.path)} />
+          <Games {clips} {shown} app={game} grouped={view.sort === 'newest'} onpick={(app) => browse('games', app)} onopen={(clip) => (opened = clip.path)} />
         {:else}
           <div class="view">
             {#if shown.length === 0}
@@ -397,7 +452,7 @@
                 {query.search ? 'No clips match.' : shelf === 'starred' ? 'Star a clip and it stays here. The storage limit never deletes it.' : 'No clips here yet.'}
               </p>
             {:else}
-              <Clips clips={shown} grouped={query.sort === 'newest'} onopen={(clip) => (opened = clip.path)} />
+              <Clips clips={shown} grouped={view.sort === 'newest'} onopen={(clip) => (opened = clip.path)} />
             {/if}
           </div>
         {/if}
@@ -407,7 +462,11 @@
 </div>
 
 <div class="toasts" role="status">
-  {#each toasts as toast (toast.id)}<p class="toast" class:bad={toast.bad}>{toast.text}</p>{/each}
+  {#each toasts as toast (toast.id)}
+    <p class="toast" class:bad={toast.bad}>
+      {toast.text}{#if toast.undo}<button class="gel" onclick={toast.undo}>Undo <kbd>Ctrl+Z</kbd></button>{/if}
+    </p>
+  {/each}
 </div>
 
 <!-- keys stop at the sheet, so the page behind never takes them, and a click on the backdrop closes it -->

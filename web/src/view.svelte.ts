@@ -1,9 +1,21 @@
-import { MediaQuery } from 'svelte/reactivity';
+import { invoke } from '@tauri-apps/api/core';
+import { MediaQuery, SvelteSet } from 'svelte/reactivity';
+import type { Query } from './types';
 
 export const zooms = [90, 100, 110, 125, 150];
+export const cards = [170, 220, 280, 340];
 
 // how the window looks is this window's business, so it lives here and never in the recorder's settings
-export const view = $state({ zoom: 100, previews: true, ...JSON.parse(localStorage.getItem('view') ?? '{}') });
+const stored = JSON.parse(localStorage.getItem('view') ?? '{}');
+export const view = $state({
+  zoom: 100,
+  previews: true,
+  card: 220,
+  list: false,
+  sort: 'newest' as Query['sort'],
+  ...stored,
+  side: { home: false, library: true, ...stored.side }
+});
 
 $effect.root(() => {
   $effect(() => localStorage.setItem('view', JSON.stringify(view)));
@@ -11,15 +23,40 @@ $effect.root(() => {
 
 export const reduced = new MediaQuery('prefers-reduced-motion: reduce');
 
-export type Toast = { id: number; text: string; bad: boolean };
+export type Toast = { id: number; text: string; bad: boolean; undo?: () => void };
 
 export const toasts = $state<Toast[]>([]);
 let made = 0;
 
-export function say(text: string, bad = false) {
+const drop = (id: number) => {
+  const at = toasts.findIndex((t) => t.id === id);
+  if (at >= 0) toasts.splice(at, 1);
+};
+
+export function say(text: string, bad = false, undo?: () => void) {
   const id = ++made;
-  toasts.push({ id, text, bad });
-  setTimeout(() => toasts.splice(toasts.findIndex((t) => t.id === id), 1), bad ? 8000 : 4000);
+  toasts.push({ id, text, bad, undo: undo && (() => (drop(id), undo())) });
+  setTimeout(() => drop(id), bad || undo ? 8000 : 4000);
+}
+
+// clips waiting out their undo, hidden until the recycle bin has them or they come back
+export const gone = new SvelteSet<string>();
+
+// nothing is deleted before the undo runs out, so quitting first keeps every clip
+export function discard(paths: string[], what: string) {
+  for (const path of paths) gone.add(path);
+  const timer = setTimeout(
+    () =>
+      invoke('delete', { paths }).catch((e) => {
+        for (const path of paths) gone.delete(path);
+        say(String(e), true);
+      }),
+    8000
+  );
+  say(`Deleted ${what}`, false, () => {
+    clearTimeout(timer);
+    for (const path of paths) gone.delete(path);
+  });
 }
 
 // arrow keys move the choice along a radiogroup, and only the chosen radio takes a tab stop

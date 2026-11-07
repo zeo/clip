@@ -3,7 +3,7 @@
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
-  import { radios, say } from './view.svelte';
+  import { discard, radios, say } from './view.svelte';
 
   let { clip, onclose, onmoved }: { clip: Clip; onclose: () => void; onmoved: (path: string) => void } = $props();
 
@@ -191,9 +191,10 @@
     if (to) onmoved(to);
   }
 
-  async function remove() {
+  function remove() {
     video?.pause();
-    if (await act('deleting', () => invoke('delete', { paths: [clip.path] }).then(() => true))) onclose();
+    discard([clip.path], title(clip));
+    onclose();
   }
 
   function keys(e: KeyboardEvent) {

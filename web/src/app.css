@@ -280,14 +280,19 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .session-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; padding-bottom: 5px; border-bottom: 1px solid var(--rule); font-family: var(--font-myriad); font-size: 16px; color: #f2f2f2; }
 .session-head .mono { margin-left: auto; color: var(--fg-3); }
 .session-when { color: var(--fg-2); }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
-.clip { position: relative; background: var(--bg-paper); border: 1px solid #0a0a0a; border-radius: 4px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 2px rgba(0, 0, 0, 0.5); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--card, 220px), 1fr)); gap: 14px; }
+.clip { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; align-content: start; padding: 5px 5px 7px; cursor: pointer; background: var(--bg-paper); border: 1px solid #0a0a0a; border-radius: 4px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 2px rgba(0, 0, 0, 0.5); }
 .clip:hover { background: var(--bg-up); }
 .clip.picked { background: var(--grad-picked); border-color: #0e3265; }
 .clip.picked .clip-meta { color: #d8e8ff; }
-.clip-open { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; width: 100%; padding: 5px 5px 7px; text-align: left; }
-.clip-open:focus-visible { outline-offset: -2px; }
-.clip-open .thumb { grid-column: 1 / -1; }
+.clip:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.clip .thumb { order: -1; grid-column: 1 / -1; }
+.clip-sub { grid-column: 1 / -1; padding-left: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--t-small); color: var(--fg-3); }
+.clip-meta { display: flex; gap: 8px; }
+.clip-marks { color: var(--fg-2); }
+.tight .clip-size { display: none; }
+.tight .clip-sub { font-size: var(--t-mini); }
+.spoken { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .clip-name { padding-left: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #f2f2f2; }
 .clip-meta { padding-right: 3px; align-self: center; color: var(--fg-3); }
 .thumb { position: relative; aspect-ratio: 16 / 9; border-radius: 2px; background: #000; overflow: hidden; }
@@ -299,10 +304,33 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .pick { left: 10px; }
 .star svg { width: 13px; height: 13px; fill: none; stroke: #f2f2f2; stroke-width: 1.2; stroke-linejoin: round; }
 .pick svg { width: 12px; height: 12px; fill: none; stroke: transparent; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.clip:hover .star, .clip:hover .pick, .star:focus-visible, .pick:focus-visible, .star[aria-pressed="true"], .picking .pick { opacity: 1; }
-.star[aria-pressed="true"] svg { fill: #ffd34d; stroke: #ffd34d; }
-.pick[aria-pressed="true"] { background: var(--grad-aqua-default); }
-.pick[aria-pressed="true"] svg { stroke: #fff; }
+.star, .pick { cursor: pointer; }
+.clip:hover .star, .clip:hover .pick, .clip:focus-visible .pick, .star.on, .picking .pick { opacity: 1; }
+.star.on svg { fill: #ffd34d; stroke: #ffd34d; }
+.picked .pick { background: var(--grad-aqua-default); }
+.picked .pick svg { stroke: #fff; }
+.listing .grid { display: flex; flex-direction: column; gap: 0; border: 1px solid #0a0a0a; border-radius: 4px; overflow: hidden; }
+.list-head, .listing .clip { display: grid; grid-template-columns: 22px 64px minmax(0, 2fr) minmax(0, 1fr) 128px 56px 72px 48px 22px; gap: 10px; align-items: center; }
+.list-head.bare, .listing.bare .clip { grid-template-columns: 22px 64px minmax(0, 2fr) 128px 56px 72px 48px 22px; }
+.list-head { position: sticky; top: -22px; z-index: 2; margin: -22px -28px 12px; padding: 4px 39px 4px 34px; background: var(--grad-tool); border-bottom: 1px solid #0a0a0a; font-size: var(--t-small); color: var(--fg-3); }
+.list-head button { justify-self: start; padding: 2px 0; color: var(--fg-2); }
+.list-head button.on { color: #f2f2f2; }
+.list-head button:hover { color: #f2f2f2; }
+.listing .clip { padding: 3px 10px 3px 6px; border: 0; border-radius: 0; box-shadow: none; background: var(--row-a); }
+.listing .clip:nth-child(even) { background: var(--row-b); }
+.listing .clip:hover { background: var(--bg-up); }
+.listing .clip.picked { background: var(--grad-picked); }
+.listing .clip:focus-visible { outline-offset: -2px; }
+.listing .thumb { order: -1; grid-column: auto; }
+.listing .pick { order: -2; }
+.listing .pick, .listing .star { position: static; width: 20px; height: 20px; }
+.listing .clip-name { padding-left: 0; }
+.clip-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-2); }
+.listing .clip.picked .clip-cell { color: #d8e8ff; }
+.toolbar .icon { padding: 2px 7px; }
+.toolbar svg, .seg button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linejoin: round; stroke-linecap: round; }
+.seg button:has(svg) { padding: 0 8px; }
+.toolbar .size { width: 96px; }
 .selection { position: sticky; bottom: -32px; display: flex; align-items: center; gap: 8px; margin: 22px -28px -32px; padding: 6px 12px 6px 16px; background: linear-gradient(to bottom, #2a2a2a, #1e1e1e); border-top: 1px solid #050505; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06); font-size: var(--t-small); color: var(--fg-2); }
 
 .covers { display: grid; grid-template-columns: repeat(auto-fill, minmax(176px, 1fr)); gap: 22px 18px; }
@@ -412,7 +440,7 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .applybar .default { min-width: 72px; }
 
 .toasts { position: fixed; z-index: 40; left: 50%; bottom: 20px; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 6px; pointer-events: none; }
-.toast { max-width: min(560px, 80vw); padding: 6px 14px; font-size: var(--t-small); color: #f2f2f2; text-shadow: 0 -1px 0 rgba(0, 0, 0, 0.6); background: linear-gradient(to bottom, #3a3a3a, #262626); border: 1px solid #050505; border-radius: var(--r-button); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 8px 24px rgba(0, 0, 0, 0.6); }
+.toast { display: flex; align-items: center; gap: 12px; pointer-events: auto; max-width: min(560px, 80vw); padding: 6px 14px; font-size: var(--t-small); color: #f2f2f2; text-shadow: 0 -1px 0 rgba(0, 0, 0, 0.6); background: linear-gradient(to bottom, #3a3a3a, #262626); border: 1px solid #050505; border-radius: var(--r-button); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 8px 24px rgba(0, 0, 0, 0.6); }
 .toast.bad { color: var(--bad); }
 
 .sheet { margin: auto; width: min(560px, calc(100vw - 48px)); max-height: calc(100vh - 80px); padding: 0; color: var(--fg-1); background: var(--bg-paper); border: 1px solid #050505; border-radius: 6px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 18px 48px rgba(0, 0, 0, 0.75); }
@@ -441,15 +469,16 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
     forced-color-adjust: none; background: Highlight !important; color: HighlightText !important;
   }
   [aria-current="page"] *, [aria-checked="true"] *, [aria-pressed="true"] *, .clip.picked * { color: HighlightText; }
-  .star[aria-pressed="true"] svg { fill: HighlightText; stroke: HighlightText; }
-  .pick[aria-pressed="true"] svg { stroke: HighlightText; }
+  .clip.picked .star.on svg { fill: HighlightText; stroke: HighlightText; }
+  .star.on svg { fill: CanvasText; stroke: CanvasText; }
+  .picked .pick svg { stroke: HighlightText; }
   .switch { forced-color-adjust: none; background: Canvas; border: 1px solid CanvasText; }
   .switch::after { background: CanvasText; }
   .switch:checked::after { background: HighlightText; }
   .playhead, .mark, .dot { forced-color-adjust: none; background: CanvasText; }
   .wave path { stroke: CanvasText; }
   .star, .pick { opacity: 1; border: 1px solid CanvasText; }
-  :focus-visible, .clip-open:focus-visible { outline: 2px solid Highlight; }
+  :focus-visible, .clip:focus-visible { outline: 2px solid Highlight; }
   .mark:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
 }
 
