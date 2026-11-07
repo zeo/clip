@@ -63,6 +63,14 @@ export function keyFor(status: Status, action: Hotkey['action']): string | null 
   return hotkey ? chord(hotkey) : null;
 }
 
+export type Disk = { free: number; total: number };
+
+export type Mic = { id: string; name: string };
+
+export function length(seconds: number): string {
+  return seconds < 60 ? `${seconds} s` : `${seconds / 60} min`;
+}
+
 export type Clip = {
   path: string;
   app: string;

@@ -25,7 +25,7 @@
       </span>
     </h1>
     {#if recent.length === 0}
-      <p class="empty">Nothing saved in the last 7 days. Older clips are under Games.</p>
+      <p class="empty">Nothing saved in the last 7 days. Older clips are in the Library.</p>
     {:else if feed.length === 0}
       <p class="empty">No clips match.</p>
     {:else}
