@@ -196,8 +196,8 @@ struct Shared {
     marks_file: PathBuf,
     /// stills and decoded audio for the window, safe to lose
     cache: PathBuf,
-    /// the run value, and with a profile the settings folder too
-    name: String,
+    /// the run value that starts clip with windows
+    login: String,
     first: AtomicBool,
     recorder: u32,
 }
@@ -219,6 +219,8 @@ fn serve() -> Result<(), String> {
     };
     // clip was called memory, and its folders and start entry carry that name until moved
     let (name, old) = (format!("clip{suffix}"), format!("memory{suffix}"));
+    // run value names ignore case, and sfmg's autostart already writes one named Clip
+    let login = format!("clip-recorder{suffix}");
     let mut context = tauri::generate_context!();
     // lt.rot.clip belongs to a different app, and sharing it would share its webview folder and single instance
     context.config_mut().identifier = format!("lt.rot.clip-recorder{suffix}");
@@ -290,7 +292,7 @@ fn serve() -> Result<(), String> {
             app.asset_protocol_scope().allow_directory(&settings.folder, true)?;
             let _ = run_at_login(&old, false);
             if settings.start_with_windows {
-                let _ = run_at_login(&name, true);
+                let _ = run_at_login(&login, true);
             }
             let pause = CheckMenuItem::with_id(app, "pause", "pause recording", true, false, None::<&str>)?;
             let menu = Menu::with_items(
@@ -339,7 +341,7 @@ fn serve() -> Result<(), String> {
                 marks,
                 marks_file,
                 cache,
-                name: name.clone(),
+                login: login.clone(),
                 first: AtomicBool::new(first),
                 recorder,
             });
@@ -909,7 +911,7 @@ fn apply(app: AppHandle, shared: State<Shared>, settings: Settings) -> Result<()
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     std::fs::write(&shared.file, json).map_err(|e| format!("can't save settings: {e}"))?;
-    run_at_login(&shared.name, settings.start_with_windows)
+    run_at_login(&shared.login, settings.start_with_windows)
         .map_err(|e| format!("can't change start with windows: {e}"))?;
     app.asset_protocol_scope().allow_directory(&settings.folder, true).map_err(|e| e.to_string())?;
     shared.first.store(false, Ordering::Relaxed);
