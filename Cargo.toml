@@ -17,6 +17,7 @@ windows = { version = "0.62.2", features = [
     "Graphics_DirectX_Direct3D11",
     "Win32_Devices",
     "Win32_Devices_Display",
+    "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D_Fxc",
@@ -46,6 +47,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 hdrkit = { git = "https://github.com/zeo/hdrkit", rev = "caac5aa0a83ac4e0e6f58729189d29022ad26564" }

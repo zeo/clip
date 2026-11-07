@@ -162,8 +162,9 @@ impl Settings {
 
     /// Whether moving from `self` to `next` needs a new session.
     fn records_differently(&self, next: &Self) -> bool {
-        (self.buffer, self.fps, self.height, self.mbps, self.hdr10, self.mic, &self.apps, &self.ignore)
-            != (next.buffer, next.fps, next.height, next.mbps, next.hdr10, next.mic, &next.apps, &next.ignore)
+        let audio = |s: &Self| (s.mic, s.apps.clone(), s.volumes.clone(), s.mic_device.clone(), s.push_to_talk);
+        (self.buffer, self.fps, self.height, self.mbps, self.hdr10, &self.ignore, audio(self))
+            != (next.buffer, next.fps, next.height, next.mbps, next.hdr10, &next.ignore, audio(next))
     }
 }
 
@@ -244,7 +245,9 @@ fn serve() -> Result<(), String> {
             game_art,
             pause,
             hold_hotkeys,
-            preview_sound
+            preview_sound,
+            mics,
+            mic_level
         ])
         .setup(move |app| {
             let paths = app.path();
@@ -540,7 +543,8 @@ fn record(
         media.clone()?;
         let current = settings.lock().expect("settings poisoned").clone();
         let pid = focus::pid(window);
-        let lanes = crate::audio::lanes(Some(pid), &current.apps, current.mic);
+        let mic = current.mic.then(|| (current.mic_device.clone(), current.push_to_talk));
+        let lanes = crate::audio::lanes(Some(pid), &current.apps, mic, &current.volumes);
         let session = Session::start(&current.options(), Target::Window(window), &lanes)?;
         let app = focus::app_name(pid);
         // the icon only dresses up the library, a game without one still records
@@ -1136,6 +1140,24 @@ fn reveal(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
 #[tauri::command]
 async fn audio_apps() -> Result<Vec<String>, String> {
     crate::audio::playing().map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct Mic {
+    id: String,
+    name: String,
+}
+
+#[tauri::command]
+async fn mics() -> Result<Vec<Mic>, String> {
+    let mics = crate::audio::mics().map_err(|e| e.to_string())?;
+    Ok(mics.into_iter().map(|(id, name)| Mic { id, name }).collect())
+}
+
+/// How loud a microphone is right now, 0 to 1, from an empty id's default one.
+#[tauri::command]
+async fn mic_level(device: String) -> Result<f32, String> {
+    blocking(move || crate::audio::mic_peak(&device).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]

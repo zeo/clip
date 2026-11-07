@@ -98,7 +98,8 @@ fn capture_command(args: &[String]) -> std::result::Result<(), String> {
         Target::Monitor(_) => None,
     };
     let apps: Vec<String> = args.windows(2).filter(|pair| pair[0] == "--app").map(|pair| pair[1].clone()).collect();
-    let lanes = audio::lanes(game, &apps, args.iter().any(|a| a == "--mic"));
+    let mic = args.iter().any(|a| a == "--mic").then(|| (String::new(), 0));
+    let lanes = audio::lanes(game, &apps, mic, &Default::default());
     let out = PathBuf::from(flag(args, "--out").unwrap_or("clip.mp4"));
     record_clip(args, target, &lanes, &out, move |_| std::thread::sleep(Duration::from_secs(duration as u64)))?;
     Ok(())

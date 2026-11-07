@@ -42,7 +42,7 @@ struct Marks {
 /// click is far below anything audible over a game, so this runs fine mid match.
 pub fn run(args: &[String]) -> std::result::Result<(), String> {
     let out = std::env::temp_dir().join(format!("clip-sync-{}.mp4", std::process::id()));
-    let lanes = [Lane { name: "sync".into(), source: Source::Process(std::process::id()) }];
+    let lanes = [Lane { name: "sync".into(), source: Source::Process(std::process::id()), gain: 100 }];
     let (opened, window) = mpsc::channel();
     let (go, begun) = mpsc::channel();
     let stage = std::thread::spawn(move || stage(&opened, &begun));

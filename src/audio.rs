@@ -1,23 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows::core::{implement, Interface, Ref, Result, HRESULT};
+use windows::core::{implement, Interface, Ref, Result, HRESULT, HSTRING};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, FILETIME, S_OK};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, IAgileObject, IAgileObject_Impl, BLOB, CLSCTX_ALL,
-    COINIT_MULTITHREADED,
+    COINIT_MULTITHREADED, STGM_READ,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::System::Variant::VT_BLOB;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 use crate::encode::packet;
 use crate::ring::{Clock, Packet, Ring, SECOND};
@@ -48,20 +50,33 @@ pub enum Source {
     Rest,
     /// everything outside one process tree as a single feed, system sounds and the game's launcher included
     Except(u32),
-    Microphone,
+    Microphone {
+        /// an endpoint id, empty for the default microphone
+        device: String,
+        /// a virtual key the microphone is only heard while held, 0 for always
+        hold: u32,
+    },
 }
 
 pub struct Lane {
     pub name: String,
     pub source: Source,
+    /// percent of the lane's own level
+    pub gain: u32,
 }
 
 /// The tracks a clip gets: the game, everything else, voice chat if it is running, any app asked
-/// for by exe name, and the microphone.
-pub fn lanes(game: Option<u32>, apps: &[String], mic: bool) -> Vec<Lane> {
+/// for by exe name, and the microphone, each at its volume in `volumes`, 100 when missing.
+pub fn lanes(
+    game: Option<u32>,
+    apps: &[String],
+    mic: Option<(String, u32)>,
+    volumes: &BTreeMap<String, u32>,
+) -> Vec<Lane> {
+    let lane = |name: String, source| Lane { gain: volumes.get(&name).map_or(100, |&v| v.min(200)), name, source };
     let mut lanes = Vec::new();
     if let Some(pid) = game {
-        lanes.push(Lane { name: "game".into(), source: Source::Process(pid) });
+        lanes.push(lane("game".into(), Source::Process(pid)));
     }
     let processes = Processes::snapshot();
     // the game's own sound is already on its track, a second lane for the same exe would stay silent
@@ -76,17 +91,56 @@ pub fn lanes(game: Option<u32>, apps: &[String], mic: bool) -> Vec<Lane> {
     // exclude mode carves out only one tree, so it can stand in for the rest only when no other lane claims one
     let rest =
         if voice || !apps.is_empty() { Source::Rest } else { Source::Except(game.unwrap_or_else(std::process::id)) };
-    lanes.push(Lane { name: if game.is_some() { "others" } else { "desktop" }.into(), source: rest });
+    lanes.push(lane(if game.is_some() { "others" } else { "desktop" }.into(), rest));
     if voice {
-        lanes.push(Lane { name: "voice".into(), source: Source::Named(discord) });
+        lanes.push(lane("voice".into(), Source::Named(discord)));
     }
     for name in apps {
-        lanes.push(Lane { source: Source::Named(vec![format!("{name}.exe")]), name });
+        lanes.push(lane(name.clone(), Source::Named(vec![format!("{name}.exe")])));
     }
-    if mic {
-        lanes.push(Lane { name: "mic".into(), source: Source::Microphone });
+    if let Some((device, hold)) = mic {
+        lanes.push(lane("mic".into(), Source::Microphone { device, hold }));
     }
     lanes
+}
+
+/// The active microphones' endpoint ids and names.
+pub fn mics() -> Result<Vec<(String, String)>> {
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    unsafe {
+        let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let all = devices.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+        (0..all.GetCount()?)
+            .map(|i| {
+                let device = all.Item(i)?;
+                let id = device.GetId()?;
+                let text = id.to_string();
+                CoTaskMemFree(Some(id.0 as _));
+                let name = device.OpenPropertyStore(STGM_READ)?.GetValue(&PKEY_Device_FriendlyName)?.to_string();
+                Ok((text?, name))
+            })
+            .collect()
+    }
+}
+
+/// The loudest sample a microphone hears over a tenth of a second, 0 to 1, for a level meter.
+pub fn mic_peak(device: &str) -> Result<f32> {
+    let input = Input::open(&Source::Microphone { device: device.into(), hold: 0 }, MIC)?;
+    std::thread::sleep(Duration::from_millis(100));
+    let mut peak = 0;
+    unsafe {
+        while input.capture.GetNextPacketSize()? > 0 {
+            let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0, 0);
+            input.capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
+                let pcm = std::slice::from_raw_parts(data, frames as usize * BLOCK);
+                let loudest = pcm.as_chunks::<2>().0.iter().map(|s| i16::from_le_bytes(*s).unsigned_abs()).max();
+                peak = peak.max(loudest.unwrap_or(0));
+            }
+            input.capture.ReleaseBuffer(frames)?;
+        }
+    }
+    Ok(peak as f32 / 32768.0)
 }
 
 /// The lowercase exe names of apps holding an audio session, Discord aside since it always gets
@@ -207,7 +261,7 @@ fn assign(sources: &[Source], processes: &Processes, sessions: &[u32], own: u32)
     let mut trees: Vec<Vec<u32>> = sources
         .iter()
         .map(|source| match source {
-            Source::Microphone => vec![MIC],
+            Source::Microphone { .. } => vec![MIC],
             Source::Except(pid) => vec![*pid],
             _ => Vec::new(),
         })
@@ -240,7 +294,7 @@ impl Recording {
     /// Returns once every lane is recording, or with the reason one couldn't start.
     pub fn start(lanes: &[Lane], span: i64, clock: Clock, stop: Arc<AtomicBool>) -> Result<Self> {
         let rings: Vec<_> = lanes.iter().map(|_| Arc::new(Mutex::new(Ring::new(span)))).collect();
-        let sources: Vec<Source> = lanes.iter().map(|lane| lane.source.clone()).collect();
+        let sources: Vec<(Source, u32)> = lanes.iter().map(|lane| (lane.source.clone(), lane.gain)).collect();
         let (opened, ready) = mpsc::sync_channel(1);
         let thread = {
             let rings = rings.clone();
@@ -262,7 +316,7 @@ impl Recording {
 }
 
 fn run(
-    sources: &[Source],
+    sources: &[(Source, u32)],
     clock: Clock,
     rings: &[Arc<Mutex<Ring>>],
     stop: &AtomicBool,
@@ -271,7 +325,8 @@ fn run(
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     let changed = Arc::new(AtomicBool::new(false));
     let started = Sessions::new(changed.clone()).and_then(|mut sessions| {
-        let mut channels = sources.iter().map(|source| Channel::new(source.clone())).collect::<Result<Vec<_>>>()?;
+        let mut channels =
+            sources.iter().map(|(source, gain)| Channel::new(source.clone(), *gain)).collect::<Result<Vec<_>>>()?;
         rescan(&mut channels, &mut sessions)?;
         Ok((sessions, channels))
     });
@@ -318,6 +373,7 @@ struct Channel {
     feeds: Vec<Feed>,
     failed: Vec<(u32, Instant)>,
     position: i64,
+    gain: u32,
     aac: Aac,
 }
 
@@ -329,12 +385,14 @@ struct Feed {
 
 impl Channel {
     /// The microphone opens here so a missing one stops the recording before it starts.
-    fn new(source: Source) -> Result<Self> {
+    fn new(source: Source, gain: u32) -> Result<Self> {
         let feeds = match source {
-            Source::Microphone => vec![Feed { pid: MIC, input: Input::open(&source, MIC)?, timeline: Timeline::at(0) }],
+            Source::Microphone { .. } => {
+                vec![Feed { pid: MIC, input: Input::open(&source, MIC)?, timeline: Timeline::at(0) }]
+            }
             _ => Vec::new(),
         };
-        Ok(Self { source, feeds, failed: Vec::new(), position: 0, aac: Aac::new()? })
+        Ok(Self { source, feeds, failed: Vec::new(), position: 0, gain, aac: Aac::new()? })
     }
 
     fn retarget(&mut self, pids: &[u32]) {
@@ -368,7 +426,7 @@ impl Channel {
         let lost = self.feeds.len() < before;
         let target = (clock.now() - LAG) * RATE as i64 / SECOND;
         let mut timelines: Vec<&mut Timeline> = self.feeds.iter_mut().map(|feed| &mut feed.timeline).collect();
-        let packets = match mix(&mut timelines, &mut self.position, target) {
+        let packets = match mix(&mut timelines, &mut self.position, target, self.gain) {
             Some((pts, pcm)) => self.aac.encode(pts, &pcm)?,
             None => Vec::new(),
         };
@@ -379,15 +437,26 @@ impl Channel {
 struct Input {
     client: IAudioClient,
     capture: IAudioCaptureClient,
+    /// a virtual key the feed is silent without, 0 for none
+    hold: u32,
 }
 
 impl Input {
     fn open(source: &Source, pid: u32) -> Result<Self> {
         unsafe {
             let (client, loopback) = match source {
-                Source::Microphone => {
+                Source::Microphone { device, .. } => {
                     let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-                    (devices.GetDefaultAudioEndpoint(eCapture, eConsole)?.Activate(CLSCTX_ALL, None)?, false)
+                    // a microphone that was unplugged gives way to the default one, so the voice still records
+                    let chosen = (!device.is_empty())
+                        .then(|| devices.GetDevice(&HSTRING::from(device.as_str())).ok())
+                        .flatten()
+                        .filter(|chosen| chosen.GetState().is_ok_and(|state| state == DEVICE_STATE_ACTIVE));
+                    let device = match chosen {
+                        Some(chosen) => chosen,
+                        None => devices.GetDefaultAudioEndpoint(eCapture, eConsole)?,
+                    };
+                    (device.Activate(CLSCTX_ALL, None)?, false)
                 }
                 Source::Except(_) => (process(pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE)?, true),
                 _ => (process(pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE)?, true),
@@ -399,7 +468,8 @@ impl Input {
             client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, DEVICE_BUFFER, 0, &wave(), None)?;
             let capture = client.GetService()?;
             client.Start()?;
-            Ok(Self { client, capture })
+            let hold = if let Source::Microphone { hold, .. } = source { *hold } else { 0 };
+            Ok(Self { client, capture, hold })
         }
     }
 
@@ -413,7 +483,8 @@ impl Input {
                     0 => clock.now() - frames as i64 * SECOND / RATE as i64,
                     qpc => clock.at(qpc as i64),
                 };
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                let held = self.hold == 0 || GetAsyncKeyState(self.hold as i32) < 0;
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || !held {
                     timeline.push(at, &vec![0; length]);
                 } else {
                     timeline.push(at, std::slice::from_raw_parts(data, length));
@@ -597,9 +668,9 @@ impl Timeline {
 }
 
 /// Sums every feed from `position` up to the frame all of them have reached (or up to `target`
-/// when the lane has none), returning the time of the first sample and the mixed samples. Every
-/// timeline's pending samples start at `position`, before and after.
-fn mix(timelines: &mut [&mut Timeline], position: &mut i64, target: i64) -> Option<(i64, Vec<u8>)> {
+/// when the lane has none) at `gain` percent, returning the time of the first sample and the mixed
+/// samples. Every timeline's pending samples start at `position`, before and after.
+fn mix(timelines: &mut [&mut Timeline], position: &mut i64, target: i64, gain: u32) -> Option<(i64, Vec<u8>)> {
     timelines.iter_mut().for_each(|timeline| timeline.fill(target));
     let end = timelines.iter().map(|timeline| timeline.frames).min().unwrap_or(target);
     if end <= *position {
@@ -612,8 +683,10 @@ fn mix(timelines: &mut [&mut Timeline], position: &mut i64, target: i64) -> Opti
             *total += i16::from_le_bytes(*sample) as i32;
         }
     }
-    let pcm =
-        sum.iter().flat_map(|&total| (total.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes()).collect();
+    let pcm = sum
+        .iter()
+        .flat_map(|&total| ((total * gain as i32 / 100).clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes())
+        .collect();
     let pts = *position * SECOND / RATE as i64;
     *position = end;
     Some((pts, pcm))
@@ -758,7 +831,7 @@ mod tests {
     }
 
     fn mixed(timelines: &mut [&mut Timeline], position: &mut i64, target_ms: i64) -> (i64, Vec<i16>) {
-        let (pts, pcm) = mix(timelines, position, target_ms * PER_MS).unwrap();
+        let (pts, pcm) = mix(timelines, position, target_ms * PER_MS, 100).unwrap();
         (pts, pcm.as_chunks::<2>().0.iter().map(|&s| i16::from_le_bytes(s)).collect())
     }
 
@@ -799,7 +872,7 @@ mod tests {
         let mut timeline = Timeline::at(0);
         let mut position = 0;
         assert_eq!(mixed(&mut [&mut timeline], &mut position, 900).1.len(), values(900));
-        assert!(mix(&mut [&mut timeline], &mut position, 905 * PER_MS).is_none());
+        assert!(mix(&mut [&mut timeline], &mut position, 905 * PER_MS, 100).is_none());
         timeline.push(990 * MS, &tone(10, 1));
         let (pts, pcm) = mixed(&mut [&mut timeline], &mut position, 905);
         assert_eq!((pts, pcm.len()), (900 * MS, values(100)));
@@ -817,6 +890,27 @@ mod tests {
         let (pts, pcm) = mixed(&mut [&mut a, &mut b], &mut position, 0);
         assert_eq!(pts, 10 * MS);
         assert!(pcm.iter().all(|&s| s == 60));
+    }
+
+    #[test]
+    fn a_lane_plays_at_its_volume_and_clips() {
+        let mut timeline = Timeline::at(0);
+        timeline.push(0, &tone(10, 1000));
+        let quiet = mix(&mut [&mut timeline], &mut 0, 0, 50).unwrap().1;
+        assert!(quiet.as_chunks::<2>().0.iter().all(|&s| i16::from_le_bytes(s) == 500));
+        let mut timeline = Timeline::at(0);
+        timeline.push(0, &tone(10, -20_000));
+        let loud = mix(&mut [&mut timeline], &mut 0, 0, 200).unwrap().1;
+        assert!(loud.as_chunks::<2>().0.iter().all(|&s| i16::from_le_bytes(s) == i16::MIN));
+    }
+
+    #[test]
+    fn a_lane_gets_its_volume_by_name() {
+        let volumes = BTreeMap::from([("others".to_string(), 40), ("mic".to_string(), 900)]);
+        let lanes = lanes(None, &[], Some((String::new(), 0)), &volumes);
+        let gains: Vec<(&str, u32)> = lanes.iter().map(|lane| (lane.name.as_str(), lane.gain)).collect();
+        assert_eq!(gains.first(), Some(&("desktop", 100)));
+        assert_eq!(gains.last(), Some(&("mic", 200)));
     }
 
     #[test]
@@ -863,7 +957,7 @@ mod tests {
             Source::Rest,
             Source::Named(vec!["discord.exe".into()]),
             Source::Named(vec!["steam.exe".into()]),
-            Source::Microphone,
+            Source::Microphone { device: String::new(), hold: 0 },
         ];
         let trees = assign(&sources, &running, &[11, 21, 31, 41, 40, 10, 50, 99], 50);
         // steam is the game's parent, so its lane can't record steam itself, only the web helper under it
