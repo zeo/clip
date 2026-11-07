@@ -14,6 +14,10 @@ export const view = $state({
   list: false,
   sort: 'newest' as Query['sort'],
   volume: 1,
+  // bytes to fit exports under, 0 for the clip's own quality and -1 for `custom` MB
+  fit: 0,
+  custom: 25,
+  copyAfter: true,
   ...stored,
   side: { home: false, library: true, ...stored.side }
 });

@@ -22,6 +22,8 @@ pub struct Clip {
     pub modified: u64,
     pub seconds: f64,
     pub fps: f64,
+    /// hevc with hdr10 metadata, which many players and sites can't show
+    pub hdr: bool,
     pub starred: bool,
     /// seconds into the clip where alt+f10 was pressed
     pub marks: Vec<f64>,
@@ -115,12 +117,28 @@ pub fn list(folder: &Path, marks: &Marks, thumbs: &Path) -> Vec<Clip> {
             let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
             let path = entry.path();
             let name = path.file_stem()?.to_string_lossy().into_owned();
-            let (seconds, fps) = crate::save::probe(&path).map_or((0.0, 0.0), |probe| (probe.seconds, probe.fps));
+            let probe = crate::save::probe(&path);
+            let (seconds, fps) = probe.as_ref().map_or((0.0, 0.0), |probe| (probe.seconds, probe.fps));
+            let hdr = probe.is_ok_and(|probe| probe.mastering.is_some());
             let (starred, at) = (marks.starred(folder, &path), marks.marks(folder, &path));
             let thumb = Some(thumb(thumbs, &path, modified, meta.len())).filter(|thumb| thumb.is_file());
             let icon = Some(icon(thumbs, &app)).filter(|icon| icon.is_file());
             let bytes = meta.len();
-            Some(Clip { path, app, name, bytes, modified, seconds, fps, starred, marks: at, session: 0, thumb, icon })
+            Some(Clip {
+                path,
+                app,
+                name,
+                bytes,
+                modified,
+                seconds,
+                fps,
+                hdr,
+                starred,
+                marks: at,
+                session: 0,
+                thumb,
+                icon,
+            })
         })
         .collect();
     clips.sort_by_key(|clip| std::cmp::Reverse(clip.modified));
@@ -211,6 +229,24 @@ pub fn recycle(paths: &[PathBuf]) -> Result<(), String> {
     }
 }
 
+/// Settles every replace that was waiting out its undo when clip last stopped: the trimmed clip
+/// stays and its original goes to the recycle bin, or the original comes back if the trimmed one
+/// never landed.
+pub fn settle(folder: &Path) {
+    let dirs = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path());
+    let dirs = std::iter::once(folder.to_path_buf()).chain(dirs.filter(|dir| dir.is_dir()));
+    let originals =
+        dirs.flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()));
+    let originals: Vec<PathBuf> =
+        originals.filter(|path| path.to_string_lossy().to_ascii_lowercase().ends_with(".mp4.orig")).collect();
+    let (kept, lost): (Vec<PathBuf>, Vec<PathBuf>) =
+        originals.into_iter().partition(|path| path.with_extension("").exists());
+    for path in lost {
+        let _ = std::fs::rename(&path, path.with_extension(""));
+    }
+    let _ = recycle(&kept);
+}
+
 /// Deletes the oldest unstarred clips, never the newest, until the folder holds at most `cap` bytes
 /// and none is older than `before`, in ms since 1970. Returns the paths deleted.
 pub fn trim(clips: &[Clip], cap: u64, before: u64) -> Vec<PathBuf> {
@@ -285,6 +321,7 @@ mod tests {
             modified: 0,
             seconds: 0.0,
             fps: 0.0,
+            hdr: false,
             starred,
             marks: Vec::new(),
             session: 0,

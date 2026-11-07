@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
@@ -27,6 +28,16 @@
   // past this the tracks are restarted where the video is
   const DRIFT = 0.04;
   const RATES = [0.25, 0.5, 1, 1.5, 2];
+  // the upload limits people meet most, in the bytes the sites count
+  const SIZES = [
+    { bytes: 0, label: 'Original quality' },
+    { bytes: 20e6, label: '20 MB, Discord' },
+    { bytes: 50e6, label: '50 MB, Nitro Basic or boost level 2' },
+    { bytes: 100e6, label: '100 MB, boost level 3' },
+    { bytes: 1000e6, label: '1 GB, Nitro' },
+    { bytes: -1, label: 'Custom' }
+  ];
+  const CANCELLED = 'the export was cancelled';
 
   let video = $state<HTMLVideoElement>();
   let bar = $state<HTMLElement>();
@@ -47,6 +58,24 @@
   let rate = $state(1);
   let loop = $state(false);
   let full = $state(false);
+  let portrait = $state(false);
+  let middle = $state(0.5);
+  let replace = $state(false);
+  let progress = $state<number | null>(null);
+  // bumped when the file under the player changes, so the webview fetches it again
+  let version = $state(0);
+  let shown = $state({ width: 0, height: 0 });
+  let picture = $state({ width: 16, height: 9 });
+  const fit = $derived(view.fit === -1 ? Math.round(Math.max(1, view.custom) * 1e6) : view.fit);
+  // the share of the picture's width a 9:16 window takes, and where it sits on screen
+  const narrow = $derived(Math.min(1, (picture.height * 9) / 16 / picture.width));
+  const crop = $derived.by(() => {
+    const scale = Math.min(shown.width / picture.width, shown.height / picture.height) || 0;
+    const width = picture.width * scale;
+    const x = (shown.width - width) / 2;
+    const left = x + (middle - narrow / 2) * width;
+    return { x, span: width, left, top: (shown.height - picture.height * scale) / 2, width: narrow * width, height: picture.height * scale };
+  });
   const fps = $derived(clip.fps || 60);
   const soloed = $derived(lanes.some((lane) => lane.solo));
   const audible = $derived(lanes.flatMap((lane, i) => ((soloed ? lane.solo : !lane.muted) ? [i] : [])));
@@ -258,11 +287,66 @@
 
   const named = (path: string) => path.split(/[\\/]/).pop();
 
-  async function exportCut(discord: boolean) {
-    const out = await act(discord ? 'fitting' : 'saving', () =>
-      invoke<string>('export', { path: clip.path, start, end, tracks: audible, mix: mix && audible.length > 1, discord })
-    );
-    if (out) say(`Saved ${named(out)}`);
+  async function exportCut() {
+    const path = clip.path;
+    const before = $state.snapshot(clip.marks);
+    progress = 0;
+    const heard = await listen<number>('export-progress', (e) => (progress = e.payload));
+    const out = await act('export', () =>
+      invoke<string>('export', {
+        path,
+        start,
+        end,
+        tracks: audible,
+        mix: mix && audible.length > 1,
+        fit: fit || null,
+        portrait: portrait ? middle : null,
+        replace
+      })
+    ).finally(() => (heard(), (progress = null)));
+    if (error === CANCELLED) {
+      error = '';
+      say('Export cancelled');
+    }
+    if (!out) return;
+    const copied =
+      fit > 0 &&
+      view.copyAfter &&
+      (await invoke('copy_files', { paths: [out] }).then(
+        () => true,
+        (e) => (say(String(e), true), false)
+      ));
+    const pasted = copied ? ', copied to paste' : '';
+    if (!replace) return say(`Saved ${named(out)}${pasted}`);
+    [start, end] = [0, end - start];
+    version++;
+    // the original waits beside the clip until the undo runs out
+    const timer = setTimeout(() => invoke('drop_original', { path }).catch((e) => say(String(e), true)), 8000);
+    say(`Replaced ${title(clip)} with the cut${pasted}`, false, async () => {
+      clearTimeout(timer);
+      try {
+        await invoke('restore_original', { path });
+        await invoke('set_marks', { path, at: before });
+        version++;
+        say(`Put back ${title(clip)}`);
+      } catch (e) {
+        say(String(e), true);
+      }
+    });
+  }
+
+  const place = (at: number) => Math.min(1 - narrow / 2, Math.max(narrow / 2, at));
+
+  function slide(event: PointerEvent) {
+    const target = event.currentTarget as HTMLElement;
+    target.setPointerCapture(event.pointerId);
+    const screen = target.parentElement!.getBoundingClientRect();
+    const grab = event.clientX - (screen.left + crop.left + crop.width / 2);
+    target.onpointermove = (e) => {
+      const width = crop.width / narrow;
+      middle = place((e.clientX - grab - screen.left - (shown.width - width) / 2) / width);
+    };
+    target.onpointerup = () => (target.onpointermove = null);
   }
 
   async function still() {
@@ -384,11 +468,11 @@
 </div>
 
 <div class="theater" class:full>
-  <div class="screen">
+  <div class="screen" bind:clientWidth={shown.width} bind:clientHeight={shown.height}>
     <!-- svelte-ignore a11y_media_has_caption -->
     <video
       bind:this={video}
-      src={convertFileSrc(clip.path)}
+      src={convertFileSrc(clip.path) + (version ? `?v=${version}` : '')}
       crossorigin="anonymous"
       muted
       preload="auto"
@@ -400,9 +484,37 @@
       onseeked={sound}
       onloadedmetadata={(e) => {
         duration = e.currentTarget.duration;
+        picture = { width: e.currentTarget.videoWidth || 16, height: e.currentTarget.videoHeight || 9 };
         if (!clip.seconds || end > duration) end = duration;
       }}
     ></video>
+    {#if portrait}
+      <div class="shroud" style:left="{crop.x}px" style:top="{crop.top}px" style:width="{crop.left - crop.x}px" style:height="{crop.height}px"></div>
+      <div class="shroud" style:left="{crop.left + crop.width}px" style:top="{crop.top}px" style:width="{crop.x + crop.span - crop.left - crop.width}px" style:height="{crop.height}px"></div>
+      <div
+        class="crop"
+        role="slider"
+        tabindex="0"
+        aria-label="9:16 window"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(middle * 100)}
+        aria-valuetext="{Math.round(middle * 100)}% across"
+        title="Drag to choose what the 9:16 copy shows"
+        style:left="{crop.left}px"
+        style:top="{crop.top}px"
+        style:width="{crop.width}px"
+        style:height="{crop.height}px"
+        onpointerdown={slide}
+        onkeydown={(e) => {
+          const to = ({ ArrowLeft: middle - 0.02, ArrowRight: middle + 0.02, Home: 0, End: 1 } as Record<string, number>)[e.key];
+          if (to === undefined) return;
+          e.preventDefault();
+          e.stopPropagation();
+          middle = place(to);
+        }}
+      ></div>
+    {/if}
   </div>
 
   <div class="dock">
@@ -517,22 +629,68 @@
     </section>
 
     <section class="panel">
-      <h3 class="panel-head">Cut</h3>
+      <h3 class="panel-head">Export</h3>
       <dl class="facts cut-facts">
         <div><dt>In</dt><dd>{clock(start, true)}</dd></div>
         <div><dt>Out</dt><dd>{clock(end, true)}</dd></div>
         <div><dt>Keeps</dt><dd>{(end - start).toFixed(2)} s</dd></div>
       </dl>
-      <div class="seg" role="radiogroup" aria-label="Audio in the copy" use:radios>
-        <button role="radio" aria-checked={mix} onclick={() => (mix = true)}>Mix to one</button>
-        <button role="radio" aria-checked={!mix} onclick={() => (mix = false)}>Keep tracks</button>
+      <label class="option">
+        <span>Size</span>
+        <select class="field" bind:value={view.fit} disabled={busy !== ''}>
+          {#each SIZES as s (s.bytes)}<option value={s.bytes}>{s.label}</option>{/each}
+        </select>
+      </label>
+      {#if view.fit === -1}
+        <label class="option">
+          <span>Under</span>
+          <input class="field mb" type="number" min="1" max="10000" step="1" bind:value={view.custom} disabled={busy !== ''} />
+          <span class="form-hint">MB</span>
+        </label>
+      {/if}
+      <div class="option">
+        <span id="frame-label">Frame</span>
+        <div class="seg" role="radiogroup" aria-labelledby="frame-label" use:radios>
+          <button role="radio" aria-checked={!portrait} disabled={busy !== ''} onclick={() => (portrait = false)}>Original</button>
+          <button role="radio" aria-checked={portrait} disabled={busy !== ''} onclick={() => (portrait = true)}>9:16</button>
+        </div>
       </div>
-      <p class="form-hint">{audible.length} of {lanes.length} tracks go in, the muted ones are left out</p>
-      <button class="gel default wide" disabled={busy !== ''} onclick={() => exportCut(false)}>
-        {busy === 'saving' ? 'Saving' : 'Save trimmed copy'}
-      </button>
-      <button class="gel wide" disabled={busy !== ''} onclick={() => exportCut(true)} title="Under 20 MB, one audio track">
-        {busy === 'fitting' ? 'Fitting' : 'Copy for Discord'}
+      <div class="option">
+        <span id="audio-label">Audio</span>
+        <div class="seg" role="radiogroup" aria-labelledby="audio-label" use:radios>
+          <button role="radio" aria-checked={mix || fit > 0} disabled={busy !== ''} onclick={() => (mix = true)}>Mix to one</button>
+          <button role="radio" aria-checked={!mix && !fit} disabled={busy !== '' || fit > 0} onclick={() => (mix = false)}>Keep tracks</button>
+        </div>
+      </div>
+      <div class="option">
+        <span id="save-label">Save as</span>
+        <div class="seg" role="radiogroup" aria-labelledby="save-label" use:radios>
+          <button role="radio" aria-checked={!replace} disabled={busy !== ''} onclick={() => (replace = false)}>New clip</button>
+          <button role="radio" aria-checked={replace} disabled={busy !== ''} onclick={() => (replace = true)}>Replace this one</button>
+        </div>
+      </div>
+      {#if fit > 0}
+        <label class="option">
+          <input type="checkbox" bind:checked={view.copyAfter} disabled={busy !== ''} />
+          <span>Copy the file when it's done</span>
+        </label>
+      {/if}
+      <p class="form-hint">
+        {audible.length} of {lanes.length} tracks go in{fit > 0 && audible.length > 1 ? ', mixed to one since most sites play only the first' : ''}.
+        {#if portrait}Drag the frame on the picture to choose what shows.{/if}
+        {#if replace}The original goes to the recycle bin, with an undo.{/if}
+        {#if clip.hdr}HDR clips export as HEVC, which some sites and players can't show.{/if}
+      </p>
+      {#if progress !== null}
+        <div class="exporting">
+          <span class="meter" role="progressbar" aria-label="Export" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+            <span style:width="{progress}%"></span>
+          </span>
+          <button class="gel" onclick={() => invoke('cancel_export')}>Cancel</button>
+        </div>
+      {/if}
+      <button class="gel default wide" disabled={busy !== ''} onclick={exportCut}>
+        {busy === 'export' ? `Exporting ${progress ?? 0}%` : replace ? 'Replace with the cut' : 'Export'}
       </button>
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}
     </section>

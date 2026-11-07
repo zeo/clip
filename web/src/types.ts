@@ -79,6 +79,7 @@ export type Clip = {
   modified: number;
   seconds: number;
   fps: number;
+  hdr: boolean;
   starred: boolean;
   marks: number[];
   session: number;

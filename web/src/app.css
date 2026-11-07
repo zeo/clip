@@ -354,7 +354,10 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .banner-facts { color: #cfcfcf; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); }
 
 .theater { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 320px; grid-template-rows: minmax(0, 1fr) auto; grid-template-areas: "screen side" "dock side"; }
-.screen { grid-area: screen; display: grid; min-height: 0; background: #000; }
+.screen { grid-area: screen; position: relative; display: grid; min-height: 0; background: #000; overflow: hidden; }
+.crop { position: absolute; cursor: ew-resize; border: 1px solid rgba(255, 255, 255, 0.85); touch-action: none; }
+.shroud { position: absolute; background: rgba(0, 0, 0, 0.6); pointer-events: none; }
+.crop:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
 .screen video { width: 100%; height: 100%; min-height: 0; object-fit: contain; display: block; }
 .dock { grid-area: dock; display: flex; flex-direction: column; gap: 8px; max-height: 42vh; padding: 10px 14px 14px; background: var(--row-a); border-top: 1px solid #050505; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05); overflow-y: auto; }
 .transport { display: flex; align-items: center; gap: 10px; }
@@ -397,6 +400,12 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .cut-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .cut-facts div:nth-child(n) { background: var(--row-a); }
 .panel .seg { align-self: flex-start; }
+.option { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--fg-2); font-size: var(--t-small); }
+.option > span:first-child { flex: none; width: 52px; }
+.option .field { flex: 1; min-width: 0; }
+.option .field.mb { flex: none; width: 80px; }
+.exporting { display: flex; align-items: center; gap: 8px; }
+.exporting .meter { flex: 1; width: auto; }
 .theater.full { position: fixed; inset: 0; z-index: 35; grid-template-columns: minmax(0, 1fr); grid-template-areas: "screen" "dock"; }
 .theater.full .inspector { display: none; }
 .gel.icon { padding: 2px 6px; }
@@ -489,6 +498,7 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
   .switch { forced-color-adjust: none; background: Canvas; border: 1px solid CanvasText; }
   .switch::after { background: CanvasText; }
   .switch:checked::after { background: HighlightText; }
+  .crop { border: 2px solid Highlight; }
   .playhead, .mark, .dot { forced-color-adjust: none; background: CanvasText; }
   .wave path { stroke: CanvasText; }
   .star, .pick { opacity: 1; border: 1px solid CanvasText; }

@@ -183,8 +183,8 @@ fn prepare(options: &Options, target: Target) -> std::result::Result<Prepared, S
     );
     let pipeline = capture::Pipeline::new(&gpu, display, format, options.filter)
         .map_err(|e| format!("can't convert frames: {e}"))?;
-    let encoder =
-        encode::Encoder::open(&choice, &gpu.device, format).map_err(|e| format!("can't open the encoder: {e}"))?;
+    let encoder = encode::Encoder::open(&choice, &gpu.device, format, encode::Purpose::Capture)
+        .map_err(|e| format!("can't open the encoder: {e}"))?;
     Ok((source, pipeline, encoder, format, mastering, summary))
 }
 
@@ -430,7 +430,8 @@ fn self_test() -> Result<()> {
                 let display = if hdr { TEST_DISPLAY } else { SDR_DISPLAY };
                 let mut pipeline =
                     capture::Pipeline::new(&gpu, display, format, hdr::Filter::Area).map_err(at("pipeline"))?;
-                let mut encoder = encode::Encoder::open(&choice, &gpu.device, format).map_err(at("open"))?;
+                let mut encoder = encode::Encoder::open(&choice, &gpu.device, format, encode::Purpose::Capture)
+                    .map_err(at("open"))?;
                 let mut ring = Ring::new(10 * SECOND);
                 // halfway through, the display switches hdr on or off
                 let switched = if hdr { SDR_DISPLAY } else { TEST_DISPLAY };
@@ -492,14 +493,22 @@ fn self_test() -> Result<()> {
         }
         let (mixed, kept) = (dir.join(format!("{case} mixed.mp4")), dir.join(format!("{case} kept.mp4")));
         let fitted = dir.join(format!("{case} fitted.mp4"));
-        // one second in this many bytes leaves about 1 Mbps for the video, which drops it to 540p
-        let budget = 360_000;
+        // one second in this many bytes leaves under 1 Mbps for the video, which drops it to 540p
+        let budget = 340_000;
         let outcome = (|| -> std::result::Result<_, String> {
             let tracks = export::tracks(&source)?.into_iter().map(|(name, pcm)| (name, pcm.len() / audio::BLOCK));
             let tracks: Vec<(String, usize)> = tracks.collect();
-            export::trim(&source, &mixed, 0.5, 1.5, &[0, 1], true, None)?;
-            export::trim(&source, &kept, 0.5, 1.5, &[1], false, None)?;
-            export::trim(&source, &fitted, 0.5, 1.5, &[0, 1], true, Some(budget))?;
+            export::trim(&source, &mixed, 0.5, 1.5, &[0, 1], true, &Default::default())?;
+            export::trim(&source, &kept, 0.5, 1.5, &[1], false, &Default::default())?;
+            export::trim(
+                &source,
+                &fitted,
+                0.5,
+                1.5,
+                &[0, 1],
+                true,
+                &export::Job { fit: Some(budget), ..Default::default() },
+            )?;
             let back = |path| read_back(path).map_err(|e| e.message());
             let onset = sync::onsets(&mixed).map_err(|e| e.message())?.1.first().copied();
             let heard = sync::onsets(&source).map_err(|e| e.message())?.1.first().copied();

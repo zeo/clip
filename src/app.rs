@@ -248,6 +248,9 @@ fn serve() -> Result<(), String> {
             save_thumb,
             track_audio,
             export,
+            cancel_export,
+            restore_original,
+            drop_original,
             game_art,
             pause,
             hold_hotkeys,
@@ -662,6 +665,7 @@ fn record(
             let settings = settings.lock().expect("settings poisoned");
             (settings.folder.clone(), settings.cap, settings.keep_days)
         };
+        library::settle(&folder);
         trim(&folder, &marks.lock().expect("marks poisoned"), thumbs, cap, keep_days);
     }
     let mut current: Result<Rc<Recording>, String> = Err(WAITING.into());
@@ -1120,11 +1124,13 @@ async fn track_audio(shared: State<'_, Shared>, path: PathBuf) -> Result<Vec<Tra
     .await
 }
 
-// discord's free upload limit is 20 MB, this leaves room for however it counts a megabyte
-const DISCORD: u64 = 19_000_000;
+// one export runs at a time, the window waits on it before starting another
+static CANCEL: AtomicBool = AtomicBool::new(false);
 
-/// Saves `start` to `end` seconds of a clip as a new clip beside it, with only the `tracks` asked
-/// for, either mixed into one or kept apart. A `discord` copy is mixed and fits Discord's limit.
+/// Saves `start` to `end` seconds of a clip with only the `tracks` asked for, mixed into one or
+/// kept apart. With `fit` it comes in under that many bytes, with `portrait` it is cut to a 9:16
+/// window centred that far across, and with `replace` it takes the clip's place while the clip
+/// waits beside it as `.orig` for an undo. Sends `export-progress` in percent as it goes.
 #[allow(clippy::too_many_arguments)] // each is a field of the request the webview sends
 #[tauri::command]
 async fn export(
@@ -1135,15 +1141,27 @@ async fn export(
     end: f64,
     tracks: Vec<usize>,
     mix: bool,
-    discord: bool,
+    fit: Option<u64>,
+    portrait: Option<f64>,
+    replace: bool,
 ) -> Result<PathBuf, String> {
     clip_in_folder(&shared, &path)?;
     if !(start >= 0.0 && end > start) {
         return Err("the end has to come after the start".into());
     }
+    if fit.is_some_and(|bytes| bytes < 1_000_000) {
+        return Err("the size has to be at least 1 MB".into());
+    }
+    CANCEL.store(false, Ordering::Relaxed);
+    let progress = app.clone();
     let out = blocking(move || {
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-        let kind = if discord { "discord" } else { "trimmed" };
+        let kind = match (fit, portrait) {
+            (Some(bytes), Some(_)) => format!("{} MB 9x16", bytes / 1_000_000),
+            (Some(bytes), None) => format!("{} MB", bytes / 1_000_000),
+            (None, Some(_)) => "9x16".into(),
+            (None, None) => "trimmed".into(),
+        };
         let out = (1..)
             .map(|n| match n {
                 1 => path.with_file_name(format!("{stem} {kind}.mp4")),
@@ -1151,8 +1169,22 @@ async fn export(
             })
             .find(|out| !out.exists())
             .expect("some name is free");
-        let fit = discord.then_some(DISCORD);
-        crate::export::trim(&path, &out, start, end, &tracks, mix || discord, fit)?;
+        let sent = Cell::new(u32::MAX);
+        let report = |done: f64| {
+            let percent = (done.clamp(0.0, 1.0) * 100.0) as u32;
+            if sent.replace(percent) != percent {
+                let _ = progress.emit("export-progress", percent);
+            }
+        };
+        let job = crate::export::Job { fit, portrait, progress: Some(&report), cancel: Some(&CANCEL) };
+        if let Err(e) = crate::export::trim(&path, &out, start, end, &tracks, mix || fit.is_some(), &job) {
+            let _ = std::fs::remove_file(&out);
+            return Err(e);
+        }
+        if replace {
+            take_place(&path, &out)?;
+            return Ok((path.clone(), path));
+        }
         Ok((path, out))
     })
     .await
@@ -1162,9 +1194,63 @@ async fn export(
             marks.mark(folder, &out, kept.map(|at| at - start).collect());
         })?;
         Ok(out)
-    })?;
+    });
     let _ = app.emit("clips", ());
-    Ok(out)
+    out
+}
+
+/// Puts `trimmed` where `clip` was, with its date, and keeps the clip beside it as `.orig`.
+fn take_place(clip: &Path, trimmed: &Path) -> Result<(), String> {
+    let original = clip.with_extension("mp4.orig");
+    // a second replace inside the undo keeps only the newest original
+    if original.exists() {
+        library::recycle(std::slice::from_ref(&original))?;
+    }
+    let modified = std::fs::metadata(clip).and_then(|meta| meta.modified());
+    let failed = |e: std::io::Error| {
+        let _ = std::fs::remove_file(trimmed);
+        format!("can't replace {}: {e}", clip.display())
+    };
+    std::fs::rename(clip, &original).map_err(failed)?;
+    if let Err(e) = std::fs::rename(trimmed, clip) {
+        let _ = std::fs::rename(&original, clip);
+        return Err(failed(e));
+    }
+    // the library keeps a replaced clip in its place by date
+    if let Ok(modified) = modified {
+        let _ = std::fs::File::options().write(true).open(clip).and_then(|file| file.set_modified(modified));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_export() {
+    CANCEL.store(true, Ordering::Relaxed);
+}
+
+/// Undoes a replace: the trimmed clip goes to the recycle bin and the original takes its place again.
+#[tauri::command]
+fn restore_original(app: AppHandle, shared: State<Shared>, path: PathBuf) -> Result<(), String> {
+    clip_in_folder(&shared, &path)?;
+    let original = path.with_extension("mp4.orig");
+    if !original.is_file() {
+        return Err("the original is gone already".into());
+    }
+    library::recycle(std::slice::from_ref(&path))?;
+    std::fs::rename(&original, &path).map_err(|e| format!("can't put the original back: {e}"))?;
+    let _ = app.emit("clips", ());
+    Ok(())
+}
+
+/// Sends a replaced clip's original to the recycle bin once its undo has run out.
+#[tauri::command]
+fn drop_original(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
+    clip_in_folder(&shared, &path)?;
+    let original = path.with_extension("mp4.orig");
+    match original.is_file() {
+        true => library::recycle(&[original]),
+        false => Ok(()),
+    }
 }
 
 /// Runs media foundation work off the webview's threads.

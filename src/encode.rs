@@ -64,6 +64,14 @@ impl Format {
     }
 }
 
+/// What the stream is for: capture wants a steady rate and a keyframe every second so a clip can
+/// start anywhere, an export wants the best picture for its size.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Purpose {
+    Capture,
+    Export,
+}
+
 pub struct Choice {
     activate: IMFActivate,
     pub name: String,
@@ -142,7 +150,7 @@ const STALL: Duration = Duration::from_secs(2);
 
 #[allow(non_upper_case_globals)] // the event names are the sdk's own constants
 impl Encoder {
-    pub fn open(choice: &Choice, device: &ID3D11Device, format: Format) -> Result<Self> {
+    pub fn open(choice: &Choice, device: &ID3D11Device, format: Format, purpose: Purpose) -> Result<Self> {
         unsafe {
             let transform: IMFTransform = choice.activate.ActivateObject()?;
             let attributes = transform.GetAttributes()?;
@@ -161,18 +169,28 @@ impl Encoder {
                 manager.ResetDevice(device, token)?;
                 transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)?;
             }
-            let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
+            let capture = purpose == Purpose::Capture;
+            let _ = attributes.SetUINT32(&MF_LOW_LATENCY, capture as u32);
 
             // vendors support different subsets, so each knob is best effort
             if let Ok(codec) = transform.cast::<ICodecAPI>() {
                 let set = |api: GUID, value: VARIANT| {
                     let _ = codec.SetValue(&api, &value);
                 };
-                set(CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
+                let mode = if capture {
+                    eAVEncCommonRateControlMode_CBR
+                } else {
+                    // spends bits where the picture moves, the peak keeps a busy stretch from blowing the size
+                    set(CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(format.bitrate / 2 * 3));
+                    set(CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(100u32));
+                    eAVEncCommonRateControlMode_PeakConstrainedVBR
+                };
+                set(CODECAPI_AVEncCommonRateControlMode, VARIANT::from(mode.0 as u32));
                 set(CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(format.bitrate));
-                set(CODECAPI_AVEncMPVGOPSize, VARIANT::from(format.fps));
+                set(CODECAPI_AVEncMPVGOPSize, VARIANT::from(format.fps * if capture { 1 } else { 4 }));
+                // b frames would need decode times the muxer doesn't write
                 set(CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
-                set(CODECAPI_AVLowLatencyMode, VARIANT::from(true));
+                set(CODECAPI_AVLowLatencyMode, VARIANT::from(capture));
             }
 
             let output = MFCreateMediaType()?;

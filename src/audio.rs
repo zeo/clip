@@ -700,6 +700,11 @@ pub struct Aac {
 
 impl Aac {
     pub fn new() -> Result<Self> {
+        Self::at(AAC_BYTES_PER_SECOND)
+    }
+
+    /// One of the rates the encoder takes: 12000, 16000, 20000 or 24000 bytes a second.
+    pub fn at(bytes_per_second: u32) -> Result<Self> {
         unsafe {
             let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Audio, guidSubtype: MFAudioFormat_PCM };
             let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Audio, guidSubtype: MFAudioFormat_AAC };
@@ -728,7 +733,7 @@ impl Aac {
             pcm.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE * BLOCK as u32)?;
             transform.SetInputType(0, &pcm, 0)?;
             let aac = audio_type(MFAudioFormat_AAC)?;
-            aac.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AAC_BYTES_PER_SECOND)?;
+            aac.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_second)?;
             aac.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
             transform.SetOutputType(0, &aac, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
