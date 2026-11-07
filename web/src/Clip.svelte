@@ -1,19 +1,36 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
-  import { discard, radios, say } from './view.svelte';
+  import { discard, radios, say, view } from './view.svelte';
 
-  let { clip, onclose, onmoved }: { clip: Clip; onclose: () => void; onmoved: (path: string) => void } = $props();
+  let {
+    clip,
+    prev,
+    next,
+    onopen,
+    onclose,
+    onmoved
+  }: {
+    clip: Clip;
+    prev?: Clip;
+    next?: Clip;
+    onopen: (clip: Clip) => void;
+    onclose: () => void;
+    onmoved: (path: string) => void;
+  } = $props();
 
   type Lane = { name: string; buffer: AudioBuffer; peaks: string; muted: boolean; solo: boolean };
   const PEAKS = 800;
   // past this the tracks are restarted where the video is
   const DRIFT = 0.04;
+  const RATES = [0.25, 0.5, 1, 1.5, 2];
 
   let video = $state<HTMLVideoElement>();
   let bar = $state<HTMLElement>();
+  let play = $state<HTMLButtonElement>();
   // the page is keyed by path, so the probe's length only seeds these
   const probed = untrack(() => clip.seconds);
   let duration = $state(probed);
@@ -27,15 +44,32 @@
   let busy = $state('');
   let error = $state('');
   let naming = $state<string | null>(null);
+  let rate = $state(1);
+  let loop = $state(false);
+  let full = $state(false);
   const fps = $derived(clip.fps || 60);
   const soloed = $derived(lanes.some((lane) => lane.solo));
   const audible = $derived(lanes.flatMap((lane, i) => ((soloed ? lane.solo : !lane.muted) ? [i] : [])));
   const pct = (t: number) => `${(100 * t) / (duration || 1)}%`;
 
   const context = new AudioContext();
+  const master = context.createGain();
+  master.connect(context.destination);
   let playing: AudioBufferSourceNode[] = [];
-  let anchor = 0;
+  // where the video was and what the audio clock read when the tracks last started
+  let from = 0;
+  let started = 0;
   let frame = 0;
+
+  $effect(() => {
+    master.gain.value = view.volume;
+  });
+
+  $effect(() => {
+    if (!video) return;
+    video.defaultPlaybackRate = video.playbackRate = rate;
+    untrack(sound);
+  });
 
   onMount(() => {
     load();
@@ -43,6 +77,8 @@
       cancelAnimationFrame(frame);
       silence();
       context.close();
+      // stepping to the next clip keeps the screen filled, anything else gives the window back
+      if (full) setTimeout(() => document.querySelector('.theater.full') || getCurrentWindow().setFullscreen(false));
     };
   });
 
@@ -89,14 +125,15 @@
   function sound() {
     silence();
     if (!video || video.paused) return;
-    const from = video.currentTime;
-    anchor = context.currentTime - from;
+    from = video.currentTime;
+    started = context.currentTime;
     for (const i of audible) {
       const buffer = lanes[i].buffer;
       if (from >= buffer.duration) continue;
       const source = context.createBufferSource();
       source.buffer = buffer;
-      source.connect(context.destination);
+      source.playbackRate.value = rate;
+      source.connect(master);
       source.start(0, from);
       playing.push(source);
     }
@@ -105,7 +142,8 @@
   function follow() {
     if (!video) return;
     now = video.currentTime;
-    if (playing.length > 0 && Math.abs(context.currentTime - anchor - now) > DRIFT) sound();
+    if (loop && now >= end) seek(start);
+    else if (playing.length > 0 && Math.abs(from + (context.currentTime - started) * rate - now) > DRIFT) sound();
     if (!video.paused) frame = requestAnimationFrame(follow);
   }
 
@@ -122,6 +160,14 @@
     if (video) now = video.currentTime;
   }
 
+  function ended() {
+    stopped();
+    if (loop) {
+      seek(start);
+      video?.play();
+    }
+  }
+
   const snap = (t: number) => Math.min(duration, Math.max(0, Math.round(t * fps) / fps));
 
   function seek(t: number) {
@@ -133,13 +179,48 @@
 
   function toggle() {
     if (!video) return;
-    if (video.paused) video.play();
-    else video.pause();
+    if (!video.paused) return video.pause();
+    if (loop && (now < start || now >= end - 1 / fps)) seek(start);
+    video.play();
+  }
+
+  const step = (frames: number) => (video?.pause(), seek(now + frames / fps));
+  const skip = (seconds: number) => seek(now + seconds);
+  const speed = (by: number) => (rate = RATES[Math.min(RATES.length - 1, Math.max(0, RATES.indexOf(rate) + by))]);
+  const loud = (by: number) => (view.volume = Math.round(Math.min(1, Math.max(0, view.volume + by)) * 100) / 100);
+
+  async function fill(on = !full) {
+    full = on;
+    await getCurrentWindow()
+      .setFullscreen(on)
+      .catch((e) => say(String(e), true));
+  }
+
+  function close() {
+    if (full) fill(false);
+    onclose();
   }
 
   function setLane(i: number, change: Partial<Pick<Lane, 'muted' | 'solo'>>) {
     Object.assign(lanes[i], change);
     sound();
+  }
+
+  function setMarks(marks: number[]) {
+    invoke('set_marks', { path: clip.path, at: marks }).catch((e) => say(String(e), true));
+  }
+
+  function mark() {
+    const t = snap(now);
+    if (clip.marks.some((m) => Math.abs(m - t) < 0.05)) return;
+    setMarks([...clip.marks, t]);
+    say(`Marked ${clock(t, true)}`);
+  }
+
+  function unmark(t: number) {
+    setMarks(clip.marks.filter((m) => m !== t));
+    say(`Removed the mark at ${clock(t, true)}`);
+    play?.focus();
   }
 
   function timeAt(event: PointerEvent): number {
@@ -175,11 +256,36 @@
     }
   }
 
+  const named = (path: string) => path.split(/[\\/]/).pop();
+
   async function exportCut(discord: boolean) {
     const out = await act(discord ? 'fitting' : 'saving', () =>
       invoke<string>('export', { path: clip.path, start, end, tracks: audible, mix: mix && audible.length > 1, discord })
     );
-    if (out) say(`Saved ${out.split(/[\\/]/).pop()}`);
+    if (out) say(`Saved ${named(out)}`);
+  }
+
+  async function still() {
+    if (!video?.videoWidth) return;
+    video.pause();
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d')?.drawImage(video, 0, 0);
+    const out = await act('frame', async () => {
+      const png = await new Promise<Blob | null>((done) => canvas.toBlob(done, 'image/png'));
+      if (!png) throw new Error("couldn't draw the frame");
+      const headers = { clip: encodeURIComponent(clip.path), at: String(now) };
+      return invoke<string>('save_frame', new Uint8Array(await png.arrayBuffer()), { headers });
+    });
+    if (out) say(`Saved ${named(out)}`);
+  }
+
+  function copy() {
+    invoke('copy_files', { paths: [clip.path] }).then(
+      () => say(`Copied ${title(clip)}, paste it into a chat or folder`),
+      (e) => say(String(e), true)
+    );
   }
 
   async function rename() {
@@ -194,20 +300,44 @@
   function remove() {
     video?.pause();
     discard([clip.path], title(clip));
-    onclose();
+    close();
   }
 
   function keys(e: KeyboardEvent) {
-    if (e.target instanceof HTMLInputElement || (e.target instanceof Element && e.target.closest('dialog'))) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target?.closest('dialog')) return;
+    if (e.ctrlKey || e.altKey || e.metaKey) {
+      if (e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'c' && !getSelection()?.toString()) {
+        e.preventDefault();
+        copy();
+      }
+      return;
+    }
+    // a focused button already answers space and enter
+    if (target instanceof HTMLButtonElement && (e.key === ' ' || e.key === 'Enter')) return;
     const keys: Record<string, () => void> = {
       ' ': toggle,
-      ArrowLeft: () => (video?.pause(), seek(now - 1 / fps)),
-      ArrowRight: () => (video?.pause(), seek(now + 1 / fps)),
+      k: toggle,
+      j: () => skip(-5),
+      l: () => skip(5),
+      ArrowLeft: () => step(-1),
+      ArrowRight: () => step(1),
+      ',': () => step(-1),
+      '.': () => step(1),
+      '<': () => speed(-1),
+      '>': () => speed(1),
+      ArrowUp: () => loud(0.05),
+      ArrowDown: () => loud(-0.05),
       i: () => (start = Math.min(snap(now), end - 1 / fps)),
       o: () => (end = Math.max(snap(now), start + 1 / fps)),
-      Escape: onclose
+      m: mark,
+      f: () => fill(),
+      'Shift+p': () => prev && onopen(prev),
+      'Shift+n': () => next && onopen(next),
+      Escape: () => (full ? fill(false) : close())
     };
-    const run = keys[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    const run = (e.shiftKey && keys[`Shift+${key}`]) || keys[key];
     if (!run) return;
     e.preventDefault();
     e.stopPropagation();
@@ -218,9 +348,17 @@
 <svelte:window onkeydown={keys} />
 
 <div class="toolbar">
-  <button class="gel back" title="Back (Esc)" onclick={onclose}>
+  <button class="gel back" title="Back (Esc)" onclick={close}>
     <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M6.5 1.5 3 5l3.5 3.5" /></svg><span>Back</span>
   </button>
+  <div class="gel-row steps">
+    <button class="gel icon" disabled={!prev} aria-label="Previous clip" title="Previous clip (Shift+P)" onclick={() => prev && onopen(prev)}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5" /></svg>
+    </button>
+    <button class="gel icon" disabled={!next} aria-label="Next clip" title="Next clip (Shift+N)" onclick={() => next && onopen(next)}>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" /></svg>
+    </button>
+  </div>
   {#if naming !== null}
     <!-- svelte-ignore a11y_autofocus -->
     <input
@@ -245,18 +383,20 @@
   <button class="gel danger" disabled={busy !== ''} onclick={remove}>Delete</button>
 </div>
 
-<div class="theater">
+<div class="theater" class:full>
   <div class="screen">
     <!-- svelte-ignore a11y_media_has_caption -->
     <video
       bind:this={video}
       src={convertFileSrc(clip.path)}
+      crossorigin="anonymous"
       muted
       preload="auto"
       onclick={toggle}
+      ondblclick={() => fill()}
       onplay={played}
       onpause={stopped}
-      onended={stopped}
+      onended={ended}
       onseeked={sound}
       onloadedmetadata={(e) => {
         duration = e.currentTarget.duration;
@@ -267,14 +407,32 @@
 
   <div class="dock">
     <div class="transport">
-      <button class="gel" onclick={toggle} aria-label={paused ? 'Play' : 'Pause'}>
+      <button class="gel" bind:this={play} onclick={toggle} aria-label={paused ? 'Play' : 'Pause'} title="{paused ? 'Play' : 'Pause'} (Space or K)">
         <svg viewBox="0 0 12 12" aria-hidden="true">
           {#if paused}<path d="M3 1.5v9l7.5-4.5z" />{:else}<path d="M2.5 1.5h2.5v9H2.5zM7 1.5h2.5v9H7z" />{/if}
         </svg>
       </button>
       <span class="mono time"><b>{clock(now, true)}</b> / {clock(duration, true)}</span>
+      <select class="field rate" aria-label="Speed" title="Speed (&lt; and &gt;)" bind:value={rate}>
+        {#each RATES as r (r)}<option value={r}>{r}x</option>{/each}
+      </select>
+      <button class="gel" aria-pressed={loop} title="Repeat the cut" onclick={() => (loop = !loop)}>Loop</button>
+      <label class="volume" title="Volume (Up and Down)">
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 6h2.5l3.5-3v10l-3.5-3H2.5z" />
+          {#if view.volume > 0}<path d="M11 5.5a3.5 3.5 0 0 1 0 5" />{/if}
+          {#if view.volume > 0.5}<path d="M12.8 3.6a6 6 0 0 1 0 8.8" />{/if}
+        </svg>
+        <input type="range" min="0" max="1" step="0.05" aria-label="Volume" aria-valuetext="{Math.round(view.volume * 100)}%" bind:value={view.volume} />
+      </label>
       <span class="grow"></span>
-      <span class="form-hint">Space plays, arrows step a frame, I and O set the cut</span>
+      <span class="form-hint">K plays, J and L skip, I and O cut, M marks, ? lists every key</span>
+      <button class="gel" disabled={busy !== ''} title="Save this frame as a png beside the clip" onclick={still}>Save frame</button>
+      <button class="gel icon" aria-pressed={full} aria-label="Fill the screen" title="{full ? 'Leave' : 'Fill'} the screen (F)" onclick={() => fill()}>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          {#if full}<path d="M6 2.5V6H2.5M10 2.5V6h3.5M6 13.5V10H2.5M10 13.5V10h3.5" />{:else}<path d="M2.5 6V2.5H6M13.5 6V2.5H10M2.5 10v3.5H6M13.5 10v3.5H10" />{/if}
+        </svg>
+      </button>
     </div>
     <div class="tracks">
       <span class="lane-label mono">Time</span>
@@ -285,9 +443,15 @@
             class="mark"
             style:left={pct(at)}
             aria-label="Mark at {clock(at, true)}"
-            title="Marked at {clock(at, true)}"
+            title="Marked at {clock(at, true)}, Del removes it"
             onpointerdown={(e) => e.stopPropagation()}
             onclick={() => (video?.pause(), seek(at))}
+            onkeydown={(e) => {
+              if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+              e.preventDefault();
+              e.stopPropagation();
+              unmark(at);
+            }}
           ></button>
         {/each}
         <div class="handle" style:left={pct(start)} role="presentation" onpointerdown={(e) => drag(e, 'in')}></div>
@@ -325,12 +489,31 @@
         <div><dt>Size</dt><dd>{size(clip.bytes)}</dd></div>
         <div><dt>Frame rate</dt><dd>{clip.fps ? `${Math.round(clip.fps)} fps` : 'unknown'}</dd></div>
         <div><dt>Tracks</dt><dd>{loading ? '...' : lanes.length}</dd></div>
-        <div><dt>Marks</dt><dd>{clip.marks.length || 'none'}</dd></div>
       </dl>
       <div class="gel-row">
         <button class="gel" onclick={() => invoke('open', { path: clip.path })}>Open</button>
         <button class="gel" onclick={() => invoke('reveal', { path: clip.path })}>Show in folder</button>
+        <button class="gel" title="Copy the file to paste into a chat or folder (Ctrl+C)" onclick={copy}>Copy file</button>
       </div>
+    </section>
+
+    <section class="panel">
+      <h3 class="panel-head">Marks</h3>
+      {#if clip.marks.length}
+        <ul class="marks">
+          {#each clip.marks as at (at)}
+            <li>
+              <button class="mark-time mono" title="Go to the mark" onclick={() => (video?.pause(), seek(at))}>{clock(at, true)}</button>
+              <button class="lane-key" aria-label="Remove the mark at {clock(at, true)}" title="Remove" onclick={() => unmark(at)}>
+                <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5" /></svg>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="form-hint">M marks the moment under the playhead.</p>
+      {/if}
+      <button class="gel wide" onclick={mark}>Mark {clock(snap(now), true)}</button>
     </section>
 
     <section class="panel">

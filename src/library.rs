@@ -68,7 +68,9 @@ impl Marks {
     }
 
     pub fn mark(&mut self, folder: &Path, path: &Path, at: Vec<f64>) {
-        if !at.is_empty() {
+        if at.is_empty() {
+            self.marked.remove(&key(folder, path));
+        } else {
             self.marked.insert(key(folder, path), at);
         }
     }

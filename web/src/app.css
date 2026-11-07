@@ -397,6 +397,20 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .cut-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .cut-facts div:nth-child(n) { background: var(--row-a); }
 .panel .seg { align-self: flex-start; }
+.theater.full { position: fixed; inset: 0; z-index: 35; grid-template-columns: minmax(0, 1fr); grid-template-areas: "screen" "dock"; }
+.theater.full .inspector { display: none; }
+.gel.icon { padding: 2px 6px; }
+.gel.icon svg, .volume svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.steps { flex-wrap: nowrap; gap: 3px; }
+.field.rate { width: 64px; }
+.volume { display: flex; align-items: center; gap: 6px; color: var(--fg-2); }
+.volume input { width: 90px; }
+.transport .form-hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.marks { display: flex; flex-wrap: wrap; gap: 4px; list-style: none; }
+.marks li { display: flex; align-items: center; gap: 2px; }
+.mark-time { padding: 1px 6px; font-size: var(--t-small); color: #f2f2f2; background: var(--row-b); border: 1px solid #0a0a0a; border-radius: var(--r-tight); }
+.mark-time:hover { background: var(--bg-up); }
+.marks .lane-key svg { width: 8px; height: 8px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
 
 .stage.wide { grid-column: 2 / -1; }
 .settings { display: flex; flex-direction: column; }

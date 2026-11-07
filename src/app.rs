@@ -242,6 +242,9 @@ fn serve() -> Result<(), String> {
             star,
             rename,
             delete,
+            set_marks,
+            save_frame,
+            copy_files,
             save_thumb,
             track_audio,
             export,
@@ -986,6 +989,70 @@ fn delete(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<
 }
 
 #[tauri::command]
+fn set_marks(app: AppHandle, shared: State<Shared>, path: PathBuf, mut at: Vec<f64>) -> Result<(), String> {
+    clip_in_folder(&shared, &path)?;
+    at.retain(|t| t.is_finite() && *t >= 0.0);
+    at.sort_by(f64::total_cmp);
+    at.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+    marked(&shared, |marks, folder| marks.mark(folder, &path, at))?;
+    let _ = app.emit("clips", ());
+    Ok(())
+}
+
+/// Saves the png the webview drew of a paused frame beside its clip. The body is the png, so a 4k
+/// frame isn't sent as a json list of numbers, and the headers say which clip and when.
+#[tauri::command]
+fn save_frame(shared: State<Shared>, request: tauri::ipc::Request) -> Result<PathBuf, String> {
+    let header = |name: &str| {
+        let value = request.headers().get(name).and_then(|v| v.to_str().ok());
+        value.and_then(unescape).ok_or_else(|| format!("the frame came without its {name}"))
+    };
+    let path = PathBuf::from(header("clip")?);
+    let at: f64 = header("at")?.parse().map_err(|_| "the frame's time isn't a number")?;
+    clip_in_folder(&shared, &path)?;
+    let tauri::ipc::InvokeBody::Raw(png) = request.body() else {
+        return Err("the frame has to come as bytes".into());
+    };
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("a frame has to be a png".into());
+    }
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let (minutes, seconds) = ((at / 60.0).floor(), at % 60.0);
+    let out = (1..)
+        .map(|n| match n {
+            1 => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s.png")),
+            n => path.with_file_name(format!("{stem} {minutes}m{seconds:05.2}s {n}.png")),
+        })
+        .find(|out| !out.exists())
+        .expect("some name is free");
+    std::fs::write(&out, png).map_err(|e| format!("couldn't save the frame: {e}"))?;
+    Ok(out)
+}
+
+/// Undoes the webview's encodeURIComponent, which is how a path fits in a header.
+fn unescape(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let [first, tail @ ..] = rest {
+        if *first == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(*first);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+#[tauri::command]
+fn copy_files(window: WebviewWindow, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
+    paths.iter().try_for_each(|path| clip_in_folder(&shared, path))?;
+    crate::clipboard::copy_files(window.hwnd().map_err(|e| e.to_string())?, &paths)
+}
+
+#[tauri::command]
 fn save_thumb(shared: State<Shared>, path: PathBuf, jpeg: Vec<u8>) -> Result<PathBuf, String> {
     clip_in_folder(&shared, &path)?;
     if !jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -1228,6 +1295,14 @@ async fn windowed_apps() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unescape_reads_what_encode_uri_component_writes() {
+        assert_eq!(unescape("D%3A%5Cclips%5Cpython%20%C3%A9.mp4").as_deref(), Some(r"D:\clips\python é.mp4"));
+        assert_eq!(unescape("50%"), None);
+        assert_eq!(unescape("%zz"), None);
+        assert_eq!(unescape("%C3"), None);
+    }
 
     #[test]
     fn a_marked_clip_saves_after_the_newest_mark_while_it_still_holds_the_first() {

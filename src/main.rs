@@ -4,6 +4,7 @@ mod app;
 mod art;
 mod audio;
 mod capture;
+mod clipboard;
 mod encode;
 mod export;
 mod focus;

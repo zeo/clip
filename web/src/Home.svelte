@@ -9,7 +9,7 @@
     grouped,
     buffer,
     onopen
-  }: { clips: Clip[]; shown: Clip[]; status: Status; grouped: boolean; buffer: number; onopen: (clip: Clip) => void } = $props();
+  }: { clips: Clip[]; shown: Clip[]; status: Status; grouped: boolean; buffer: number; onopen: (clip: Clip, list: Clip[]) => void } = $props();
   const since = Date.now() - 7 * 864e5;
   const recent = $derived(clips.filter((clip) => clip.modified >= since));
   const feed = $derived(shown.filter((clip) => clip.modified >= since));

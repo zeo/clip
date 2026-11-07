@@ -13,6 +13,7 @@ export const view = $state({
   card: 220,
   list: false,
   sort: 'newest' as Query['sort'],
+  volume: 1,
   ...stored,
   side: { home: false, library: true, ...stored.side }
 });
@@ -36,6 +37,8 @@ const drop = (id: number) => {
 export function say(text: string, bad = false, undo?: () => void) {
   const id = ++made;
   toasts.push({ id, text, bad, undo: undo && (() => (drop(id), undo())) });
+  // a burst of quick actions keeps the latest few on screen, and every undo stays reachable
+  while (toasts.length > 3 && toasts.some((t) => !t.undo)) toasts.splice(toasts.findIndex((t) => !t.undo), 1);
   setTimeout(() => drop(id), bad || undo ? 8000 : 4000);
 }
 

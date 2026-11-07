@@ -48,6 +48,17 @@
   let sheet = $state<HTMLDialogElement>();
   let query = $state({ search: '' });
   const current = $derived(clips.find((clip) => clip.path === opened));
+  // the list the clip was opened from, for stepping to the clip before or after it
+  let siblings = $state<string[]>([]);
+  const step = $derived.by(() => {
+    const at = siblings.indexOf(opened ?? '');
+    const near = (n: number) => (at < 0 ? undefined : clips.find((clip) => clip.path === siblings[at + n]));
+    return { prev: near(-1), next: near(1) };
+  });
+  function open(clip: Clip, list?: Clip[]) {
+    if (list) siblings = list.map((c) => c.path);
+    opened = clip.path;
+  }
   const listed = $derived(games(clips));
   const show = $derived(game || shelf === 'games' ? 'all' : shelf);
   const shown = $derived(choose(clips, { ...query, sort: view.sort, show }));
@@ -87,6 +98,7 @@
         [['Shift+Space', 'Shift+Click'], 'Select every clip up to it'],
         [['Ctrl+A'], 'Select all'],
         [['S'], 'Star or unstar'],
+        [['Ctrl+C'], 'Copy the files to paste anywhere'],
         [['Del'], 'Delete, with a few seconds to undo'],
         [['Ctrl+Z'], 'Undo the delete'],
         [['Esc'], 'Clear the selection'],
@@ -97,9 +109,17 @@
     [
       'Playing a clip',
       [
-        [['Space'], 'Play or pause'],
-        [['Left', 'Right'], 'Step a frame'],
-        [['I', 'O'], 'Set where the cut starts and ends']
+        [['Space', 'K'], 'Play or pause'],
+        [['J', 'L'], 'Back or ahead 5 seconds'],
+        [['Left', 'Right', ',', '.'], 'Step a frame'],
+        [['<', '>'], 'Slower or faster'],
+        [['Up', 'Down'], 'Volume'],
+        [['I', 'O'], 'Set where the cut starts and ends'],
+        [['M'], 'Mark the moment'],
+        [['Del'], 'Remove the mark in focus'],
+        [['F'], 'Fill the screen'],
+        [['Shift+P', 'Shift+N'], 'Previous or next clip'],
+        [['Ctrl+C'], 'Copy the file to paste anywhere']
       ]
     ],
     [
@@ -377,8 +397,12 @@
         {#key current.path}
           <ClipPage
             clip={current}
+            prev={step.prev}
+            next={step.next}
+            onopen={open}
             onclose={() => (opened = null)}
             onmoved={async (to) => {
+              siblings = siblings.map((path) => (path === opened ? to : path));
               await refresh();
               opened = to;
             }}
@@ -442,9 +466,9 @@
           <input class="field search" type="search" placeholder="Search" aria-label="Search clips and games" bind:value={query.search} />
         </div>
         {#if area === 'home'}
-          <Home {clips} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={(clip) => (opened = clip.path)} />
+          <Home {clips} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={open} />
         {:else if game || shelf === 'games'}
-          <Games {clips} {shown} app={game} grouped={view.sort === 'newest'} onpick={(app) => browse('games', app)} onopen={(clip) => (opened = clip.path)} />
+          <Games {clips} {shown} app={game} grouped={view.sort === 'newest'} onpick={(app) => browse('games', app)} onopen={open} />
         {:else}
           <div class="view">
             {#if shown.length === 0}
@@ -452,7 +476,7 @@
                 {query.search ? 'No clips match.' : shelf === 'starred' ? 'Star a clip and it stays here. The storage limit never deletes it.' : 'No clips here yet.'}
               </p>
             {:else}
-              <Clips clips={shown} grouped={view.sort === 'newest'} onopen={(clip) => (opened = clip.path)} />
+              <Clips clips={shown} grouped={view.sort === 'newest'} onopen={open} />
             {/if}
           </div>
         {/if}

@@ -6,11 +6,11 @@
   import { cards, discard, reduced, say, view } from './view.svelte';
 
   let {
-    clips,
+    clips: listed,
     onopen,
     showApp = true,
     grouped = true
-  }: { clips: Clip[]; onopen: (clip: Clip) => void; showApp?: boolean; grouped?: boolean } = $props();
+  }: { clips: Clip[]; onopen: (clip: Clip, list: Clip[]) => void; showApp?: boolean; grouped?: boolean } = $props();
   let hovered = $state<string | null>(null);
   let box = $state<HTMLElement>();
   const uid = $props.id();
@@ -19,9 +19,6 @@
   const selected = new SvelteSet<string>();
   // where a shift click's range starts
   let anchor: string | null = null;
-  const picked = $derived(clips.filter((clip) => selected.has(clip.path)));
-  const allStarred = $derived(picked.length > 0 && picked.every((clip) => clip.starred));
-  const stop = $derived(clips.some((clip) => clip.path === focused) ? focused : (clips[0]?.path ?? null));
   const columns: [string, Query['sort'] | null][] = [
     ['Name', 'name'],
     ['Game', 'game'],
@@ -33,15 +30,20 @@
 
   // clips come newest first and each session's clips sit together in that order, unless sorted otherwise
   const sessions = $derived.by(() => {
-    if (!grouped) return clips.length > 0 ? [clips] : [];
+    if (!grouped) return listed.length > 0 ? [listed] : [];
     const groups = new Map<number, Clip[]>();
-    for (const clip of clips) {
+    for (const clip of listed) {
       const group = groups.get(clip.session);
       if (group) group.push(clip);
       else groups.set(clip.session, [clip]);
     }
     return [...groups.values()];
   });
+  // the order they're drawn in, which every key, range and next clip follows
+  const clips = $derived(sessions.flat());
+  const picked = $derived(clips.filter((clip) => selected.has(clip.path)));
+  const allStarred = $derived(picked.length > 0 && picked.every((clip) => clip.starred));
+  const stop = $derived(clips.some((clip) => clip.path === focused) ? focused : (clips[0]?.path ?? null));
 
   const when = (clip: Clip) => `${day(clip.modified)} ${at(clip.modified)}`;
 
@@ -53,7 +55,6 @@
     }
   }
 
-  // clips are in the order they're drawn, so a range runs across sessions as it looks
   function pick(clip: Clip, range: boolean) {
     const from = anchor === null ? -1 : clips.findIndex((c) => c.path === anchor);
     const to = clips.indexOf(clip);
@@ -65,6 +66,13 @@
       selected.add(clip.path);
     }
     anchor = clip.path;
+  }
+
+  function copy(files: Clip[]) {
+    invoke('copy_files', { paths: files.map((clip) => clip.path) }).then(
+      () => say(`Copied ${files.length === 1 ? title(files[0]) : `${files.length} clips`}, paste into a chat or folder`),
+      (e) => say(String(e), true)
+    );
   }
 
   function remove(gone: Clip[]) {
@@ -126,8 +134,11 @@
     if (mod && e.key.toLowerCase() === 'a') {
       e.preventDefault();
       for (const c of clips) selected.add(c.path);
+    } else if (mod && e.key.toLowerCase() === 'c' && !e.altKey) {
+      e.preventDefault();
+      copy(picked.length > 0 ? picked : [clip]);
     } else if (e.key === 'Enter' && !mod) {
-      onopen(clip);
+      onopen(clip, clips);
     } else if (e.key === ' ' && !mod) {
       e.preventDefault();
       pick(clip, e.shiftKey);
@@ -211,7 +222,7 @@
             onfocus={() => (focused = clip.path)}
             onpointerenter={() => (hovered = clip.path)}
             onpointerleave={() => hovered === clip.path && (hovered = null)}
-            onclick={(e) => (picked.length > 0 || e.shiftKey || e.ctrlKey ? pick(clip, e.shiftKey) : onopen(clip))}
+            onclick={(e) => (picked.length > 0 || e.shiftKey || e.ctrlKey ? pick(clip, e.shiftKey) : onopen(clip, clips))}
           >
             <!-- the title comes first, so it starts the name a screen reader gives the card, and css draws the still above it -->
             <span class="clip-name">{title(clip)}</span>
@@ -267,6 +278,7 @@
     <button class="gel" onclick={() => act('star', { paths: picked.map((clip) => clip.path), on: !allStarred })}>
       {allStarred ? 'Unstar' : 'Star'}
     </button>
+    <button class="gel" onclick={() => copy(picked)}>Copy <kbd>Ctrl+C</kbd></button>
     <button class="gel danger" onclick={() => remove(picked)}>Delete <kbd>Del</kbd></button>
     <button class="gel" onclick={() => selected.clear()}>Clear <kbd>Esc</kbd></button>
   </div>

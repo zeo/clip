@@ -20,7 +20,7 @@
     app: string | null;
     grouped: boolean;
     onpick: (app: string) => void;
-    onopen: (clip: Clip) => void;
+    onopen: (clip: Clip, list: Clip[]) => void;
   } = $props();
   const all = $derived(games(clips));
   const listed = $derived(games(shown));
