@@ -5,6 +5,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import Bind from './Bind.svelte';
   import { length, ramMB, size, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
+  import { radios, reduced, say, view, zooms } from './view.svelte';
 
   let {
     first,
@@ -32,6 +33,7 @@
     {
       name: 'App',
       pages: [
+        { id: 'appearance', title: 'Appearance', blurb: 'How big everything is, and clips playing on hover', path: 'M2.5 15 6.5 5l4 10M4 11.5h5M12 15l2.75-6.5L17.5 15M13 12.8h3.5' },
         { id: 'sounds', title: 'Sound alerts', blurb: 'The sound that says a clip was saved', path: 'M6 13V9a4 4 0 0 1 8 0v4l1.5 1.5h-11zM8.5 16.5h3' },
         { id: 'notifications', title: 'Notifications', blurb: 'A Windows notification for each saved clip', path: 'M3.5 4h13v9h-6l-3.5 3v-3H3.5z' },
         { id: 'startup', title: 'Startup and window', blurb: 'When clip opens and what closing the window does', path: 'M10 3v6M6.2 5.8a6 6 0 1 0 7.6 0' },
@@ -183,6 +185,7 @@
     error = '';
     try {
       await invoke('apply', { settings: draft });
+      say(restarts ? 'Settings applied, a new buffer started' : 'Settings applied');
       saved = JSON.stringify(draft);
       onapplied();
     } catch (e) {
@@ -204,9 +207,9 @@
   </header>
 {/snippet}
 
-{#snippet slider(name: string, max = 200)}
+{#snippet slider(name: string, label: string)}
   {@const value = draft?.volumes[name] ?? 100}
-  <input type="range" min="0" {max} step="5" aria-label="Volume" {value} oninput={(e) => volume(name, Number(e.currentTarget.value))} />
+  <input type="range" min="0" max="200" step="5" aria-label="{label} volume" {value} oninput={(e) => volume(name, Number(e.currentTarget.value))} />
   <span class="mono readout">{value}%</span>
 {/snippet}
 
@@ -328,7 +331,7 @@
             <div class="rows">
               <div class="row">
                 <span class="row-label">Preset</span>
-                <div class="seg" role="radiogroup" aria-label="Preset">
+                <div class="seg" role="radiogroup" aria-label="Preset" use:radios>
                   {#each presets as p (p.name)}
                     <button
                       role="radio"
@@ -381,7 +384,7 @@
               {#each lanes as lane (lane.name)}
                 <div class="row">
                   <span class="row-label">{lane.label} volume<small>{lane.hint}</small></span>
-                  {@render slider(lane.name)}
+                  {@render slider(lane.name, lane.label)}
                 </div>
               {/each}
               {#each choices(playing, draft.apps) as exe (exe)}
@@ -391,7 +394,7 @@
                     <input type="checkbox" checked={draft.apps.includes(exe)} onchange={(e) => pick('apps', exe, e.currentTarget.checked)} />
                     <span class="mono">{exe} on its own track</span>
                   </label>
-                  {#if draft.apps.includes(exe)}{@render slider(name)}{/if}
+                  {#if draft.apps.includes(exe)}{@render slider(name, exe)}{/if}
                 </div>
               {:else}
                 <div class="row"><span class="row-label dim">No other app is playing sound right now</span></div>
@@ -415,7 +418,7 @@
               </label>
               <div class="row">
                 <span class="row-label">Microphone volume<small>Applied to its track</small></span>
-                {@render slider('mic')}
+                {@render slider('mic', 'Microphone')}
               </div>
               <div class="row">
                 <span class="row-label">Test microphone level<small>{mics.length ? 'Speak and watch the bar for up to 10 s' : 'No microphone is plugged in'}</small></span>
@@ -459,6 +462,29 @@
               <label class="row">
                 <span class="row-label">Keep clips for<small>Days</small></span>
                 <input class="field" type="number" min="0" step="1" bind:value={draft.keepDays} />
+              </label>
+            </div>
+          </section>
+        </section>
+      {/if}
+
+      {#if drawn('appearance')}
+        <section data-page="appearance">
+          {@render head('appearance')}
+          <section class="group">
+            <p class="form-hint">These change this window straight away, with nothing to apply.</p>
+            <div class="rows">
+              <label class="row">
+                <span class="row-label">Size<small>Ctrl+= and Ctrl+- change it from anywhere in clip, Ctrl+0 goes back to 100%</small></span>
+                <select class="field" bind:value={view.zoom}>
+                  {#each zooms as z (z)}<option value={z}>{z}%</option>{/each}
+                </select>
+              </label>
+              <label class="row">
+                <span class="row-label"
+                  >Play clips on hover<small>{reduced.current ? 'Off while Windows has animation effects turned off' : 'A card plays its clip, muted, while the pointer is on it'}</small></span
+                >
+                <input type="checkbox" bind:checked={view.previews} disabled={reduced.current} />
               </label>
             </div>
           </section>
@@ -518,7 +544,7 @@
               </label>
               <div class="row">
                 <span class="row-label">Closing the window</span>
-                <div class="choices" role="radiogroup" aria-label="Closing the window">
+                <div class="choices" role="radiogroup" aria-label="Closing the window" use:radios>
                   {#each [[true, 'Hide to tray', 'Keeps recording'], [false, 'Quit', 'Stops recording']] as const as [tray, label, hint] (label)}
                     <button class="choice" role="radio" aria-checked={draft.closeToTray === tray} onclick={() => (draft!.closeToTray = tray)}>
                       <b>{label}</b><small>{hint}</small>
@@ -550,7 +576,7 @@
     {#if changed || first || error}
       <div class="applybar">
         <span class="grow">
-          {#if error}<span class="form-error">{error}</span>
+          {#if error}<span class="form-error" role="alert">{error}</span>
           {:else if first}clip is already recording with these. Change anything, then apply.
           {:else if restarts}Unsaved changes. Applying starts a new buffer, so what it holds now is dropped.
           {:else}Unsaved changes. They apply without touching the buffer.{/if}

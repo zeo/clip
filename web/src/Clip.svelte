@@ -3,6 +3,7 @@
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
+  import { radios, say } from './view.svelte';
 
   let { clip, onclose, onmoved }: { clip: Clip; onclose: () => void; onmoved: (path: string) => void } = $props();
 
@@ -24,7 +25,6 @@
   let loading = $state(true);
   let mix = $state(true);
   let busy = $state('');
-  let note = $state('');
   let error = $state('');
   let naming = $state<string | null>(null);
   const fps = $derived(clip.fps || 60);
@@ -166,7 +166,6 @@
   async function act<T>(label: string, work: () => Promise<T>): Promise<T | undefined> {
     busy = label;
     error = '';
-    note = '';
     try {
       return await work();
     } catch (e) {
@@ -180,7 +179,7 @@
     const out = await act(discord ? 'fitting' : 'saving', () =>
       invoke<string>('export', { path: clip.path, start, end, tracks: audible, mix: mix && audible.length > 1, discord })
     );
-    if (out) note = `Saved ${out.split(/[\\/]/).pop()}`;
+    if (out) say(`Saved ${out.split(/[\\/]/).pop()}`);
   }
 
   async function rename() {
@@ -198,7 +197,7 @@
   }
 
   function keys(e: KeyboardEvent) {
-    if (e.target instanceof HTMLInputElement) return;
+    if (e.target instanceof HTMLInputElement || (e.target instanceof Element && e.target.closest('dialog'))) return;
     const keys: Record<string, () => void> = {
       ' ': toggle,
       ArrowLeft: () => (video?.pause(), seek(now - 1 / fps)),
@@ -297,11 +296,11 @@
       {#each lanes as lane, i (i)}
         <div class="lane-label" class:quiet={!audible.includes(i)}>
           <span class="lane-name">{lane.name}</span>
-          <button class="lane-key" aria-pressed={lane.muted} title="Mute" onclick={() => setLane(i, { muted: !lane.muted })}>M</button>
-          <button class="lane-key" aria-pressed={lane.solo} title="Solo" onclick={() => setLane(i, { solo: !lane.solo })}>S</button>
+          <button class="lane-key" aria-pressed={lane.muted} aria-label="Mute {lane.name}" title="Mute" onclick={() => setLane(i, { muted: !lane.muted })}>M</button>
+          <button class="lane-key" aria-pressed={lane.solo} aria-label="Solo {lane.name}" title="Solo" onclick={() => setLane(i, { solo: !lane.solo })}>S</button>
         </div>
         <div class="wave" class:quiet={!audible.includes(i)}>
-          <svg viewBox="0 0 {PEAKS} 100" preserveAspectRatio="none"><path d={lane.peaks} /></svg>
+          <svg aria-hidden="true" viewBox="0 0 {PEAKS} 100" preserveAspectRatio="none"><path d={lane.peaks} /></svg>
           <div class="shade" style:right={`calc(100% - ${pct(start)})`}></div>
           <div class="shade" style:left={pct(end)}></div>
           <div class="playhead" style:left={pct(now)}></div>
@@ -340,7 +339,7 @@
         <div><dt>Out</dt><dd>{clock(end, true)}</dd></div>
         <div><dt>Keeps</dt><dd>{(end - start).toFixed(2)} s</dd></div>
       </dl>
-      <div class="seg" role="radiogroup" aria-label="Audio in the copy">
+      <div class="seg" role="radiogroup" aria-label="Audio in the copy" use:radios>
         <button role="radio" aria-checked={mix} onclick={() => (mix = true)}>Mix to one</button>
         <button role="radio" aria-checked={!mix} onclick={() => (mix = false)}>Keep tracks</button>
       </div>
@@ -351,8 +350,7 @@
       <button class="gel wide" disabled={busy !== ''} onclick={() => exportCut(true)} title="Under 20 MB, one audio track">
         {busy === 'fitting' ? 'Fitting' : 'Copy for Discord'}
       </button>
-      {#if note}<p class="form-hint">{note}</p>{/if}
-      {#if error}<p class="form-error">{error}</p>{/if}
+      {#if error}<p class="form-error" role="alert">{error}</p>{/if}
     </section>
   </aside>
 </div>

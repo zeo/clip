@@ -39,7 +39,7 @@ use crate::library::{self, Clip, Marks};
 use crate::ring::SECOND;
 use crate::{hdr, toast, Options, Session};
 
-// capscr's shutter played backwards, so the two apps are told apart by ear
+// capscr's capture sound
 static SAVED: &[u8] = include_bytes!("../assets/saved.wav");
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const WM_RESTART: u32 = WM_APP;
@@ -622,6 +622,16 @@ fn record(
                 Err(e) => toast::show(id, "Clip not saved", e, None, true),
             };
         }
+        // the window says it too, where a screen reader hears it
+        let _ = app.emit(
+            "saved",
+            match &saved {
+                Ok((saved, _)) => {
+                    (format!("Saved {:.0} s of {}, {}", saved.seconds, recording.app, size(saved.bytes as u64)), false)
+                }
+                Err(e) => (format!("Clip not saved: {e}"), true),
+            },
+        );
         match saved {
             Ok((saved, out)) => {
                 let mut marks = marks.lock().expect("marks poisoned");

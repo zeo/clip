@@ -50,7 +50,7 @@
 
   --fg-1: #e8e8e8;
   --fg-2: #a8a8a8;
-  --fg-3: #858585;
+  --fg-3: #8c8c8c;
   --link: #7eb8ff;
   --bad: #ff7a6e;
   --good: #8fc46a;
@@ -243,7 +243,6 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .err .dot { background: radial-gradient(circle at 50% 30%, #ffd27a, #c88a14); }
 .err { color: var(--bad); }
 @keyframes breathe { 50% { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6), 0 0 2px rgba(255, 70, 50, 0.2); } }
-@media (prefers-reduced-motion: reduce) { .on .dot { animation: none; } }
 .bar-actions { display: flex; align-items: center; gap: 8px; padding: 0 12px; }
 .bar-actions .default { min-width: 92px; }
 .controls { display: flex; border-left: 1px solid rgba(0, 0, 0, 0.55); }
@@ -347,6 +346,7 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .handle { position: absolute; top: -3px; bottom: -3px; width: 10px; margin-left: -5px; background: var(--grad-aqua-default); border: 1px solid #0e3265; border-radius: var(--r-tight); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5); cursor: ew-resize; touch-action: none; }
 .mark { position: absolute; bottom: -1px; width: 9px; height: 9px; margin-left: -4.5px; background: var(--good); transform: rotate(45deg) scale(0.8); }
 .mark:hover, .mark:focus-visible { transform: rotate(45deg); outline: none; box-shadow: 0 0 0 2px var(--well); }
+.mark:focus-visible { box-shadow: 0 0 0 2px var(--well), 0 0 0 4px var(--link); }
 .playhead { position: absolute; top: 0; bottom: 0; width: 1px; margin-left: -0.5px; background: #fff; pointer-events: none; }
 .timeline .playhead::before { content: ""; position: absolute; top: -1px; left: -4px; border: 4.5px solid transparent; border-top-color: #fff; }
 .wave { height: 42px; overflow: hidden; }
@@ -410,6 +410,48 @@ input[type="number"].field { width: 90px; font-family: var(--font-mono); font-si
 .meter > span:has(+ .ours) { background: #4a4a4a; }
 .applybar { flex: none; display: flex; align-items: center; gap: 8px; padding: 7px 14px; background: linear-gradient(to bottom, #2a2a2a, #1e1e1e); border-top: 1px solid #050505; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06); font-size: var(--t-small); color: var(--fg-2); }
 .applybar .default { min-width: 72px; }
+
+.toasts { position: fixed; z-index: 40; left: 50%; bottom: 20px; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 6px; pointer-events: none; }
+.toast { max-width: min(560px, 80vw); padding: 6px 14px; font-size: var(--t-small); color: #f2f2f2; text-shadow: 0 -1px 0 rgba(0, 0, 0, 0.6); background: linear-gradient(to bottom, #3a3a3a, #262626); border: 1px solid #050505; border-radius: var(--r-button); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 8px 24px rgba(0, 0, 0, 0.6); }
+.toast.bad { color: var(--bad); }
+
+.sheet { margin: auto; width: min(560px, calc(100vw - 48px)); max-height: calc(100vh - 80px); padding: 0; color: var(--fg-1); background: var(--bg-paper); border: 1px solid #050505; border-radius: 6px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 18px 48px rgba(0, 0, 0, 0.75); }
+.sheet::backdrop { background: rgba(0, 0, 0, 0.55); }
+.sheet-body { padding: 14px 18px 18px; }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.sheet-head h2 { font-family: var(--font-myriad); font-size: 18px; color: #f2f2f2; }
+.sheet .side-head { margin: 14px 0 6px; }
+.sheet-rows { border: 1px solid #0a0a0a; border-radius: 4px; overflow: hidden; }
+.sheet-rows div { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 12px; align-items: center; min-height: 30px; padding: 4px 12px; background: var(--row-a); }
+.sheet-rows div:nth-child(even) { background: var(--row-b); }
+.sheet-rows dt { white-space: nowrap; }
+.sheet-rows dd { color: var(--fg-2); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+  .cover:hover .cover-art { transform: none; }
+}
+
+/* high contrast themes drop every gradient and shadow, so state moves to borders and the system highlight */
+@media (forced-colors: active) {
+  .gel, .seg, .field, .choice, .clip, .storage, .now, .quick, .toast, .sheet, .rows, .facts, .lane-key, .hotkey kbd, .key, .timeline, .wave, .meter { border: 1px solid CanvasText; }
+  .seg button + button { border-left: 1px solid CanvasText; }
+  .gel:disabled { border-color: GrayText; color: GrayText; }
+  [aria-current="page"], [aria-checked="true"], [aria-pressed="true"], .clip.picked, .switch:checked, .meter > span, .kept, .handle, .on .dot {
+    forced-color-adjust: none; background: Highlight !important; color: HighlightText !important;
+  }
+  [aria-current="page"] *, [aria-checked="true"] *, [aria-pressed="true"] *, .clip.picked * { color: HighlightText; }
+  .star[aria-pressed="true"] svg { fill: HighlightText; stroke: HighlightText; }
+  .pick[aria-pressed="true"] svg { stroke: HighlightText; }
+  .switch { forced-color-adjust: none; background: Canvas; border: 1px solid CanvasText; }
+  .switch::after { background: CanvasText; }
+  .switch:checked::after { background: HighlightText; }
+  .playhead, .mark, .dot { forced-color-adjust: none; background: CanvasText; }
+  .wave path { stroke: CanvasText; }
+  .star, .pick { opacity: 1; border: 1px solid CanvasText; }
+  :focus-visible, .clip-open:focus-visible { outline: 2px solid Highlight; }
+  .mark:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+}
 
 @media (max-width: 1180px) {
   .hotkeys { display: none; }

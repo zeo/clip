@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
+  import { getCurrentWebview } from '@tauri-apps/api/webview';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { art } from './art.svelte';
   import ClipPage from './Clip.svelte';
@@ -10,7 +11,8 @@
   import Home from './Home.svelte';
   import Icon from './Icon.svelte';
   import Preferences from './Preferences.svelte';
-  import { choose, chord, games, length, sentence, size, type Clip, type Disk, type Mic, type Query, type Settings, type Status } from './types';
+  import { choose, chord, games, length, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
+  import { say, toasts, view, zooms } from './view.svelte';
 
   type Area = 'home' | 'library' | 'settings';
   type Shelf = Query['show'] | 'games';
@@ -40,6 +42,9 @@
   let first = $state(false);
   let maximized = $state(false);
   let quick = $state(false);
+  let chip = $state<HTMLButtonElement>();
+  let panel = $state<HTMLElement>();
+  let sheet = $state<HTMLDialogElement>();
   let query = $state<Omit<Query, 'show'>>({ sort: 'newest', search: '' });
   const current = $derived(clips.find((clip) => clip.path === opened));
   const listed = $derived(games(clips));
@@ -56,6 +61,46 @@
   const switchable = $derived(settings ? [...new Set([status.exe, ...settings.ignore])].filter(Boolean) : []);
   const cap = $derived(settings?.cap ? settings.cap * 1e9 : null);
   const room = $derived(cap ?? (disk ? used + disk.free : null));
+  const does = (h: Hotkey) => (h.action === 'mark' ? 'Mark' : h.seconds ? `Save ${length(h.seconds)}` : 'Save');
+  const sheetRows = $derived<[string, [string[], string][]][]>([
+    [
+      'Anywhere in clip',
+      [
+        [['1', '2', '3'], 'Home, Library, Settings'],
+        [['Ctrl+F'], 'Search'],
+        [['Ctrl+=', 'Ctrl+-'], 'Make everything bigger or smaller'],
+        [['Ctrl+0'], 'Back to 100%'],
+        [['Esc'], 'Back'],
+        [['?'], 'This list']
+      ]
+    ],
+    [
+      'Clips',
+      [
+        [['Ctrl+Click'], 'Select a clip'],
+        [['Shift+Click'], 'Select every clip up to it'],
+        [['Esc'], 'Clear the selection']
+      ]
+    ],
+    [
+      'Playing a clip',
+      [
+        [['Space'], 'Play or pause'],
+        [['Left', 'Right'], 'Step a frame'],
+        [['I', 'O'], 'Set where the cut starts and ends']
+      ]
+    ],
+    [
+      'In games',
+      status.hotkeys
+        .filter((h) => h.key)
+        .map((h): [string[], string] => [[chord(h)], h.action === 'mark' ? 'Mark a moment, saved 15 s later' : `${does(h)} clip`])
+    ]
+  ]);
+
+  $effect(() => {
+    getCurrentWebview().setZoom(view.zoom / 100);
+  });
 
   async function refresh() {
     [settings, clips] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
@@ -71,7 +116,12 @@
     refresh();
     const sized = () => win.isMaximized().then((m) => (maximized = m));
     sized();
-    const stops = [listen<Status>('status', (e) => (status = e.payload)), listen('clips', refresh), win.onResized(sized)];
+    const stops = [
+      listen<Status>('status', (e) => (status = e.payload)),
+      listen('clips', refresh),
+      listen<[string, boolean]>('saved', (e) => say(...e.payload)),
+      win.onResized(sized)
+    ];
     return () => stops.forEach((stop) => stop.then((f) => f()));
   });
 
@@ -110,7 +160,52 @@
 
   async function openQuick() {
     quick = !quick;
-    if (quick) mics = await invoke<Mic[]>('mics').catch(() => []);
+    if (!quick) return;
+    await tick();
+    panel?.querySelector<HTMLElement>('input, select, button')?.focus();
+    mics = await invoke<Mic[]>('mics').catch(() => []);
+  }
+
+  function closeQuick() {
+    const inside = document.activeElement === document.body || panel?.contains(document.activeElement);
+    quick = false;
+    if (inside) chip?.focus();
+  }
+
+  function trap(e: KeyboardEvent) {
+    if (e.key !== 'Tab' || !panel) return;
+    const all = [...panel.querySelectorAll<HTMLElement>('input, select, button')];
+    const edge = e.shiftKey ? all[0] : all[all.length - 1];
+    if (document.activeElement !== edge) return;
+    e.preventDefault();
+    (e.shiftKey ? all[all.length - 1] : all[0]).focus();
+  }
+
+  function zoom(step: number | null) {
+    const at = zooms.indexOf(view.zoom);
+    view.zoom = step === null ? 100 : zooms[Math.min(zooms.length - 1, Math.max(0, at + step))];
+    say(`Size ${view.zoom}%`);
+  }
+
+  function keydown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && quick) return closeQuick();
+    if (e.ctrlKey && !e.altKey && !e.metaKey) {
+      const step = ({ '=': 1, '+': 1, '-': -1, '0': null } as Record<string, number | null>)[e.key];
+      if (step !== undefined) {
+        e.preventDefault();
+        return zoom(step);
+      }
+      if (e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        return document.querySelector<HTMLInputElement>('input.search')?.focus();
+      }
+    }
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.key === '?') return sheet?.showModal();
+    const picked = areas[Number(e.key) - 1];
+    if (picked) go(picked.id);
+    // the clip page handles its own esc
+    if (e.key === 'Escape' && !opened && game && !e.defaultPrevented) back();
   }
 
   async function applied() {
@@ -128,7 +223,16 @@
       </svg>
     </span>
     <div class="now-wrap">
-      <button class="now" class:on={status.recording} class:err={failed} aria-expanded={quick} title={sentence(status.message)} onclick={openQuick}>
+      <button
+        class="now"
+        class:on={status.recording}
+        class:err={failed}
+        bind:this={chip}
+        aria-haspopup="dialog"
+        aria-expanded={quick}
+        title={sentence(status.message)}
+        onclick={openQuick}
+      >
         {#if hero}<img src={convertFileSrc(hero)} alt="" draggable="false" />{/if}
         <span class="dot"></span>
         <span class="now-text">
@@ -137,7 +241,7 @@
         <svg class="caret" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5l3-3" /></svg>
       </button>
       {#if quick && settings}
-        <div class="quick" role="dialog" aria-label="Recording">
+        <div class="quick" role="dialog" aria-label="Recording" tabindex="-1" bind:this={panel} onkeydown={trap}>
           <label class="quick-row">
             <span class="grow">Recording<small>{status.paused ? 'Paused until switched back on' : 'Follows the game in focus'}</small></span>
             <input type="checkbox" class="switch" checked={!status.paused} onchange={(e) => invoke('pause', { on: !e.currentTarget.checked })} />
@@ -184,7 +288,7 @@
           title={hotkey.taken ? 'Another app holds this key, pick another' : 'Change hotkeys'}
           onclick={() => settle('hotkeys')}
         >
-          <kbd>{chord(hotkey)}</kbd>{hotkey.action === 'mark' ? 'Mark' : hotkey.seconds ? `Save ${length(hotkey.seconds)}` : 'Save'}
+          <kbd>{chord(hotkey)}</kbd>{does(hotkey)}
         </button>
       {/each}
     </div>
@@ -302,16 +406,45 @@
   {/if}
 </div>
 
+<div class="toasts" role="status">
+  {#each toasts as toast (toast.id)}<p class="toast" class:bad={toast.bad}>{toast.text}</p>{/each}
+</div>
+
+<!-- keys stop at the sheet, so the page behind never takes them, and a click on the backdrop closes it -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
+<dialog
+  class="sheet"
+  bind:this={sheet}
+  aria-labelledby="sheet-title"
+  onkeydown={(e) => e.stopPropagation()}
+  onclick={(e) => e.target === sheet && sheet.close()}
+>
+  <div class="sheet-body">
+    <header class="sheet-head">
+      <h2 id="sheet-title">Keys</h2>
+      <button class="gel" onclick={() => sheet?.close()}>Close <kbd>Esc</kbd></button>
+    </header>
+    {#each sheetRows as [name, rows] (name)}
+      {#if rows.length}
+        <section>
+          <h3 class="side-head">{name}</h3>
+          <dl class="sheet-rows">
+            {#each rows as [keys, what], n (n)}
+              <div>
+                <dt>{#each keys as key, i (key)}{#if i > 0}<span class="mute"> or </span>{/if}<kbd class="key">{key}</kbd>{/each}</dt>
+                <dd>{what}</dd>
+              </div>
+            {/each}
+          </dl>
+        </section>
+      {/if}
+    {/each}
+  </div>
+</dialog>
+
 <svelte:window
   onclick={(e) => {
-    if (quick && e.target instanceof Element && !e.target.closest('.now-wrap')) quick = false;
+    if (quick && e.target instanceof Element && !e.target.closest('.now-wrap')) closeQuick();
   }}
-  onkeydown={(e) => {
-    if (e.key === 'Escape' && quick) return (quick = false);
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.ctrlKey || e.altKey || e.metaKey) return;
-    const picked = areas[Number(e.key) - 1];
-    if (picked) go(picked.id);
-    // the clip page handles its own esc
-    if (e.key === 'Escape' && !opened && game && !e.defaultPrevented) back();
-  }}
+  onkeydown={keydown}
 />

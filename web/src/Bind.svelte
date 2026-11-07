@@ -5,6 +5,7 @@
   // plain takes a single key with no modifiers, for push to talk
   let { mods = $bindable(0), key = $bindable(0), plain = false, label }: { mods?: number; key: number; plain?: boolean; label: string } = $props();
   let listening = $state(false);
+  const shown = $derived(listening ? 'Press a key' : plain ? (key ? keyName(key) : 'None') : chord({ mods, key }));
 
   // clip's own hotkeys are let go while listening, so pressing one reaches this box instead of saving a clip
   function hold(on: boolean) {
@@ -24,6 +25,6 @@
   }
 </script>
 
-<button class="field bind mono" class:listening aria-label={label} title="Press a key, Backspace clears" onfocus={() => hold(true)} onblur={() => hold(false)} onkeydown={press}>
-  {listening ? 'Press a key' : plain ? (key ? keyName(key) : 'None') : chord({ mods, key })}
+<button class="field bind mono" class:listening aria-label="{shown}, {label}" title="Press a key, Backspace clears" onfocus={() => hold(true)} onblur={() => hold(false)} onkeydown={press}>
+  {shown}
 </button>

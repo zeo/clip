@@ -3,6 +3,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import Thumb from './Thumb.svelte';
   import { at, day, size, title, type Clip } from './types';
+  import { reduced, say, view } from './view.svelte';
 
   let {
     clips,
@@ -11,7 +12,6 @@
     grouped = true
   }: { clips: Clip[]; onopen: (clip: Clip) => void; showApp?: boolean; grouped?: boolean } = $props();
   let hovered = $state<string | null>(null);
-  let error = $state('');
   const selected = new SvelteSet<string>();
   // where a shift click's range starts
   let anchor: string | null = null;
@@ -31,11 +31,10 @@
   });
 
   async function act(command: string, args: Record<string, unknown>) {
-    error = '';
     try {
       await invoke(command, args);
     } catch (e) {
-      error = String(e);
+      say(String(e), true);
     }
   }
 
@@ -61,7 +60,6 @@
 </script>
 
 <div class="sessions">
-  {#if error}<p class="form-error">{error}</p>{/if}
   {#each sessions as session (session[0].path)}
     {@const newest = session[0]}
     {@const oldest = session[session.length - 1]}
@@ -85,20 +83,20 @@
               class="clip-open"
               onclick={(e) => (picked.length > 0 || e.shiftKey || e.ctrlKey ? pick(clip, e) : onopen(clip))}
             >
-              <Thumb {clip} live={hovered === clip.path} />
+              <Thumb {clip} live={view.previews && !reduced.current && hovered === clip.path} />
               <span class="clip-name">{title(clip)}</span>
               <span class="clip-meta mono">{size(clip.bytes)}</span>
             </button>
-            <button class="pick" aria-pressed={selected.has(clip.path)} aria-label="Select" onclick={(e) => pick(clip, e)}>
-              <svg viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" /></svg>
+            <button class="pick" aria-pressed={selected.has(clip.path)} aria-label="Select {title(clip)}" onclick={(e) => pick(clip, e)}>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" /></svg>
             </button>
             <button
               class="star"
               aria-pressed={clip.starred}
-              aria-label="Star"
+              aria-label="Star {title(clip)}"
               onclick={() => act('star', { paths: [clip.path], on: !clip.starred })}
             >
-              <svg viewBox="0 0 16 16"><path d="M8 1.6l1.9 4 4.3.5-3.2 3 .9 4.3L8 11.2l-3.9 2.2.9-4.3-3.2-3 4.3-.5z" /></svg>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.6l1.9 4 4.3.5-3.2 3 .9 4.3L8 11.2l-3.9 2.2.9-4.3-3.2-3 4.3-.5z" /></svg>
             </button>
           </li>
         {/each}
@@ -120,7 +118,7 @@
 
 <svelte:window
   onkeydowncapture={(e) => {
-    if (e.key !== 'Escape' || selected.size === 0) return;
+    if (e.key !== 'Escape' || selected.size === 0 || (e.target instanceof Element && e.target.closest('dialog'))) return;
     // the page behind would take esc as back too
     e.preventDefault();
     selected.clear();
