@@ -10,6 +10,7 @@
 
   let {
     clip,
+    rewind = false,
     prev,
     next,
     onopen,
@@ -17,6 +18,7 @@
     onmoved
   }: {
     clip: Clip;
+    rewind?: boolean;
     prev?: Clip;
     next?: Clip;
     onopen: (clip: Clip) => void;
@@ -47,7 +49,8 @@
   let duration = $state(probed);
   let now = $state(0);
   let paused = $state(true);
-  let start = $state(0);
+  // a rewound buffer opens on its last 30 s, the usual clip length
+  let start = $state(untrack(() => rewind) ? Math.max(0, probed - 30) : 0);
   let end = $state(probed);
   let lanes = $state<Lane[]>([]);
   let loading = $state(true);
@@ -312,6 +315,11 @@
       say('Export cancelled');
     }
     if (!out) return;
+    if (rewind && !animated) {
+      say(`Saved ${named(out)}`);
+      discard([path], 'the rest of the buffer');
+      return onmoved(out);
+    }
     const copied =
       fit > 0 &&
       view.copyAfter &&
@@ -381,6 +389,11 @@
     naming = null;
     if (!name || name === clip.name) return;
     const to = await act('renaming', () => invoke<string>('rename', { path: clip.path, name }));
+    if (to) onmoved(to);
+  }
+
+  async function keepAll() {
+    const to = await act('renaming', () => invoke<string>('rename', { path: clip.path, name: clip.name.replace(/ rewind$/, '') }));
     if (to) onmoved(to);
   }
 
@@ -459,12 +472,18 @@
       }}
       onblur={rename}
     />
+  {:else if rewind}
+    <h1 class="toolbar-title">Rewind, the last {clock(probed)}</h1>
   {:else}
     <h1 class="toolbar-title" class:renamable={!clip.source} title={clip.source ? undefined : 'Double click to rename'} ondblclick={() => !clip.source && (naming = clip.name)}>
       {title(clip)}
     </h1>
   {/if}
   <span class="grow"></span>
+  {#if rewind}
+    <button class="gel" disabled={busy !== ''} title="Keep the whole buffer as a clip" onclick={keepAll}>Keep all</button>
+    <button class="gel danger" disabled={busy !== ''} onclick={remove}>Discard</button>
+  {:else}
   <button class="gel" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred })}>
     {clip.starred ? 'Starred' : 'Star'}
   </button>
@@ -473,6 +492,7 @@
   {:else}
     <button class="gel" onclick={() => (naming = clip.name)}>Rename</button>
     <button class="gel danger" disabled={busy !== ''} onclick={remove}>Delete</button>
+  {/if}
   {/if}
 </div>
 
@@ -679,6 +699,7 @@
             <button role="radio" aria-checked={!mix && !fit} disabled={busy !== '' || fit > 0} onclick={() => (mix = false)}>Keep tracks</button>
           </div>
         </div>
+        {#if !rewind}
         <div class="option">
           <span id="save-label">Save as</span>
           <div class="seg" role="radiogroup" aria-labelledby="save-label" use:radios>
@@ -686,6 +707,7 @@
             <button role="radio" aria-checked={replace} disabled={busy !== '' || !!clip.source} onclick={() => (replace = true)}>Replace this one</button>
           </div>
         </div>
+        {/if}
       {/if}
       {#if fit > 0}
         <label class="option">
@@ -713,7 +735,7 @@
         </div>
       {/if}
       <button class="gel default wide" disabled={busy !== '' || long} onclick={exportCut}>
-        {busy === 'export' ? `Exporting ${progress ?? 0}%` : animated ? 'Export GIF' : replace ? 'Replace with the cut' : 'Export'}
+        {busy === 'export' ? `Exporting ${progress ?? 0}%` : animated ? 'Export GIF' : replace ? 'Replace with the cut' : rewind ? 'Save this part' : 'Export'}
       </button>
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}
     </section>

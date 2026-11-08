@@ -31,14 +31,15 @@ export type Corner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 
 // mods are MOD_ALT 1, MOD_CONTROL 2, MOD_SHIFT 4 and MOD_WIN 8, key is a virtual key code with 0 for none
 export type Hotkey = { action: Action; mods: number; key: number; seconds: number };
-export type Action = 'save' | 'mark' | 'shot' | 'mic' | 'record';
+export type Action = 'save' | 'mark' | 'shot' | 'mic' | 'record' | 'rewind';
 
 export const ACTIONS: Record<Action, { name: string; does: string; key: string }> = {
   save: { name: 'Save a clip', does: 'Saves what the buffer holds', key: 'Save' },
   mark: { name: 'Mark a moment', does: 'Marks now and saves 15 s later', key: 'Mark' },
   shot: { name: 'Take a screenshot', does: 'Saves the next frame as a png', key: 'Screenshot' },
   mic: { name: 'Mute the mic', does: 'Mutes or unmutes the mic in clips', key: 'Mic' },
-  record: { name: 'Start or stop recording', does: 'Records until pressed again', key: 'Record' }
+  record: { name: 'Start or stop recording', does: 'Records until pressed again', key: 'Record' },
+  rewind: { name: 'Rewind the buffer', does: 'Opens the buffer in clip to keep just a part', key: 'Rewind' }
 };
 
 const ALT = 1;

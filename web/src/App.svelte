@@ -36,6 +36,8 @@
   let shelf = $state<Shelf>('games');
   let game = $state<string | null>(null);
   let opened = $state<string | null>(null);
+  // a whole buffer saved to be cut down, open until it's kept, cut or thrown away
+  let rewound = $state<string | null>(null);
   let page = $state('hotkeys');
   let status = $state<Status>({ recording: false, app: '', exe: '', message: 'starting', paused: false, hotkeys: [], mic_muted: false, taping: 0 });
   let settings = $state<Settings | null>(null);
@@ -170,6 +172,10 @@
       listen<Status>('status', (e) => (status = e.payload)),
       listen('clips', refresh),
       listen<[string, boolean]>('saved', (e) => say(...e.payload)),
+      listen<string>('rewind', (e) => {
+        go('library');
+        opened = rewound = e.payload;
+      }),
       win.onResized(sized)
     ];
     return () => stops.forEach((stop) => stop.then((f) => f()));
@@ -317,6 +323,10 @@
             </button>
           </div>
           <div class="quick-row">
+            <span class="grow">Rewind<small>Opens the buffer here to keep just the part you want</small></span>
+            <button class="gel" disabled={!status.recording} onclick={() => ((quick = false), invoke('rewind'))}>Rewind</button>
+          </div>
+          <div class="quick-row">
             <span class="grow">Screenshot<small>Saved as a png next to the clips</small></span>
             <button class="gel" disabled={!status.recording} onclick={() => invoke('take_shot')}>Take</button>
           </div>
@@ -435,6 +445,7 @@
           {:else}
           <ClipPage
             clip={current}
+            rewind={current.path === rewound}
             prev={step.prev}
             next={step.next}
             onopen={open}

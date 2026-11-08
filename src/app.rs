@@ -55,6 +55,9 @@ const MARK: usize = 2;
 const SHOT: usize = 3;
 const MIC: usize = 4;
 const RECORD: usize = 5;
+const REWIND: usize = 6;
+// the tail of a whole buffer saved to be cut down, which its cuts drop from their names
+const REWOUND: &str = " rewind";
 // hotkey ids from here on are indexes into the settings' hotkeys
 const HOTKEY: usize = 100;
 // a marked clip saves itself this long after the newest mark, so the moment sits mid clip
@@ -124,6 +127,7 @@ enum Action {
     Shot,
     Mic,
     Record,
+    Rewind,
 }
 
 impl Default for Settings {
@@ -255,6 +259,7 @@ fn serve() -> Result<(), String> {
             take_shot,
             toggle_mic,
             toggle_recording,
+            rewind,
             open,
             reveal,
             audio_apps,
@@ -332,6 +337,7 @@ fn serve() -> Result<(), String> {
                 app,
                 &[
                     &MenuItem::with_id(app, "save", "save clip", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "rewind", "rewind the buffer", true, None::<&str>)?,
                     &MenuItem::with_id(app, "shot", "take screenshot", true, None::<&str>)?,
                     &taping,
                     &PredefinedMenuItem::separator(app)?,
@@ -388,6 +394,7 @@ fn serve() -> Result<(), String> {
                     "save" => post(shared.recorder, WM_HOTKEY, SAVE),
                     "shot" => post(shared.recorder, WM_HOTKEY, SHOT),
                     "record" => post(shared.recorder, WM_HOTKEY, RECORD),
+                    "rewind" => post(shared.recorder, WM_HOTKEY, REWIND),
                     "mic" => post(shared.recorder, WM_HOTKEY, MIC),
                     "pause" => {
                         let paused = shared.status.lock().expect("status poisoned").paused;
@@ -622,6 +629,7 @@ fn record(
         SHOT => Some((Action::Shot, 0)),
         MIC => Some((Action::Mic, 0)),
         RECORD => Some((Action::Record, 0)),
+        REWIND => Some((Action::Rewind, 0)),
         id => bound.borrow().get(id.wrapping_sub(HOTKEY)).map(|bound| (bound.hotkey.action, bound.hotkey.seconds)),
     };
     unsafe { SetTimer(None, 0, 250, None) };
@@ -712,17 +720,39 @@ fn record(
         note(&text, bad, game);
         let _ = app.emit("saved", (text, bad));
     };
-    let save = |recording: &Recording, marked: &[i64], seconds: Option<u32>| {
-        let (folder, cap, keep_days, sound, notify) = {
+    // writes the buffer into the game's folder with its marks, and lets the library know
+    let keep = |recording: &Recording, marked: &[i64], seconds: Option<u32>, tail: &str| {
+        let (folder, cap, keep_days) = {
             let settings = settings.lock().expect("settings poisoned");
-            let sound = settings.sound.then_some(settings.sound_volume);
-            (settings.folder.clone(), settings.cap, settings.keep_days, sound, settings.notify)
+            (settings.folder.clone(), settings.cap, settings.keep_days)
         };
         let dir = folder.join(&recording.app);
-        let saved = std::fs::create_dir_all(&dir)
+        let (saved, out) = std::fs::create_dir_all(&dir)
             .map_err(|e| format!("can't make {}: {e}", dir.display()))
-            .map(|()| free(&dir, "", "mp4"))
-            .and_then(|out| Ok((recording.session.save(&out, seconds)?, out)));
+            .map(|()| free(&dir, tail, "mp4"))
+            .and_then(|out| Ok((recording.session.save(&out, seconds)?, out)))?;
+        let mut marks = marks.lock().expect("marks poisoned");
+        let at: Vec<f64> = marked
+            .iter()
+            .map(|&at| (at - saved.start) as f64 / SECOND as f64)
+            .filter(|at| (0.0..=saved.seconds).contains(at))
+            .collect();
+        if !at.is_empty() {
+            marks.mark(&folder, &out, at);
+            if let Err(e) = marks.store(marks_file) {
+                let _ = tray.set_tooltip(Some(format!("clip: {e}")));
+            }
+        }
+        trim(&folder, &marks, thumbs, cap, keep_days);
+        let _ = app.emit("clips", ());
+        Ok::<_, String>((saved, out))
+    };
+    let save = |recording: &Recording, marked: &[i64], seconds: Option<u32>| {
+        let (sound, notify) = {
+            let settings = settings.lock().expect("settings poisoned");
+            (settings.sound.then_some(settings.sound_volume), settings.notify)
+        };
+        let saved = keep(recording, marked, seconds, "");
         match &saved {
             Ok(_) => {
                 if let Some(volume) = sound {
@@ -759,26 +789,8 @@ fn record(
             }
             Err(e) => note(&format!("Clip not saved: {e}"), true, recording.window),
         }
-        match saved {
-            Ok((saved, out)) => {
-                let mut marks = marks.lock().expect("marks poisoned");
-                let at: Vec<f64> = marked
-                    .iter()
-                    .map(|&at| (at - saved.start) as f64 / SECOND as f64)
-                    .filter(|at| (0.0..=saved.seconds).contains(at))
-                    .collect();
-                if !at.is_empty() {
-                    marks.mark(&folder, &out, at);
-                    if let Err(e) = marks.store(marks_file) {
-                        let _ = tray.set_tooltip(Some(format!("clip: {e}")));
-                    }
-                }
-                trim(&folder, &marks, thumbs, cap, keep_days);
-                let _ = app.emit("clips", ());
-            }
-            Err(e) => {
-                let _ = tray.set_tooltip(Some(format!("clip: {e}")));
-            }
+        if let Err(e) = saved {
+            let _ = tray.set_tooltip(Some(format!("clip: {e}")));
         }
     };
     {
@@ -977,6 +989,22 @@ fn record(
                     (None, Err(e)) => feedback(format!("Recording not started: {e}"), true, HWND::default()),
                 }
                 report(&current);
+                None
+            }
+            WM_HOTKEY if pressed(&msg).is_some_and(|(action, _)| action == Action::Rewind) => {
+                match &current {
+                    Ok(recording) => {
+                        let marked = pending.as_ref().filter(|p| Rc::ptr_eq(&p.recording, recording));
+                        match keep(recording, marked.map_or(&[], |p| &p.marks), None, REWOUND) {
+                            Ok((_, out)) => {
+                                show(app);
+                                let _ = app.emit("rewind", out);
+                            }
+                            Err(e) => feedback(format!("Couldn't rewind: {e}"), true, recording.window),
+                        }
+                    }
+                    Err(e) => feedback(format!("Nothing to rewind: {e}"), true, HWND::default()),
+                }
                 None
             }
             WM_HOTKEY if pressed(&msg).is_some_and(|(action, _)| action == Action::Mark) => {
@@ -1432,10 +1460,15 @@ async fn export(
             (None, Some(_)) => "9x16".into(),
             (None, None) => "trimmed".into(),
         };
+        let base = match stem.strip_suffix(REWOUND) {
+            Some(base) if kind == "trimmed" => base.to_string(),
+            Some(base) => format!("{base} {kind}"),
+            None => format!("{stem} {kind}"),
+        };
         let out = (1..)
             .map(|n| match n {
-                1 => dir.join(format!("{stem} {kind}.mp4")),
-                n => dir.join(format!("{stem} {kind} {n}.mp4")),
+                1 => dir.join(format!("{base}.mp4")),
+                n => dir.join(format!("{base} {n}.mp4")),
             })
             .find(|out| !out.exists())
             .expect("some name is free");
@@ -1611,6 +1644,11 @@ fn toggle_mic(shared: State<Shared>) {
 #[tauri::command]
 fn toggle_recording(shared: State<Shared>) {
     post(shared.recorder, WM_HOTKEY, RECORD);
+}
+
+#[tauri::command]
+fn rewind(shared: State<Shared>) {
+    post(shared.recorder, WM_HOTKEY, REWIND);
 }
 
 /// A clip in the clips folder, which clip may change.
