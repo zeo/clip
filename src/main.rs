@@ -38,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWi
 use capture::Target;
 use encode::{Codec, Format};
 use hdr::Display;
-use ring::{Clock, Ring, SECOND};
+use ring::{Clock, Ring, Spool, IN_MEMORY, SECOND};
 
 const USAGE: &str = "\
 clip capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
@@ -129,6 +129,8 @@ pub struct Options {
     pub filter: hdr::Filter,
     pub software: bool,
     pub hdr10: bool,
+    /// where a buffer longer than [`IN_MEMORY`] goes, which stays in memory without one
+    pub spool: Option<PathBuf>,
 }
 
 impl Options {
@@ -145,6 +147,7 @@ impl Options {
             },
             software: args.iter().any(|a| a == "--software"),
             hdr10: args.iter().any(|a| a == "--hdr10"),
+            spool: None,
         })
     }
 }
@@ -200,6 +203,9 @@ fn prepare(options: &Options, target: Target) -> std::result::Result<Prepared, S
 pub struct Session {
     pub clock: Clock,
     pub summary: String,
+    /// seconds the rings keep, and why that's less than asked for
+    pub buffer: u32,
+    pub short: Option<String>,
     format: Format,
     mastering: Option<hdr::Mastering>,
     names: Vec<String>,
@@ -213,8 +219,21 @@ pub struct Session {
 
 impl Session {
     pub fn start(options: &Options, target: Target, lanes: &[audio::Lane]) -> std::result::Result<Self, String> {
-        let span = options.buffer.max(1) as i64 * SECOND;
-        let ring = Arc::new(Mutex::new(Ring::new(span)));
+        let asked = options.buffer.max(1);
+        let need =
+            asked as u64 * (options.mbps as u64 * 125_000 + lanes.len() as u64 * audio::AAC_BYTES_PER_SECOND as u64);
+        let spool = options.spool.as_deref().filter(|_| asked > IN_MEMORY).map(|dir| Spool::open(dir, need));
+        let (buffer, short) = match &spool {
+            Some(Err(e)) => (IN_MEMORY, Some(e.clone())),
+            _ => (asked, None),
+        };
+        let spool = spool.and_then(std::result::Result::ok);
+        let span = buffer as i64 * SECOND;
+        let make = |name: &str| match &spool {
+            Some(spool) => Ring::spooled(span, spool.clone(), name),
+            None => Ring::new(span),
+        };
+        let ring = Arc::new(Mutex::new(make("video")));
         let stop = Arc::new(AtomicBool::new(false));
         let shots = capture::Shots::default();
         let (opened, ready) = std::sync::mpsc::sync_channel(1);
@@ -242,7 +261,7 @@ impl Session {
                 return Err(format!("capture failed: {reason}"));
             }
         };
-        let sound = match audio::Recording::start(lanes, span, clock, stop.clone()) {
+        let sound = match audio::Recording::start(lanes, |n| make(&format!("lane{n}")), clock, stop.clone()) {
             Ok(sound) => sound,
             Err(e) => {
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -253,6 +272,8 @@ impl Session {
         Ok(Self {
             clock,
             summary,
+            buffer,
+            short,
             format,
             mastering,
             names: lanes.iter().map(|lane| lane.name.clone()).collect(),
@@ -276,9 +297,9 @@ impl Session {
         let start = packets.first().map_or(0, |p| p.pts);
         let from = if seconds.is_some() { start } else { i64::MIN };
         let audio: Vec<_> = self.rings.iter().map(|ring| ring.lock().expect("ring poisoned").since(from)).collect();
-        let bytes = packets.iter().map(|p| p.data.len()).sum();
+        let bytes = packets.iter().map(|p| p.len).sum();
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
-        save::write_mp4(out, &packets, self.format, &audio, &names, self.mastering)
+        save::write_held(out, &packets, self.format, &audio, &names, self.mastering)
             .map_err(|e| format!("saving failed: {e}"))?;
         Ok(Saved { seconds: (end - start) as f64 / SECOND as f64, frames: packets.len(), bytes, start })
     }
@@ -303,6 +324,7 @@ impl Session {
                 .next()
                 .ok_or("nothing is recorded yet")?
         };
+        let first = first.load().map_err(|e| format!("can't read the buffer back: {e}"))?;
         let writer = save::Writer::open(out, &first, self.format, self.rings.len())
             .map_err(|e| format!("can't start the recording: {e}"))?;
         Ok(Tape {
@@ -358,16 +380,17 @@ pub struct Tape {
 impl Tape {
     /// Writes what the rings gained since the last pull.
     pub fn pull(&mut self) -> std::result::Result<(), String> {
-        let fresh = |ring: &Mutex<Ring>, after: i64| -> Vec<Arc<ring::Packet>> {
-            let ring = ring.lock().expect("ring poisoned");
-            ring.since(after).into_iter().filter(|p| p.pts > after).collect()
+        let fresh = |ring: &Mutex<Ring>, after: i64, upto: i64| {
+            let held: Vec<_> = ring.lock().expect("ring poisoned").since(after);
+            ring::load(&held.into_iter().filter(|p| p.pts > after && p.pts <= upto).collect::<Vec<_>>())
+                .map_err(|e| format!("can't read the buffer back: {e}"))
         };
-        let packets = fresh(&self.ring, self.video);
+        let packets = fresh(&self.ring, self.video, i64::MAX)?;
         let Some(newest) = packets.last().map(|p| p.pts) else { return Ok(()) };
         // sound only up to the newest frame, so the next pull's frames never land before it
-        let audio: Vec<_> = (self.rings.iter().zip(&self.audio))
-            .map(|(ring, &after)| fresh(ring, after).into_iter().filter(|p| p.pts <= newest).collect::<Vec<_>>())
-            .collect();
+        let audio = (self.rings.iter().zip(&self.audio))
+            .map(|(ring, &after)| fresh(ring, after, newest))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         self.writer.write(&packets, &audio).map_err(|e| format!("recording failed: {e}"))?;
         for (at, lane) in self.audio.iter_mut().zip(&audio) {
             *at = lane.last().map_or(*at, |p| p.pts);
@@ -527,7 +550,10 @@ fn self_test() -> Result<()> {
                     capture::Pipeline::new(&gpu, display, format, hdr::Filter::Area).map_err(at("pipeline"))?;
                 let mut encoder = encode::Encoder::open(&choice, &gpu.device, format, encode::Purpose::Capture)
                     .map_err(at("open"))?;
-                let mut ring = Ring::new(10 * SECOND);
+                // the long buffer's files, so the clip comes back from disk
+                let spool =
+                    Spool::open(&dir.join(".buffer"), 0).map_err(|e| windows::core::Error::new(E_SELF_TEST, e))?;
+                let mut ring = Ring::spooled(10 * SECOND, spool, &format!("{case}-{kind}"));
                 // halfway through, the display switches hdr on or off
                 let switched = if hdr { SDR_DISPLAY } else { TEST_DISPLAY };
                 for i in 0..frames {
@@ -545,7 +571,9 @@ fn self_test() -> Result<()> {
                 }
                 encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
                 let mastering = matches!(codec, Codec::Hdr10).then_some(TEST_PANEL);
-                save::write_mp4(&path, &ring.since(i64::MIN), format, &lanes, &["tone 440", "tone 660"], mastering)
+                let lanes: Vec<Vec<ring::Held>> =
+                    lanes.iter().map(|lane| lane.iter().cloned().map(ring::Held::from).collect()).collect();
+                save::write_held(&path, &ring.since(i64::MIN), format, &lanes, &["tone 440", "tone 660"], mastering)
                     .map_err(at("save"))?;
                 let streams = read_back(&path).map_err(at("read back"))?;
                 Ok((streams, sync::onsets(&path).map_err(at("read sound back"))?.1.first().copied()))
@@ -702,7 +730,9 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
         !video.is_empty()
     };
     feed(5);
-    let first = ring.lock().expect("ring poisoned").since(i64::MIN)[0].clone();
+    let first = ring.lock().expect("ring poisoned").since(i64::MIN)[0]
+        .load()
+        .map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
     let mut tape = Tape {
         writer: save::Writer::open(&path, &first, format, rings.len()).map_err(at("open tape"))?,
         ring: ring.clone(),
@@ -1058,7 +1088,7 @@ fn tone(hz: f32) -> Result<Vec<Arc<ring::Packet>>> {
         aac.encode(start as i64 * SECOND / audio::RATE as i64, &pcm)?.into_iter().for_each(|p| ring.push(p));
     }
     aac.finish()?.into_iter().for_each(|p| ring.push(p));
-    Ok(ring.since(i64::MIN))
+    ring::load(&ring.since(i64::MIN)).map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))
 }
 
 #[cfg(test)]

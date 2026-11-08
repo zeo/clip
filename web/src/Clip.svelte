@@ -520,7 +520,7 @@
   {/if}
   <span class="grow"></span>
   {#if rewind}
-    <button class="gel" disabled={busy !== ''} title="Keep the whole buffer as a clip" onclick={keepAll}>Keep all</button>
+    <button class="gel" disabled={busy !== ''} title="Keep all of it as a clip" onclick={keepAll}>Keep all</button>
     <button class="gel danger" disabled={busy !== ''} onclick={remove}>Discard</button>
   {:else}
   <button class="gel" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred })}>

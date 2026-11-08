@@ -105,7 +105,7 @@ export type Disk = { free: number; total: number };
 export type Mic = { id: string; name: string };
 
 export function length(seconds: number): string {
-  return seconds < 60 ? `${seconds} s` : `${seconds / 60} min`;
+  return seconds < 60 ? `${seconds} s` : seconds < 3600 ? `${seconds / 60} min` : `${seconds / 3600} h`;
 }
 
 export type Clip = {
@@ -131,10 +131,16 @@ export type Game = { app: string; icon: string | null; clips: Clip[]; bytes: num
 
 export type Track = { name: string; path: string };
 
+// a longer buffer goes to a hidden folder in the clips folder instead of memory
+export const IN_MEMORY = 600;
+
 // the app and everything else at 192 kbps each, plus every app split out and the mic when it's on
-export function ramMB(s: Settings): number {
+export function bufferCost(s: Settings): string {
   const tracks = 2 + s.apps.length + (s.mic ? 1 : 0);
-  return Math.round((s.buffer * (s.mbps * 1e6 + tracks * 192e3)) / 8 / 1e6);
+  const bytes = (s.buffer * (s.mbps * 1e6 + tracks * 192e3)) / 8;
+  if (s.buffer <= IN_MEMORY) return `About ${Math.round(bytes / 1e6)} MB of memory`;
+  const drive = /^[a-z]:/i.exec(s.folder)?.[0] ?? 'the clips drive';
+  return `About ${Math.ceil(bytes / 1e9)} GB on ${drive}, in a hidden .buffer folder`;
 }
 
 export function size(bytes: number): string {

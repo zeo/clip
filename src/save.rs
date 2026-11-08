@@ -9,7 +9,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use crate::audio::Aac;
 use crate::encode::{describe, parameter_sets, Format};
 use crate::hdr::Mastering;
-use crate::ring::Packet;
+use crate::ring::{load, Held, Packet};
 
 /// Writes already encoded packets to an MP4 without re-encoding: the video, then one AAC track per
 /// audio lane cut to the video's span and titled with its name, and for hdr10 the screen it was
@@ -22,20 +22,59 @@ pub fn write_mp4(
     names: &[&str],
     mastering: Option<Mastering>,
 ) -> Result<()> {
+    let held = |packets: &[Arc<Packet>]| packets.iter().cloned().map(Held::from).collect::<Vec<_>>();
+    let audio: Vec<_> = audio.iter().map(|lane| held(lane)).collect();
+    write_held(path, &held(packets), format, &audio, names, mastering)
+}
+
+/// [`write_mp4`] for packets a ring may hold on disk, read back a stretch at a time so a buffer of
+/// hours never has to fit in memory.
+pub fn write_held(
+    path: &Path,
+    packets: &[Held],
+    format: Format,
+    audio: &[Vec<Held>],
+    names: &[&str],
+    mastering: Option<Mastering>,
+) -> Result<()> {
+    let io = |e: std::io::Error| windows::core::Error::new(E_READ, e.to_string());
+    let read = |held: &[Held]| load(held).map_err(io);
     let first = packets
         .first()
         .filter(|p| p.key)
         .ok_or(windows::core::Error::new(MF_E_INVALIDREQUEST, "a clip has to start on a keyframe"))?;
     let end = packets.iter().map(|p| p.pts + p.duration).max().unwrap_or(first.pts);
-    let audio: Vec<Vec<Arc<Packet>>> =
-        audio.iter().map(|lane| lane.iter().filter(|p| p.pts >= first.pts && p.pts < end).cloned().collect()).collect();
-    let writer = Writer::open(path, first, format, audio.len())?;
-    writer.write(packets, &audio)?;
+    let mut lanes: Vec<&[Held]> = audio
+        .iter()
+        .map(|lane| &lane[lane.partition_point(|p| p.pts < first.pts)..lane.partition_point(|p| p.pts < end)])
+        .collect();
+    let writer = Writer::open(path, &*first.load().map_err(io)?, format, lanes.len())?;
+    let mut stretches = packets.chunks(STRETCH).peekable();
+    while let Some(stretch) = stretches.next() {
+        // sound only up to the stretch's newest frame, the rest goes with the next one
+        let upto = match stretches.peek() {
+            Some(_) => stretch.iter().map(|p| p.pts).max().unwrap_or(i64::MAX),
+            None => i64::MAX,
+        };
+        let sound = lanes
+            .iter_mut()
+            .map(|lane| {
+                let (now, rest) = lane.split_at(lane.partition_point(|p| p.pts <= upto));
+                *lane = rest;
+                read(now)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writer.write(&read(stretch)?, &sound)?;
+    }
     writer.finish(names, mastering)
 }
 
+/// video packets read back at a time, about 10 s at 60 fps
+const STRETCH: usize = 600;
+
 const E_RENAME: windows::core::HRESULT = windows::core::HRESULT(0x8007_0050_u32 as i32);
 const E_LABEL: windows::core::HRESULT = windows::core::HRESULT(0x8007_000D_u32 as i32);
+const E_READ: windows::core::HRESULT = windows::core::HRESULT(0x8007_001E_u32 as i32);
 
 /// An MP4 written a stretch at a time under a .part name, which a writer dropped unfinished deletes.
 pub struct Writer {

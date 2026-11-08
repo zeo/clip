@@ -36,7 +36,7 @@ use crate::art::{self, Art};
 use crate::capture::Target;
 use crate::focus::{self, Follow};
 use crate::library::{self, Clip, Marks};
-use crate::ring::SECOND;
+use crate::ring::{room, Spool, IN_MEMORY, ROOM, SECOND};
 use crate::{hdr, notice, toast, Options, Session, Tape};
 
 // capscr's capture sound
@@ -169,13 +169,14 @@ impl Default for Settings {
 impl Settings {
     fn options(&self) -> Options {
         Options {
-            buffer: self.buffer.clamp(5, 600),
+            buffer: self.buffer.clamp(5, 7200),
             fps: self.fps,
             mbps: self.mbps,
             height: self.height,
             filter: hdr::Filter::Area,
             software: false,
             hdr10: self.hdr10,
+            spool: Some(spool(&self.folder)),
         }
     }
 
@@ -559,9 +560,6 @@ struct Taping {
     checked: Instant,
 }
 
-// a long recording stops before the drive fills up
-const ROOM: u64 = 2_000_000_000;
-
 /// A session and the app window it records.
 struct Recording {
     session: Session,
@@ -580,10 +578,21 @@ struct Pending {
 }
 
 impl Pending {
-    fn mark(&mut self, at: i64, now: Instant, buffer: Duration) {
+    fn mark(&mut self, at: i64, now: Instant) {
         self.marks.push(at);
-        self.due = due(self.first, now, buffer);
+        self.due = due(self.first, now, Duration::from_secs(self.recording.session.buffer as u64));
     }
+
+    /// How much the clip keeps: all of a buffer in memory, or of one on disk from a minute before
+    /// the first mark, which spares writing out hours for one moment.
+    fn seconds(&self) -> Option<u32> {
+        (self.recording.session.buffer > IN_MEMORY).then(|| self.first.elapsed().as_secs() as u32 + 60)
+    }
+}
+
+/// The hidden folder in the clips folder that a buffer too long for memory goes to.
+fn spool(folder: &Path) -> PathBuf {
+    folder.join(".buffer")
 }
 
 /// When a clip marked first at `first` and last at `now` saves: [`LEAD`] after the newest mark,
@@ -665,7 +674,6 @@ fn record(
         focus::focused(&settings.record, &settings.ignore)
     };
     let report = |recording: &Result<Rc<Recording>, String>| {
-        let buffer = settings.lock().expect("settings poisoned").options().buffer;
         let hotkeys = bound.borrow().clone();
         let taken = if hotkeys.iter().any(|bound| bound.taken) { ", a hotkey is taken by another app" } else { "" };
         let (mic_muted, taping) = (crate::audio::MIC_MUTED.load(Ordering::Relaxed), taping_since.get());
@@ -682,7 +690,15 @@ fn record(
                 recording: true,
                 app: recording.app.clone(),
                 exe: recording.exe.clone(),
-                message: format!("keeping the last {buffer} s{taken}"),
+                message: format!(
+                    "keeping the last {}{}{taken}",
+                    length(recording.session.buffer),
+                    recording
+                        .session
+                        .short
+                        .as_ref()
+                        .map_or(String::new(), |why| format!(", a longer buffer won't fit: {why}"))
+                ),
                 paused: false,
                 hotkeys,
                 mic_muted,
@@ -807,6 +823,7 @@ fn record(
             (settings.folder.clone(), settings.cap, settings.keep_days)
         };
         library::settle(&folder);
+        Spool::clear(&spool(&folder));
         trim(&folder, &marks.lock().expect("marks poisoned"), thumbs, cap, keep_days);
     }
     let shoot = |recording: &Recording| {
@@ -863,7 +880,7 @@ fn record(
         if restart {
             restart = false;
             if let Some(early) = pending.take() {
-                save(&early.recording, &early.marks, None);
+                save(&early.recording, &early.marks, early.seconds());
             }
             // the old sessions let go of the encoder before the new one opens its own
             previous = None;
@@ -937,7 +954,7 @@ fn record(
                     report(&current);
                 }
                 if let Some(due) = pending.take_if(|due| due.due <= Instant::now()) {
-                    save(&due.recording, &due.marks, None);
+                    save(&due.recording, &due.marks, due.seconds());
                 }
                 let candidate = focused().filter(|&w| Some(w) != refused);
                 follow.tick(candidate, recorded, back, Instant::now())
@@ -1003,7 +1020,9 @@ fn record(
                 match &current {
                     Ok(recording) => {
                         let marked = pending.as_ref().filter(|p| Rc::ptr_eq(&p.recording, recording));
-                        match keep(recording, marked.map_or(&[], |p| &p.marks), None, REWOUND) {
+                        // a buffer on disk rewinds its last part, the whole one can still be saved
+                        let seconds = (recording.session.buffer > IN_MEMORY).then_some(IN_MEMORY);
+                        match keep(recording, marked.map_or(&[], |p| &p.marks), seconds, REWOUND) {
                             Ok((_, out)) => {
                                 show(app);
                                 let _ = app.emit("rewind", out);
@@ -1019,11 +1038,9 @@ fn record(
                 match &current {
                     Ok(recording) => {
                         let (now, at) = (Instant::now(), recording.session.clock.now());
-                        let buffer =
-                            Duration::from_secs(settings.lock().expect("settings poisoned").options().buffer as u64);
                         // marks in another app's recording make their clip now
                         if let Some(other) = pending.take_if(|p| !Rc::ptr_eq(&p.recording, recording)) {
-                            save(&other.recording, &other.marks, None);
+                            save(&other.recording, &other.marks, other.seconds());
                         }
                         pending
                             .get_or_insert_with(|| Pending {
@@ -1032,7 +1049,7 @@ fn record(
                                 first: now,
                                 due: now,
                             })
-                            .mark(at, now, buffer);
+                            .mark(at, now);
                     }
                     Err(_) => {
                         let _ = unsafe { MessageBeep(MB_ICONHAND) };
@@ -1675,16 +1692,6 @@ struct Disk {
     total: u64,
 }
 
-/// Free bytes on the drive `path` is on, or as many as it takes when the drive can't say.
-fn room(path: &Path) -> u64 {
-    let found = path.ancestors().find(|dir| dir.is_dir());
-    let mut free = u64::MAX;
-    if let Some(dir) = found {
-        let _ = unsafe { GetDiskFreeSpaceExW(&HSTRING::from(dir), Some(&mut free), None, None) };
-    }
-    free
-}
-
 /// Space on the drive a folder is on, which may not exist yet.
 #[tauri::command]
 fn disk(folder: PathBuf) -> Result<Disk, String> {
@@ -1694,6 +1701,15 @@ fn disk(folder: PathBuf) -> Result<Disk, String> {
     unsafe { GetDiskFreeSpaceExW(&HSTRING::from(found), Some(&mut free), Some(&mut total), None) }
         .map_err(|e| e.to_string())?;
     Ok(Disk { free, total })
+}
+
+/// Seconds the way the settings say them: 30 s, 10 min, 2 h.
+fn length(seconds: u32) -> String {
+    match seconds {
+        0..60 => format!("{seconds} s"),
+        60..3600 => format!("{} min", seconds as f64 / 60.0),
+        _ => format!("{} h", seconds as f64 / 3600.0),
+    }
 }
 
 fn size(bytes: u64) -> String {

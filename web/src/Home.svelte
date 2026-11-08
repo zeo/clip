@@ -1,6 +1,6 @@
 <script lang="ts">
   import Clips from './Clips.svelte';
-  import { keyFor, sentence, sessionCount, size, type Clip, type Status } from './types';
+  import { keyFor, length, sentence, sessionCount, size, type Clip, type Status } from './types';
 
   let {
     clips,
@@ -44,7 +44,7 @@
     <section class="welcome">
       <h1>Play something, then press <kbd>{keyFor(status, 'save') ?? 'Save clip'}</kbd></h1>
       <p>
-        The last {buffer} s of the game in focus land here.
+        The last {length(buffer)} of the game in focus land here.
         {#if keyFor(status, 'mark')}<kbd>{keyFor(status, 'mark')}</kbd> marks a moment and saves it 15 s later, so the moment sits
           in the middle of the clip.{/if}
       </p>

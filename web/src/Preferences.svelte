@@ -5,7 +5,7 @@
   import { getVersion } from '@tauri-apps/api/app';
   import { open } from '@tauri-apps/plugin-dialog';
   import Bind from './Bind.svelte';
-  import { ACTIONS, PRESETS, chord, length, ramMB, size, type Corner, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
+  import { ACTIONS, PRESETS, chord, length, bufferCost, size, type Corner, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
   import { radios, reduced, say, view, zooms } from './view.svelte';
 
   let {
@@ -51,7 +51,7 @@
     { name: 'High', height: 4320, fps: 60, mbps: 50 },
     { name: 'Max', height: 4320, fps: 120, mbps: 80 }
   ];
-  const buffers = [15, 30, 60, 120, 300];
+  const buffers = [15, 30, 60, 120, 300, 600, 1800, 3600, 7200];
   const corners: [Corner, string][] = [
     ['top-left', 'Top left'],
     ['top-right', 'Top right'],
@@ -368,7 +368,7 @@
             <h2 class="group-head">Buffer</h2>
             <div class="rows">
               <label class="row">
-                <span class="row-label">Keep the last<small>About {ramMB(draft)} MB of memory at the current video settings</small></span>
+                <span class="row-label">Keep the last<small>{bufferCost(draft)} at the current video settings</small></span>
                 <select class="field" bind:value={draft.buffer}>
                   {#each buffers as b (b)}<option value={b}>{length(b)}</option>{/each}
                 </select>
@@ -448,7 +448,7 @@
                 <input type="checkbox" bind:checked={draft.hdr10} />
               </label>
               <div class="row">
-                <span class="row-label">Result<small>About {ramMB(draft)} MB in memory for {length(draft.buffer)}</small></span>
+                <span class="row-label">Result<small>{bufferCost(draft)} for {length(draft.buffer)}</small></span>
                 <span class="mono">
                   {draft.height >= 4320 ? 'native' : `${draft.height}p`}{draft.fps}, {draft.mbps} Mbps, {draft.hdr10 ? 'HEVC HDR10 on HDR' : 'H.264 SDR'}
                 </span>

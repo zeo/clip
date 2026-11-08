@@ -299,9 +299,9 @@ pub struct Recording {
 }
 
 impl Recording {
-    /// Returns once every lane is recording, or with the reason one couldn't start.
-    pub fn start(lanes: &[Lane], span: i64, clock: Clock, stop: Arc<AtomicBool>) -> Result<Self> {
-        let rings: Vec<_> = lanes.iter().map(|_| Arc::new(Mutex::new(Ring::new(span)))).collect();
+    /// Returns once every lane is recording into the `n`th of `ring`, or with the reason one couldn't start.
+    pub fn start(lanes: &[Lane], ring: impl Fn(usize) -> Ring, clock: Clock, stop: Arc<AtomicBool>) -> Result<Self> {
+        let rings: Vec<_> = (0..lanes.len()).map(|n| Arc::new(Mutex::new(ring(n)))).collect();
         let sources: Vec<(Source, u32)> = lanes.iter().map(|lane| (lane.source.clone(), lane.gain)).collect();
         let (opened, ready) = mpsc::sync_channel(1);
         let thread = {
