@@ -49,6 +49,8 @@
   const stop = $derived(clips.some((clip) => clip.path === focused) ? focused : (clips[0]?.path ?? null));
 
   const when = (clip: Clip) => `${day(clip.modified)} ${at(clip.modified)}`;
+  // clips are stamped when saved, so they began their length earlier
+  const start = (clip: Clip) => clip.modified - (clip.kind === 'clip' ? clip.seconds * 1000 : 0);
 
   async function act(command: string, args: Record<string, unknown>) {
     try {
@@ -231,6 +233,29 @@
           <span class:session-when={showApp}>{span}</span>
           <span class="mono">{session.length} {session[0].kind === 'image' ? 'image' : 'clip'}{session.length === 1 ? '' : 's'}</span>
         </div>
+        {#if session.length > 1}
+          {@const from = Math.min(...session.map(start))}
+          {@const whole = Math.max(newest.modified - from, 1)}
+          <!-- the cards below carry the same clips for the keys and screen readers, this is the pointer's map of the session -->
+          <div class="timeline" aria-hidden="true">
+            {#each session as clip (clip.path)}
+              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+              <span
+                class="timeline-clip"
+                class:on={hovered === clip.path}
+                class:starred={clip.starred}
+                style:left="{((start(clip) - from) / whole) * 100}%"
+                style:width="{((clip.seconds * 1000) / whole) * 100}%"
+                title="{title(clip)}, {at(start(clip))}, {clock(clip.seconds)}"
+                onpointerenter={() => (hovered = clip.path)}
+                onpointerleave={() => hovered === clip.path && (hovered = null)}
+                onclick={() => onopen(clip, clips)}
+              >
+                {#each clip.marks as mark (mark)}<i style:left="{(mark / Math.max(clip.seconds, 1)) * 100}%"></i>{/each}
+              </span>
+            {/each}
+          </div>
+        {/if}
       {/if}
       <ul class="grid" class:picking={picked.length > 0} role="presentation">
         {#each session as clip (clip.path)}
