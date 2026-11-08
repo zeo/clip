@@ -52,6 +52,8 @@
   // a rewound buffer opens on its last 30 s, the usual clip length
   let start = $state(untrack(() => rewind) ? Math.max(0, probed - 30) : 0);
   let end = $state(probed);
+  // the other kept parts, start and end are the part the handles move
+  let others = $state<[number, number][]>([]);
   let lanes = $state<Lane[]>([]);
   let loading = $state(true);
   let mix = $state(true);
@@ -83,6 +85,12 @@
   });
   const fps = $derived(clip.fps || 60);
   const source = $derived(convertFileSrc(clip.path) + (version ? `?v=${version}` : ''));
+  const parts = $derived([...others, [start, end] as [number, number]].sort((a, b) => a[0] - b[0]));
+  const kept = $derived(parts.reduce((sum, [a, b]) => sum + b - a, 0));
+  const gaps = $derived([0, ...parts.flat(), duration].flatMap((t, i, edges) => (i % 2 === 0 && edges[i + 1] > t ? [[t, edges[i + 1]]] : [])));
+  // the part moving can't run into its neighbours
+  const lo = $derived(Math.max(0, ...others.filter(([, b]) => b <= start).map(([, b]) => b)));
+  const hi = $derived(Math.min(duration, ...others.filter(([a]) => a >= end).map(([a]) => a)));
   const long = $derived(animated && end - start > LONGEST);
   const soloed = $derived(lanes.some((lane) => lane.solo));
   const audible = $derived(lanes.flatMap((lane, i) => ((soloed ? lane.solo : !lane.muted) ? [i] : [])));
@@ -178,7 +186,8 @@
   function follow() {
     if (!video) return;
     now = video.currentTime;
-    if (loop && now >= end) seek(start);
+    const [a, b] = ahead(now);
+    if (loop && (now < a || now >= b)) seek(a);
     else if (playing.length > 0 && Math.abs(from + (context.currentTime - started) * rate - now) > DRIFT) sound();
     if (!video.paused) frame = requestAnimationFrame(follow);
   }
@@ -199,7 +208,7 @@
   function ended() {
     stopped();
     if (loop) {
-      seek(start);
+      seek(parts[0][0]);
       video?.play();
     }
   }
@@ -211,12 +220,39 @@
     // a hair past the frame's start so the webview shows that frame, not the one before
     video.currentTime = snap(t) + 0.25 / fps;
     now = snap(t);
+    choose(now);
+  }
+
+  // the kept part playing at t or the next one, round to the first after the last
+  const ahead = (t: number) => parts.find(([, b]) => t < b - 1 / fps) ?? parts[0];
+
+  // the part under t is the one the handles and I and O move
+  function choose(t: number) {
+    const i = others.findIndex(([a, b]) => t >= a && t < b);
+    if (i >= 0) [[start, end]] = others.splice(i, 1, [start, end]);
+  }
+
+  function split() {
+    const t = snap(now);
+    if (t - start < 1 / fps || end - t < 1 / fps) return say('Put the playhead inside a kept part to split it', true);
+    others.push([start, t]);
+    start = t;
+  }
+
+  function cutOut() {
+    const rest = [...others].sort((a, b) => a[0] - b[0]);
+    if (!rest.length) return;
+    const i = rest.findIndex(([a]) => a > start);
+    [[start, end]] = rest.splice(i < 0 ? rest.length - 1 : i, 1);
+    others = rest;
+    seek(start);
   }
 
   function toggle() {
     if (!video) return;
     if (!video.paused) return video.pause();
-    if (loop && (now < start || now >= end - 1 / fps)) seek(start);
+    const [a, b] = ahead(now);
+    if (loop && (now < a || now >= b - 1 / fps)) seek(a);
     video.play();
   }
 
@@ -271,8 +307,8 @@
     target.setPointerCapture(event.pointerId);
     const move = (e: PointerEvent) => {
       const t = timeAt(e);
-      if (what === 'in') start = Math.min(t, end - 1 / fps);
-      else if (what === 'out') end = Math.max(t, start + 1 / fps);
+      if (what === 'in') start = Math.max(lo, Math.min(t, end - 1 / fps));
+      else if (what === 'out') end = Math.min(hi, Math.max(t, start + 1 / fps));
       else seek(t);
     };
     move(event);
@@ -303,7 +339,7 @@
     const heard = animated ? () => {} : await listen<number>('export-progress', (e) => (progress = e.payload));
     const out = await act('export', async () => {
       if (!animated) {
-        const args = { path, start, end, tracks: audible, mix: mix && audible.length > 1, fit: fit || null, portrait: portrait ? middle : null, replace };
+        const args = { path, ranges: parts, tracks: audible, mix: mix && audible.length > 1, fit: fit || null, portrait: portrait ? middle : null, replace };
         return invoke<string>('export', args);
       }
       const cut = { start, end, middle: portrait ? middle : null, fit };
@@ -329,7 +365,8 @@
       ));
     const pasted = copied ? ', copied to paste' : '';
     if (!replacing) return say(`Saved ${named(out)}${pasted}`);
-    [start, end] = [0, end - start];
+    [start, end] = [0, kept];
+    others = [];
     version++;
     // the original waits beside the clip until the undo runs out
     const timer = setTimeout(() => invoke('drop_original', { path }).catch((e) => say(String(e), true)), 8000);
@@ -428,8 +465,10 @@
       '>': () => speed(1),
       ArrowUp: () => loud(0.05),
       ArrowDown: () => loud(-0.05),
-      i: () => (start = Math.min(snap(now), end - 1 / fps)),
-      o: () => (end = Math.max(snap(now), start + 1 / fps)),
+      i: () => (start = Math.max(lo, Math.min(snap(now), end - 1 / fps))),
+      o: () => (end = Math.min(hi, Math.max(snap(now), start + 1 / fps))),
+      s: () => !animated && split(),
+      Delete: cutOut,
       m: mark,
       f: () => fill(),
       'Shift+p': () => prev && onopen(prev),
@@ -567,7 +606,7 @@
         <input type="range" min="0" max="1" step="0.05" aria-label="Volume" aria-valuetext="{Math.round(view.volume * 100)}%" bind:value={view.volume} style:--pct={view.volume} />
       </label>
       <span class="grow"></span>
-      <span class="form-hint">K plays, J and L skip, I and O cut, M marks, ? lists every key</span>
+      <span class="form-hint">K plays, J and L skip, I and O cut, S splits, M marks, ? lists every key</span>
       <button class="gel" disabled={busy !== ''} title="Save this frame as a png beside the clip" onclick={still}>Save frame</button>
       <button class="gel icon" aria-pressed={full} aria-label="Fill the screen" title="{full ? 'Leave' : 'Fill'} the screen (F)" onclick={() => fill()}>
         <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -578,7 +617,9 @@
     <div class="tracks">
       <span class="lane-label mono">Time</span>
       <div class="timeline" bind:this={bar} role="presentation" onpointerdown={(e) => drag(e, 'head')}>
-        <div class="kept" style:left={pct(start)} style:right={`calc(100% - ${pct(end)})`}></div>
+        {#each parts as [a, b] (a)}
+          <div class="kept" class:other={a !== start} style:left={pct(a)} style:right={`calc(100% - ${pct(b)})`}></div>
+        {/each}
         {#each clip.marks as at (at)}
           <button
             class="mark"
@@ -607,8 +648,9 @@
         </div>
         <div class="wave" class:quiet={!audible.includes(i)}>
           <svg aria-hidden="true" viewBox="0 0 {PEAKS} 100" preserveAspectRatio="none"><path d={lane.peaks} /></svg>
-          <div class="shade" style:right={`calc(100% - ${pct(start)})`}></div>
-          <div class="shade" style:left={pct(end)}></div>
+          {#each gaps as [a, b] (a)}
+            <div class="shade" style:left={pct(a)} style:right={`calc(100% - ${pct(b)})`}></div>
+          {/each}
           <div class="playhead" style:left={pct(now)}></div>
         </div>
       {:else}
@@ -662,13 +704,17 @@
       <dl class="facts cut-facts">
         <div><dt>In</dt><dd>{clock(start, true)}</dd></div>
         <div><dt>Out</dt><dd>{clock(end, true)}</dd></div>
-        <div><dt>Keeps</dt><dd>{(end - start).toFixed(2)} s</dd></div>
+        <div><dt>Keeps</dt><dd>{kept.toFixed(2)} s{parts.length > 1 ? ` in ${parts.length} parts` : ''}</dd></div>
       </dl>
+      <div class="gel-row">
+        <button class="gel" disabled={busy !== '' || animated} title="Split the part at the playhead, to cut out what's between (S)" onclick={split}>Split</button>
+        <button class="gel" disabled={busy !== '' || parts.length < 2} title="Cut out the part the handles are on (Del)" onclick={cutOut}>Cut out this part</button>
+      </div>
       <div class="option">
         <span id="format-label">Format</span>
         <div class="seg" role="radiogroup" aria-labelledby="format-label" use:radios>
           <button role="radio" aria-checked={!animated} disabled={busy !== ''} onclick={() => (animated = false)}>MP4</button>
-          <button role="radio" aria-checked={animated} disabled={busy !== ''} onclick={() => (animated = true)}>GIF</button>
+          <button role="radio" aria-checked={animated} disabled={busy !== '' || parts.length > 1} title={parts.length > 1 ? 'GIFs keep one part' : undefined} onclick={() => (animated = true)}>GIF</button>
         </div>
       </div>
       <label class="option">

@@ -161,21 +161,22 @@ pub struct Job<'a> {
     pub cancel: Option<&'a AtomicBool>,
 }
 
-/// Writes `start` to `end` seconds of `source` to `out`, re-encoded on the gpu so the cut lands on
-/// the exact frames asked for. Only the audio `tracks` listed are kept, summed into one when `mix`.
+/// Writes the `ranges` of `source`, in seconds and in order, one after another to `out`, re-encoded
+/// on the gpu so each cut lands on the exact frames asked for. Only the audio `tracks` listed are
+/// kept, summed into one when `mix`.
 /// With a size to fit, the video gets what the audio leaves, the frame rate and then the picture
 /// come down when that is too little for them, and a copy that comes out over is encoded again lower.
 pub fn trim(
     source: &Path,
     out: &Path,
-    start: f64,
-    end: f64,
+    ranges: &[(f64, f64)],
     tracks: &[usize],
     mix: bool,
     job: &Job,
 ) -> std::result::Result<(), String> {
     let probe = crate::save::probe(source).map_err(|e| format!("can't read the clip: {e}"))?;
-    let whole = start <= 0.05 && end >= probe.seconds - 0.05 && tracks.len() == probe.tracks.len();
+    let whole = matches!(ranges, [(start, end)] if *start <= 0.05 && *end >= probe.seconds - 0.05)
+        && tracks.len() == probe.tracks.len();
     let bytes = std::fs::metadata(source).map_or(u64::MAX, |meta| meta.len());
     if whole && probe.tracks.len() <= 1 && job.portrait.is_none() && job.fit.is_some_and(|budget| bytes <= budget) {
         // it already fits, and encoding it again would only lose detail
@@ -191,11 +192,17 @@ pub fn trim(
         _ => AAC_BYTES_PER_SECOND,
     };
     let target = match goal {
-        Some(bytes) => Some(video_bitrate(bytes, end - start, streams * aac_rate as u64 * 8)?),
+        Some(bytes) => Some(video_bitrate(
+            bytes,
+            ranges.iter().map(|(start, end)| end - start).sum(),
+            streams * aac_rate as u64 * 8,
+        )?),
         None => None,
     };
+    let ticks: Vec<(i64, i64)> =
+        ranges.iter().map(|(start, end)| ((start * SECOND as f64) as i64, (end * SECOND as f64) as i64)).collect();
     let video_of = |target| {
-        trim_video(source, (start * SECOND as f64) as i64, (end * SECOND as f64) as i64, target, job).map_err(|e| {
+        trim_video(source, &ticks, target, job).map_err(|e| {
             if e.code() == E_ABORT {
                 CANCELLED.to_string()
             } else {
@@ -203,7 +210,7 @@ pub fn trim(
             }
         })
     };
-    let (mut video, mut format, first, length) = video_of(target)?;
+    let (mut video, mut format, spans) = video_of(target)?;
     if video.is_empty() {
         return Err("there are no frames between the start and the end".into());
     }
@@ -212,10 +219,17 @@ pub fn trim(
         .iter()
         .map(|&i| all.get(i).ok_or(format!("the clip has no track {i}")))
         .collect::<std::result::Result<_, _>>()?;
+    // each part's sound runs as long as its frames, so the parts after it stay in sync
     let span = |pcm: &[u8]| {
-        let from = (first * RATE as i64 / SECOND) as usize * BLOCK;
-        let to = from + (length * RATE as i64 / SECOND) as usize * BLOCK;
-        pcm.get(from.min(pcm.len())..to.min(pcm.len())).unwrap_or_default().to_vec()
+        let mut kept = Vec::new();
+        for &(first, length) in &spans {
+            let from = (first * RATE as i64 / SECOND) as usize * BLOCK;
+            let samples = (length * RATE as i64 / SECOND) as usize * BLOCK;
+            let part = pcm.get(from.min(pcm.len())..(from + samples).min(pcm.len())).unwrap_or_default();
+            kept.extend_from_slice(part);
+            kept.resize(kept.len() + samples - part.len(), 0);
+        }
+        kept
     };
     let lanes: Vec<(String, Vec<u8>)> = match (mix, chosen.as_slice()) {
         (_, []) => Vec::new(),
@@ -246,7 +260,7 @@ pub fn trim(
                 break;
             }
             let bitrate = (format.bitrate as f64 * goal as f64 / size as f64 * 0.97) as u32;
-            (video, format, _, _) = video_of(Some(bitrate))?;
+            (video, format, _) = video_of(Some(bitrate))?;
             write(&video, format)?;
         }
         let size = std::fs::metadata(out).map_or(u64::MAX, |meta| meta.len());
@@ -338,16 +352,18 @@ fn aac(pcm: &[u8], bytes_per_second: u32) -> Result<Vec<Arc<Packet>>> {
     Ok(packets.into_iter().map(Arc::new).collect())
 }
 
-/// Decodes the frames from `start` to `end` on the gpu and encodes them again from time 0, at the
-/// clip's bitrate and size or at most the `target` bitrate, cut to the job's 9:16 window. Returns
-/// the packets, their format, the source time of the first frame kept and how long the kept frames last.
+/// For each range, where its first kept frame was in the source and how long its kept frames last.
+type Spans = Vec<(i64, i64)>;
+
+/// Decodes the frames of each range on the gpu and encodes them again one after another from time 0,
+/// at the clip's bitrate and size or at most the `target` bitrate, cut to the job's 9:16 window.
+/// Returns the packets, their format and what each range kept.
 fn trim_video(
     source: &Path,
-    start: i64,
-    end: i64,
+    ranges: &[(i64, i64)],
     target: Option<u32>,
     job: &Job,
-) -> Result<(Vec<Arc<Packet>>, Format, i64, i64)> {
+) -> Result<(Vec<Arc<Packet>>, Format, Spans)> {
     let gpu = crate::capture::gpu()?;
     unsafe {
         let mut token = 0;
@@ -431,54 +447,58 @@ fn trim_video(
         // decoders pad the coded height to a multiple of 16, so only the picture is copied
         let picture = D3D11_BOX { left, top: 0, front: 0, right: left + shown.0, bottom: shown.1, back: 1 };
 
-        reader.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(start))?;
-        let (mut packets, mut first, mut kept, mut seen) = (Vec::new(), None, 0i64, 0u32);
-        loop {
-            if job.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-                return Err(windows::core::Error::from(E_ABORT));
+        let total = ranges.iter().map(|(start, end)| end - start).sum::<i64>().max(1);
+        let (mut packets, mut spans, mut kept, mut seen, mut done) = (Vec::new(), Vec::new(), 0i64, 0u32, 0);
+        for &(start, end) in ranges {
+            reader.SetCurrentPosition(&GUID::zeroed(), &PROPVARIANT::from(start))?;
+            let (mut first, began) = (None, kept);
+            loop {
+                if job.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return Err(windows::core::Error::from(E_ABORT));
+                }
+                let (mut flags, mut time, mut sample) = (0, 0, None);
+                reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))?;
+                if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 || time >= end {
+                    break;
+                }
+                let Some(sample) = sample.filter(|_| time >= start) else { continue };
+                seen += 1;
+                if (seen - 1) % step != 0 {
+                    continue;
+                }
+                if let Some(progress) = job.progress {
+                    progress((done + time - start) as f64 / total as f64);
+                }
+                let buffer = sample.GetBufferByIndex(0)?.cast::<IMFDXGIBuffer>().map_err(|_| {
+                    windows::core::Error::new(MF_E_UNSUPPORTED_D3D_TYPE, "the gpu can't decode this clip")
+                })?;
+                let mut decoded = std::ptr::null_mut();
+                buffer.GetResource(&ID3D11Texture2D::IID, &mut decoded)?;
+                let decoded = ID3D11Texture2D::from_raw(decoded);
+                let target = &targets[kept as usize % targets.len()];
+                gpu.context.CopySubresourceRegion(
+                    target,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &decoded,
+                    buffer.GetSubresourceIndex()?,
+                    Some(&picture),
+                );
+                let frame = match &mut shrink {
+                    Some(shrink) => shrink.convert(target, shown, fps)?,
+                    None => target.clone(),
+                };
+                packets.extend(encoder.encode(&frame, format.time(kept))?);
+                first.get_or_insert(time);
+                kept += 1;
             }
-            let (mut flags, mut time, mut sample) = (0, 0, None);
-            reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))?;
-            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 || time >= end {
-                break;
-            }
-            let Some(sample) = sample.filter(|_| time >= start) else { continue };
-            seen += 1;
-            if (seen - 1) % step != 0 {
-                continue;
-            }
-            if let Some(progress) = job.progress {
-                progress((time - start) as f64 / (end - start).max(1) as f64);
-            }
-            let buffer = sample
-                .GetBufferByIndex(0)?
-                .cast::<IMFDXGIBuffer>()
-                .map_err(|_| windows::core::Error::new(MF_E_UNSUPPORTED_D3D_TYPE, "the gpu can't decode this clip"))?;
-            let mut decoded = std::ptr::null_mut();
-            buffer.GetResource(&ID3D11Texture2D::IID, &mut decoded)?;
-            let decoded = ID3D11Texture2D::from_raw(decoded);
-            let target = &targets[kept as usize % targets.len()];
-            gpu.context.CopySubresourceRegion(
-                target,
-                0,
-                0,
-                0,
-                0,
-                &decoded,
-                buffer.GetSubresourceIndex()?,
-                Some(&picture),
-            );
-            let frame = match &mut shrink {
-                Some(shrink) => shrink.convert(target, shown, fps)?,
-                None => target.clone(),
-            };
-            packets.extend(encoder.encode(&frame, format.time(kept))?);
-            first.get_or_insert(time);
-            kept += 1;
+            spans.push((first.unwrap_or(start), format.time(kept) - format.time(began)));
+            done += end - start;
         }
         packets.extend(encoder.finish()?);
-        let length = format.time(kept);
-        Ok((packets.into_iter().map(Arc::new).collect(), format, first.unwrap_or(start), length))
+        Ok((packets.into_iter().map(Arc::new).collect(), format, spans))
     }
 }
 

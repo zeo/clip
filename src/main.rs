@@ -593,13 +593,12 @@ fn self_test() -> Result<()> {
         let outcome = (|| -> std::result::Result<_, String> {
             let tracks = export::tracks(&source)?.into_iter().map(|(name, pcm)| (name, pcm.len() / audio::BLOCK));
             let tracks: Vec<(String, usize)> = tracks.collect();
-            export::trim(&source, &mixed, 0.5, 1.5, &[0, 1], true, &Default::default())?;
-            export::trim(&source, &kept, 0.5, 1.5, &[1], false, &Default::default())?;
+            export::trim(&source, &mixed, &[(0.5, 1.5)], &[0, 1], true, &Default::default())?;
+            export::trim(&source, &kept, &[(0.5, 1.5)], &[1], false, &Default::default())?;
             export::trim(
                 &source,
                 &fitted,
-                0.5,
-                1.5,
+                &[(0.5, 1.5)],
                 &[0, 1],
                 true,
                 &export::Job { fit: Some(budget), ..Default::default() },

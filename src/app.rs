@@ -1454,8 +1454,7 @@ async fn export(
     app: AppHandle,
     shared: State<'_, Shared>,
     path: PathBuf,
-    start: f64,
-    end: f64,
+    ranges: Vec<(f64, f64)>,
     tracks: Vec<usize>,
     mix: bool,
     fit: Option<u64>,
@@ -1467,14 +1466,18 @@ async fn export(
         false => listed(&shared, &path)?,
     }
     let dir = home(&shared, &path)?;
-    if !(start >= 0.0 && end > start) {
-        return Err("the end has to come after the start".into());
+    if ranges.is_empty() || ranges.iter().any(|&(start, end)| !(start >= 0.0 && end > start)) {
+        return Err("each part has to end after it starts".into());
+    }
+    if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+        return Err("the parts have to be in order and apart".into());
     }
     if fit.is_some_and(|bytes| bytes < 1_000_000) {
         return Err("the size has to be at least 1 MB".into());
     }
     CANCEL.store(false, Ordering::Relaxed);
     let progress = app.clone();
+    let parts = ranges.clone();
     let out = blocking(move || {
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let kind = match (fit, portrait) {
@@ -1503,7 +1506,7 @@ async fn export(
             }
         };
         let job = crate::export::Job { fit, portrait, progress: Some(&report), cancel: Some(&CANCEL) };
-        if let Err(e) = crate::export::trim(&path, &out, start, end, &tracks, mix || fit.is_some(), &job) {
+        if let Err(e) = crate::export::trim(&path, &out, &parts, &tracks, mix || fit.is_some(), &job) {
             let _ = std::fs::remove_file(&out);
             return Err(e);
         }
@@ -1516,13 +1519,23 @@ async fn export(
     .await
     .and_then(|(path, out)| {
         marked(&shared, |marks, folder| {
-            let kept = marks.marks(folder, &path).into_iter().filter(|at| (start..=end).contains(at));
-            marks.mark(folder, &out, kept.map(|at| at - start).collect());
+            marks.mark(folder, &out, carried(&marks.marks(folder, &path), &ranges));
         })?;
         Ok(out)
     });
     let _ = app.emit("clips", ());
     out
+}
+
+/// Where `marks` land once only the `ranges` are kept, one after another.
+fn carried(marks: &[f64], ranges: &[(f64, f64)]) -> Vec<f64> {
+    let mut before = 0.0;
+    let mut kept = Vec::new();
+    for &(start, end) in ranges {
+        kept.extend(marks.iter().filter(|at| (start..=end).contains(*at)).map(|at| before + at - start));
+        before += end - start;
+    }
+    kept
 }
 
 /// Puts `trimmed` where `clip` was, with its date, and keeps the clip beside it as `.orig`.
@@ -1843,6 +1856,12 @@ mod tests {
         assert_eq!(unescape("50%"), None);
         assert_eq!(unescape("%zz"), None);
         assert_eq!(unescape("%C3"), None);
+    }
+
+    #[test]
+    fn marks_follow_their_part_and_drop_with_the_cut() {
+        assert_eq!(carried(&[0.5, 2.5, 4.5], &[(0.0, 1.0), (4.0, 5.0)]), [0.5, 1.5]);
+        assert_eq!(carried(&[3.0], &[(1.0, 4.0)]), [2.0]);
     }
 
     #[test]

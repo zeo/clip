@@ -148,6 +148,8 @@
         [['<', '>'], 'Slower or faster'],
         [['Up', 'Down'], 'Volume'],
         [['I', 'O'], 'Set where the cut starts and ends'],
+        [['S'], 'Split the cut at the playhead'],
+        [['Del'], 'Cut out the part the handles are on'],
         [['M'], 'Mark the moment'],
         [['Del'], 'Remove the mark in focus'],
         [['F'], 'Fill the screen'],

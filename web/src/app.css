@@ -396,6 +396,7 @@ input[type="range"]:focus-visible { outline-offset: 2px; }
 .timeline, .wave { position: relative; border-radius: var(--r-tight); background: var(--well); border: 1px solid #000; border-bottom-color: #333; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.8); }
 .timeline { height: 24px; cursor: ew-resize; touch-action: none; }
 .kept { position: absolute; top: 0; bottom: 0; background: rgba(47, 111, 181, 0.22); border-top: 1px solid #4f8fd6; border-bottom: 1px solid #4f8fd6; }
+.kept.other { background: rgba(47, 111, 181, 0.12); border-color: #3a6ea8; }
 .handle { position: absolute; top: -3px; bottom: -3px; width: 10px; margin-left: -5px; background: var(--grad-aqua-default); border: 1px solid #0e3265; border-radius: var(--r-tight); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5); cursor: ew-resize; touch-action: none; }
 .mark { position: absolute; bottom: -1px; width: 9px; height: 9px; margin-left: -4.5px; background: var(--good); transform: rotate(45deg) scale(0.8); }
 .mark:hover, .mark:focus-visible { transform: rotate(45deg); outline: none; box-shadow: 0 0 0 2px var(--well); }
@@ -406,8 +407,6 @@ input[type="range"]:focus-visible { outline-offset: 2px; }
 .wave svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .wave path { stroke: #9cc4ff; stroke-width: 1; vector-effect: non-scaling-stroke; }
 .shade { position: absolute; top: 0; bottom: 0; background: rgba(0, 0, 0, 0.6); pointer-events: none; }
-.shade:first-of-type { left: 0; }
-.shade + .shade { right: 0; }
 .inspector { grid-area: side; display: flex; flex-direction: column; min-height: 0; background: var(--bg-paper); border-left: 1px solid #050505; overflow-y: auto; }
 .panel { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px 16px; }
 .panel + .panel { border-top: 1px solid var(--rule); }
