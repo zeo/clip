@@ -1,14 +1,18 @@
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use windows::core::w;
+use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY};
-use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::System::Ole::{IDropSource, CF_HDROP, DROPEFFECT_COPY};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{
+    BHID_DataObject, ILFree, SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHParseDisplayName, DROPFILES,
+};
 
 /// A DROPFILES header and then the paths as wide strings, each ended by a nul and the list by
 /// another, the way explorer puts files on the clipboard.
@@ -63,9 +67,62 @@ pub fn copy_files(owner: HWND, paths: &[PathBuf]) -> Result<(), String> {
     }
 }
 
+/// The data object explorer itself hands out for these files, so every drop target reads it.
+fn shell_data(paths: &[PathBuf]) -> windows::core::Result<IDataObject> {
+    let mut lists = Vec::with_capacity(paths.len());
+    let parsed = paths.iter().try_for_each(|path| {
+        let mut list: *mut ITEMIDLIST = std::ptr::null_mut();
+        unsafe { SHParseDisplayName(&HSTRING::from(path.as_path()), None, &mut list, 0, None) }?;
+        lists.push(list.cast_const());
+        Ok(())
+    });
+    let data = parsed
+        .and_then(|()| unsafe { SHCreateShellItemArrayFromIDLists(&lists)?.BindToHandler(None, &BHID_DataObject) });
+    for list in lists {
+        unsafe { ILFree(Some(list)) };
+    }
+    data
+}
+
+/// Drags files out to explorer, discord or a browser while the mouse button stays down, as a copy.
+/// Blocks until they're dropped, on the thread that owns `owner`.
+pub fn drag_files(owner: HWND, paths: &[PathBuf]) -> Result<(), String> {
+    let data = shell_data(paths).map_err(|e| e.to_string())?;
+    // with no drop source of its own the shell supplies one, along with the drag image
+    unsafe { SHDoDragDrop(Some(owner), &data, None::<&IDropSource>, DROPEFFECT_COPY) }
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL,
+    };
+
+    #[test]
+    fn dragged_files_offer_a_file_drop() {
+        let file = std::env::temp_dir().join("clip drag test.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let data = shell_data(std::slice::from_ref(&file)).unwrap();
+        let format = FORMATETC {
+            cfFormat: CF_HDROP.0,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        let offered = unsafe { data.QueryGetData(&format) };
+        std::fs::remove_file(&file).unwrap();
+        assert!(offered.is_ok(), "{offered:?}");
+        assert!(shell_data(&[PathBuf::from(
+            r"Z:
+o such\clip.mp4"
+        )])
+        .is_err());
+    }
 
     #[test]
     fn dropped_files_are_wide_and_double_nul_ended() {

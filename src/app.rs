@@ -275,6 +275,7 @@ fn serve(restarted: bool) -> Result<(), String> {
             set_marks,
             save_frame,
             copy_files,
+            drag_out,
             save_thumb,
             track_audio,
             export,
@@ -1354,6 +1355,22 @@ fn unescape(text: &str) -> Option<String> {
 fn copy_files(window: WebviewWindow, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
     paths.iter().try_for_each(|path| listed(&shared, path))?;
     crate::clipboard::copy_files(window.hwnd().map_err(|e| e.to_string())?, &paths)
+}
+
+/// Hands the files to windows to drag out, from a dragstart in the library while the button is still down.
+#[tauri::command]
+async fn drag_out(window: WebviewWindow, shared: State<'_, Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
+    paths.iter().try_for_each(|path| listed(&shared, path))?;
+    // a window handle isn't Send, its value is
+    let owner = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+    let (done, dropped) = mpsc::channel();
+    // ole drags run on the thread that owns the window
+    window
+        .run_on_main_thread(move || {
+            let _ = done.send(crate::clipboard::drag_files(HWND(owner as _), &paths));
+        })
+        .map_err(|e| e.to_string())?;
+    dropped.recv().map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

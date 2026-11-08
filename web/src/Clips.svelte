@@ -222,6 +222,13 @@
             aria-selected={selected.has(clip.path)}
             tabindex={clip.path === stop ? 0 : -1}
             data-path={clip.path}
+            draggable="true"
+            ondragstart={(e) => {
+              // windows runs the drag, so the files land in explorer, chats and browsers as real files
+              e.preventDefault();
+              const paths = selected.has(clip.path) ? picked.map((c) => c.path) : [clip.path];
+              invoke('drag_out', { paths }).catch((err) => say(String(err), true));
+            }}
             onfocus={() => (focused = clip.path)}
             onpointerenter={() => (hovered = clip.path)}
             onpointerleave={() => hovered === clip.path && (hovered = null)}
