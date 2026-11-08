@@ -279,6 +279,7 @@ fn serve(restarted: bool) -> Result<(), String> {
             save_thumb,
             track_audio,
             export,
+            join,
             cancel_export,
             restore_original,
             drop_original,
@@ -1525,6 +1526,51 @@ async fn export(
     });
     let _ = app.emit("clips", ());
     out
+}
+
+/// Joins `paths` in order into one new clip beside the first, with every clip's marks moved along.
+#[tauri::command]
+async fn join(app: AppHandle, shared: State<'_, Shared>, paths: Vec<PathBuf>) -> Result<PathBuf, String> {
+    if paths.len() < 2 {
+        return Err("pick two clips or more to join".into());
+    }
+    paths.iter().try_for_each(|path| in_folder(&shared, path, &["mp4"], true))?;
+    let dir = home(&shared, &paths[0])?;
+    CANCEL.store(false, Ordering::Relaxed);
+    let progress = app.clone();
+    let clips = paths.clone();
+    let joined = blocking(move || {
+        let out = free(&dir, " joined", "mp4");
+        let sent = Cell::new(u32::MAX);
+        let report = |done: f64| {
+            let percent = (done.clamp(0.0, 1.0) * 100.0) as u32;
+            if sent.replace(percent) != percent {
+                let _ = progress.emit("export-progress", percent);
+            }
+        };
+        let job = crate::export::Job { progress: Some(&report), cancel: Some(&CANCEL), ..Default::default() };
+        match crate::export::join(&clips, &out, &job) {
+            Ok(starts) => Ok((out, starts)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&out);
+                Err(e)
+            }
+        }
+    })
+    .await
+    .and_then(|(out, starts)| {
+        marked(&shared, |marks, folder| {
+            let moved = paths
+                .iter()
+                .zip(starts)
+                .flat_map(|(path, start)| marks.marks(folder, path).into_iter().map(move |at| start + at));
+            let moved = moved.collect();
+            marks.mark(folder, &out, moved);
+        })?;
+        Ok(out)
+    });
+    let _ = app.emit("clips", ());
+    joined
 }
 
 /// Where `marks` land once only the `ranges` are kept, one after another.

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { SvelteSet } from 'svelte/reactivity';
   import Thumb from './Thumb.svelte';
   import { at, clock, day, size, title, type Clip, type Query } from './types';
@@ -43,6 +44,8 @@
   const clips = $derived(sessions.flat());
   const picked = $derived(clips.filter((clip) => selected.has(clip.path)));
   const allStarred = $derived(picked.length > 0 && picked.every((clip) => clip.starred));
+  const joinable = $derived(picked.length > 1 && picked.every((clip) => clip.kind === 'clip'));
+  let joining = $state<number | null>(null);
   const stop = $derived(clips.some((clip) => clip.path === focused) ? focused : (clips[0]?.path ?? null));
 
   const when = (clip: Clip) => `${day(clip.modified)} ${at(clip.modified)}`;
@@ -73,6 +76,23 @@
       () => say(`Copied ${files.length === 1 ? title(files[0]) : `${files.length} clips`}, paste into a chat or folder`),
       (e) => say(String(e), true)
     );
+  }
+
+  async function join() {
+    // oldest first, the order they happened in
+    const paths = [...picked].sort((a, b) => a.modified - b.modified).map((clip) => clip.path);
+    joining = 0;
+    const heard = await listen<number>('export-progress', (e) => (joining = e.payload));
+    try {
+      const out = await invoke<string>('join', { paths });
+      selected.clear();
+      say(`Joined ${paths.length} clips into ${out.split(/[\\/]/).pop()}`);
+    } catch (e) {
+      say(String(e), true);
+    } finally {
+      heard();
+      joining = null;
+    }
   }
 
   function remove(chosen: Clip[]) {
@@ -290,6 +310,12 @@
       {allStarred ? 'Unstar' : 'Star'}
     </button>
     <button class="gel" onclick={() => copy(picked)}>Copy <kbd>Ctrl+C</kbd></button>
+    {#if joining !== null}
+      <span class="mono" role="status">Joining {joining}%</span>
+      <button class="gel" onclick={() => invoke('cancel_export')}>Cancel</button>
+    {:else if joinable}
+      <button class="gel" title="One clip of these, oldest first" onclick={join}>Join</button>
+    {/if}
     <button class="gel danger" onclick={() => remove(picked)}>Delete <kbd>Del</kbd></button>
     <button class="gel" onclick={() => selected.clear()}>Clear <kbd>Esc</kbd></button>
   </div>
