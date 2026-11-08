@@ -24,7 +24,7 @@ The tray app looks at the focused window four times a second. Each app is named 
 
 Only games are followed: a window counts once it covers its whole monitor, the way fullscreen and borderless games do, and maximized windows don't. Settings lists the apps with a window open, and any switched on there are recorded in a window too. Games switched off on the recorder page, or from the top bar while they record, are never recorded. The desktop, taskbar, start menu, minimized and cloaked windows, tool windows and clip's own window never are. Focus moving to something else leaves the game recording. Once the recorded window closes, clip records nothing and the tray says it is waiting for a game, and Alt+F9 or Alt+F10 plays the Windows error sound.
 
-Settings lists the apps playing sound right now. Each one switched on gets its own track in every clip, the way OBS adds an application audio capture source, and is left out of `others`. While that app is the one being recorded, its sound stays on `game` and it gets no second track.
+The audio page lists every source in one place, the way Medal does: the game, everything else, Discord, the microphone, then the apps playing sound right now with their exe icons. Each has its own volume. Each app switched on gets its own track in every clip, the way OBS adds an application audio capture source, and is left out of `others`. While that app is the one being recorded, its sound stays on `game` and it gets no second track.
 
 ## marks
 

@@ -162,6 +162,14 @@ pub fn playing() -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// A running process id for each of these lowercase exe names that has one.
+pub fn running(names: &[String]) -> Vec<(String, u32)> {
+    let processes = Processes::snapshot();
+    let first =
+        |name: &String| processes.0.iter().find(|(_, (_, exe))| exe == name).map(|(&pid, _)| (name.clone(), pid));
+    names.iter().filter_map(first).collect()
+}
+
 /// Every running process's parent and lowercase exe name.
 struct Processes(HashMap<u32, (u32, String)>);
 

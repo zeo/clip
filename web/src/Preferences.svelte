@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
+  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getVersion } from '@tauri-apps/api/app';
   import { open } from '@tauri-apps/plugin-dialog';
@@ -86,15 +86,21 @@
   const restarts = $derived(!!draft && !!before && restarting.some((k) => JSON.stringify(draft![k]) !== JSON.stringify(before[k])));
   const searching = $derived(search.trim() !== '');
   const shownPages = $derived(searching ? pages.filter((p) => found[p.id]) : pages.filter((p) => p.id === page));
-  const lanes = $derived(
-    draft
-      ? [
-          { name: 'game', label: 'The game', hint: 'The app being recorded' },
-          { name: 'others', label: 'Everything else', hint: 'Every other app, unless it has its own track' },
-          { name: 'voice', label: 'Discord', hint: 'Voice chat, while Discord is running' }
-        ]
-      : []
-  );
+  const DISCORD = ['discord.exe', 'discordptb.exe', 'discordcanary.exe'];
+  const glyphs = {
+    game: 'M6 7h8a3.5 3.5 0 0 1 3.4 4.3l-.6 2.6a1.8 1.8 0 0 1-3.1.8L12 13H8l-1.7 1.7a1.8 1.8 0 0 1-3.1-.8l-.6-2.6A3.5 3.5 0 0 1 6 7zM6.5 9.5v2M5.5 10.5h2M13 10h0M14.5 11.5h0',
+    others: 'M3.5 8h3l4-3.5v11l-4-3.5h-3zM13.5 7.5c1.2 1.4 1.2 3.6 0 5M15.5 5.5c2.4 2.6 2.4 6.4 0 9',
+    voice: 'M4 12v-1.5a6 6 0 0 1 12 0V12M4 12h2.5v4H5a1 1 0 0 1-1-1zM16 12h-2.5v4H15a1 1 0 0 0 1-1z',
+    mic: 'M10 3a2.5 2.5 0 0 1 2.5 2.5v4a2.5 2.5 0 0 1-5 0v-4A2.5 2.5 0 0 1 10 3zM5.5 9.5a4.5 4.5 0 0 0 9 0M10 14v3M7.5 17h5',
+    app: 'M3.5 4.5h13v11h-13zM3.5 7.5h13'
+  };
+  const lanes = [
+    { name: 'game', label: 'Game audio', hint: 'The app being recorded' },
+    { name: 'others', label: 'Everything else', hint: 'Other apps without a track of their own' },
+    { name: 'voice', label: 'Discord', hint: 'Voice chat, while Discord runs' }
+  ] as const;
+  // exe icons by lowercase exe name, saved the first time each one runs
+  let icons = $state<Record<string, string>>({});
 
   onMount(async () => {
     const s = await invoke<Settings>('settings');
@@ -120,7 +126,9 @@
         for (const group of section.querySelectorAll<HTMLElement>('.group')) {
           let inGroup = 0;
           for (const row of group.querySelectorAll<HTMLElement>('.row')) {
-            const hit = !words || (row.querySelector('.row-label')?.textContent ?? '').toLowerCase().includes(words);
+            // a slider's name counts too, so volume finds the audio sources
+            const said = [row.querySelector('.row-label')?.textContent, ...[...row.querySelectorAll('[aria-label]')].map((c) => c.getAttribute('aria-label'))];
+            const hit = !words || said.join(' ').toLowerCase().includes(words);
             row.hidden = !hit;
             inGroup += +hit;
           }
@@ -140,6 +148,7 @@
   async function look() {
     try {
       [playing, windowed, mics] = await Promise.all([invoke<string[]>('audio_apps'), invoke<string[]>('windowed_apps'), invoke<Mic[]>('mics')]);
+      icons = await invoke<Record<string, string>>('app_icons', { exes: [...choices(playing, draft?.apps), ...DISCORD] });
     } catch (e) {
       error = String(e);
     }
@@ -249,10 +258,27 @@
   </header>
 {/snippet}
 
-{#snippet slider(name: string, label: string)}
+{#snippet slider(name: string, label: string, off = false)}
   {@const value = draft?.volumes[name] ?? 100}
-  <input type="range" min="0" max="200" step="5" aria-label="{label} volume" {value} oninput={(e) => volume(name, Number(e.currentTarget.value))} />
-  <span class="mono readout">{value}%</span>
+  <input type="range" min="0" max="200" step="5" aria-label="{label} volume" {value} disabled={off} style:--pct={value / 200} oninput={(e) => volume(name, Number(e.currentTarget.value))} />
+  <span class="mono readout" class:mute={off}>{value}%</span>
+{/snippet}
+
+{#snippet source(name: string, label: string, hint: string, glyph: string, icon: string | undefined, on?: boolean, toggle?: (on: boolean) => void)}
+  <div class="row source">
+    {#if toggle}
+      <input type="checkbox" checked={on} aria-label="Record {label}" onchange={(e) => toggle(e.currentTarget.checked)} />
+    {:else}
+      <span class="source-fixed"></span>
+    {/if}
+    {#if icon}
+      <img class="source-icon" src={convertFileSrc(icon)} alt="" draggable="false" />
+    {:else}
+      <svg class="source-icon" viewBox="0 0 20 20" aria-hidden="true"><path d={glyph} /></svg>
+    {/if}
+    <span class="row-label" class:dim={on === false}>{label}{#if hint}<small>{hint}</small>{/if}</span>
+    {@render slider(name, label, on === false)}
+  </div>
 {/snippet}
 
 <aside class="side">
@@ -436,48 +462,32 @@
         <section data-page="audio">
           {@render head('audio')}
           <section class="group">
-            <h2 class="group-head">Tracks</h2>
-            <p class="form-hint">Each source gets its own track. Volumes go up to 200%, louder clips past 100% where it's quiet.</p>
+            <h2 class="group-head">Recording audio</h2>
             <div class="rows">
               {#each lanes as lane (lane.name)}
-                <div class="row">
-                  <span class="row-label">{lane.label} volume<small>{lane.hint}</small></span>
-                  {@render slider(lane.name, lane.label)}
-                </div>
+                {@const discord = lane.name === 'voice' ? DISCORD.find((exe) => icons[exe]) : undefined}
+                {@render source(lane.name, lane.label, lane.hint, glyphs[lane.name], discord && icons[discord])}
               {/each}
+              {@render source('mic', 'Microphone', mics.length ? (mics.find((m) => m.id === draft!.micDevice)?.name ?? 'Default device') : 'No microphone is plugged in', glyphs.mic, undefined, draft.mic, (on) => (draft!.mic = on))}
               {#each choices(playing, draft.apps) as exe (exe)}
-                {@const name = exe.toLowerCase().replace(/\.exe$/, '')}
-                <div class="row">
-                  <label class="row-label check">
-                    <input type="checkbox" checked={draft.apps.includes(exe)} onchange={(e) => pick('apps', exe, e.currentTarget.checked)} />
-                    <span class="mono">{exe} on its own track</span>
-                  </label>
-                  {#if draft.apps.includes(exe)}{@render slider(name, exe)}{/if}
-                </div>
-              {:else}
-                <div class="row"><span class="row-label dim">No other app is playing sound right now</span></div>
+                {@render source(exe.toLowerCase().replace(/\.exe$/, ''), exe.replace(/\.exe$/i, ''), playing.includes(exe) ? 'Playing sound now' : 'Quiet right now', glyphs.app, icons[exe.toLowerCase()], draft.apps.includes(exe), (on) => pick('apps', exe, on))}
               {/each}
-              <div class="row"><span class="row-label">Look again<small>Lists the apps playing sound right now</small></span><button class="gel" onclick={look}>Look again</button></div>
+            </div>
+            <div class="form-foot">
+              <p class="form-hint">Each source is saved on a track of its own. Apps show up here once they play sound, and volumes past 100% lift quiet ones.</p>
+              <button class="gel" onclick={look}>Look again</button>
             </div>
           </section>
           <section class="group">
-            <h2 class="group-head">Microphone</h2>
+            <h2 class="group-head">Microphone settings</h2>
             <div class="rows">
               <label class="row">
-                <span class="row-label">Record the microphone<small>On a track of its own</small></span>
-                <input type="checkbox" bind:checked={draft.mic} />
-              </label>
-              <label class="row">
-                <span class="row-label">Microphone device</span>
+                <span class="row-label">Microphone device<small>Which one clip records</small></span>
                 <select class="field" bind:value={draft.micDevice}>
                   <option value="">Default device</option>
                   {#each mics as mic (mic.id)}<option value={mic.id}>{mic.name}</option>{/each}
                 </select>
               </label>
-              <div class="row">
-                <span class="row-label">Microphone volume<small>Applied to its track</small></span>
-                {@render slider('mic', 'Microphone')}
-              </div>
               <div class="row">
                 <span class="row-label">Test microphone level<small>{mics.length ? 'Speak and watch the bar for up to 10 s' : 'No microphone is plugged in'}</small></span>
                 <span class="meter level"><span style:width="{Math.min(100, (level ?? 0) * 100)}%"></span></span>
@@ -589,7 +599,7 @@
               </label>
               <div class="row">
                 <span class="row-label">Sound volume</span>
-                <input type="range" min="0" max="150" step="5" aria-label="Sound volume" bind:value={draft.soundVolume} disabled={!draft.sound} />
+                <input type="range" min="0" max="150" step="5" aria-label="Sound volume" bind:value={draft.soundVolume} disabled={!draft.sound} style:--pct={draft.soundVolume / 150} style:--steps={3} />
                 <span class="mono readout">{draft.soundVolume}%</span>
                 <button class="gel" onclick={() => invoke('preview_sound', { percent: draft!.soundVolume })}>Play</button>
               </div>

@@ -482,6 +482,8 @@
                 aria-valuetext="{['Smallest', 'Small', 'Large', 'Largest'][cards.indexOf(view.card)]} cards"
                 title="Card size (Ctrl+Wheel)"
                 value={Math.max(0, cards.indexOf(view.card))}
+                style:--pct={Math.max(0, cards.indexOf(view.card)) / (cards.length - 1)}
+                style:--steps={cards.length - 1}
                 oninput={(e) => (view.card = cards[Number(e.currentTarget.value)])}
               />
             {/if}

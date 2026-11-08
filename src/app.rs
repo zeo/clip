@@ -258,6 +258,7 @@ fn serve() -> Result<(), String> {
             open,
             reveal,
             audio_apps,
+            app_icons,
             windowed_apps,
             star,
             rename,
@@ -1721,6 +1722,26 @@ fn reveal(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
 #[tauri::command]
 async fn audio_apps() -> Result<Vec<String>, String> {
     crate::audio::playing().map_err(|e| e.to_string())
+}
+
+/// Each exe's icon, saved from a running copy the first time and kept for when it isn't running.
+#[tauri::command]
+async fn app_icons(shared: State<'_, Shared>, exes: Vec<String>) -> Result<BTreeMap<String, PathBuf>, String> {
+    let dir = shared.cache.join("app-icons");
+    blocking(move || {
+        // the names become file names, so only bare ones are taken
+        let exes: Vec<String> = (exes.into_iter().map(|exe| exe.to_lowercase()))
+            .filter(|exe| Path::new(exe).file_name().is_some_and(|name| name == exe.as_str()))
+            .collect();
+        for (exe, pid) in crate::audio::running(&exes) {
+            // an exe without an icon just shows the plain one
+            let _ = focus::save_icon(pid, &dir.join(format!("{exe}.png")));
+        }
+        let icon =
+            |exe: String| Some(dir.join(format!("{exe}.png"))).filter(|icon| icon.is_file()).map(|icon| (exe, icon));
+        Ok(exes.into_iter().filter_map(icon).collect())
+    })
+    .await
 }
 
 #[derive(Serialize)]

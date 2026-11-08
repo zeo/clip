@@ -544,7 +544,7 @@
           {#if view.volume > 0}<path d="M11 5.5a3.5 3.5 0 0 1 0 5" />{/if}
           {#if view.volume > 0.5}<path d="M12.8 3.6a6 6 0 0 1 0 8.8" />{/if}
         </svg>
-        <input type="range" min="0" max="1" step="0.05" aria-label="Volume" aria-valuetext="{Math.round(view.volume * 100)}%" bind:value={view.volume} />
+        <input type="range" min="0" max="1" step="0.05" aria-label="Volume" aria-valuetext="{Math.round(view.volume * 100)}%" bind:value={view.volume} style:--pct={view.volume} />
       </label>
       <span class="grow"></span>
       <span class="form-hint">K plays, J and L skip, I and O cut, M marks, ? lists every key</span>
