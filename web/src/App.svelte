@@ -91,6 +91,21 @@
     const timer = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(timer);
   });
+  let cost = $state<{ cpu: number | null; memory: number; encoder: number | null } | null>(null);
+  $effect(() => {
+    if (!quick) return;
+    const read = () => invoke<typeof cost>('cost').then((c) => (cost = c));
+    read();
+    const timer = setInterval(read, 2000);
+    return () => clearInterval(timer);
+  });
+  const spent = $derived(
+    cost &&
+      [cost.cpu !== null && `${cost.cpu.toFixed(1)}% of the CPU`, `${size(cost.memory)} of memory`, cost.encoder !== null && `${Math.round(cost.encoder)}% of the video encoder`]
+        .filter(Boolean)
+        .join(', ')
+        .replace(/, ([^,]*)$/, ' and $1')
+  );
   const taped = $derived.by(() => {
     const s = Math.max(0, Math.floor((now - status.taping) / 1000));
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
@@ -323,7 +338,7 @@
             </button>
           </div>
           <div class="quick-row">
-            <span class="grow">Rewind<small>Opens the buffer here to keep just the part you want</small></span>
+            <span class="grow">Rewind<small>Keep just a part of the buffer</small></span>
             <button class="gel" disabled={!status.recording} onclick={() => ((quick = false), invoke('rewind'))}>Rewind</button>
           </div>
           <div class="quick-row">
@@ -361,6 +376,9 @@
             <span class="grow">Audio<small>Tracks, volumes and push to talk</small></span>
             <span class="go">›</span>
           </button>
+          {#if cost}
+            <p class="quick-cost">clip uses {spent}</p>
+          {/if}
         </div>
       {/if}
     </div>

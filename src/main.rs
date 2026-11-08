@@ -5,6 +5,7 @@ mod art;
 mod audio;
 mod capture;
 mod clipboard;
+mod cost;
 mod crash;
 mod encode;
 mod export;

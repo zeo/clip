@@ -221,6 +221,8 @@ struct Shared {
     login: String,
     first: AtomicBool,
     recorder: u32,
+    /// made when the quick panel first asks
+    meter: Mutex<Option<crate::cost::Meter>>,
 }
 
 /// Runs clip from the tray, keeping the last stretch of the focused app ready to save.
@@ -261,6 +263,7 @@ fn serve(restarted: bool) -> Result<(), String> {
             toggle_mic,
             toggle_recording,
             rewind,
+            cost,
             open,
             reveal,
             audio_apps,
@@ -389,6 +392,7 @@ fn serve(restarted: bool) -> Result<(), String> {
                 login: name.clone(),
                 first: AtomicBool::new(first),
                 recorder,
+                meter: Mutex::default(),
             });
             app.on_menu_event(|app, event| {
                 let shared = app.state::<Shared>();
@@ -1646,6 +1650,11 @@ fn toggle_mic(shared: State<Shared>) {
 #[tauri::command]
 fn toggle_recording(shared: State<Shared>) {
     post(shared.recorder, WM_HOTKEY, RECORD);
+}
+
+#[tauri::command]
+fn cost(shared: State<Shared>) -> crate::cost::Cost {
+    shared.meter.lock().expect("meter poisoned").get_or_insert_with(crate::cost::Meter::new).read()
 }
 
 #[tauri::command]
