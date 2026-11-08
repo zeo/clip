@@ -5,6 +5,7 @@ mod art;
 mod audio;
 mod capture;
 mod clipboard;
+mod crash;
 mod encode;
 mod export;
 mod focus;
@@ -47,8 +48,13 @@ clip self-test [--live]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        return app::run();
+    match &args[..] {
+        [] => return app::run(false),
+        [restarted, pid] if restarted == crash::RESTARTED => {
+            crash::wait_for(pid);
+            return app::run(true);
+        }
+        _ => {}
     }
     // the exe is a windows app so the tray never opens a console, so the command line borrows the caller's
     let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };

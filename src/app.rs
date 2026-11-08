@@ -224,13 +224,14 @@ struct Shared {
 }
 
 /// Runs clip from the tray, keeping the last stretch of the focused app ready to save.
-pub fn run() {
-    if let Err(e) = serve() {
+pub fn run(restarted: bool) {
+    if let Err(e) = serve(restarted) {
         unsafe { MessageBoxW(None, &HSTRING::from(e), w!("clip"), MB_ICONERROR) };
     }
 }
 
-fn serve() -> Result<(), String> {
+/// `restarted` after a crash, when the window stays hidden so a game in front keeps its screen
+fn serve(restarted: bool) -> Result<(), String> {
     // below normal, not background mode, which would also let windows page out the buffer
     let _ = unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) };
     // a profile runs a separate clip beside the usual one, with its own settings and single instance
@@ -311,6 +312,7 @@ fn serve() -> Result<(), String> {
             let marks_file = dir.join("library.json");
             let marks = Arc::new(Mutex::new(Marks::load(&marks_file)));
             let cache = app.path().cache_dir()?.join(&name);
+            crate::crash::guard(&cache.join("crash.dmp"));
             app.asset_protocol_scope().allow_directory(&cache, true)?;
             let icon = cache.join("icon.png");
             let _ = std::fs::create_dir_all(&cache)
@@ -415,7 +417,7 @@ fn serve() -> Result<(), String> {
                     _ => {}
                 }
             });
-            if first || open_on_start {
+            if !restarted && (first || open_on_start) {
                 show(app.handle());
             }
             Ok(())
