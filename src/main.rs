@@ -8,15 +8,18 @@ mod clipboard;
 mod cost;
 mod crash;
 mod encode;
+mod events;
 mod export;
 mod focus;
 mod library;
+mod log;
 mod notice;
 use hdrkit as hdr;
 mod ring;
 mod save;
 mod sync;
 mod toast;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -160,26 +163,43 @@ pub struct Saved {
     pub start: i64,
 }
 
-type Prepared = (capture::Source, capture::Pipeline, encode::Encoder, Format, Option<hdr::Mastering>, String);
+/// The capture, converter and encoder, with what they record and whether the encoder runs on the cpu.
+type Prepared = (capture::Source, capture::Pipeline, encode::Encoder, Format, Option<hdr::Mastering>, String, bool);
 
-/// Picks the encoder and opens the capture, the converter and the encoder for `target`.
+/// What a software encoder keeps up with beside a game, when there's no hardware one.
+const CPU_FPS: u32 = 30;
+const CPU_HEIGHT: u32 = 720;
+
+/// Picks the encoder and opens the capture, the converter and the encoder for `target`. Without a
+/// hardware h.264 encoder it falls back to the software one at no more than [`CPU_HEIGHT`] and
+/// [`CPU_FPS`], in sdr.
 fn prepare(options: &Options, target: Target) -> std::result::Result<Prepared, String> {
-    let fps = options.fps.clamp(10, 240);
-    let mbps = options.mbps.clamp(1, 200);
     let gpu = capture::gpu().map_err(|e| format!("no usable gpu: {e}"))?;
     let display = hdr::display(target.monitor()).map_err(|e| format!("can't read the display: {e}"))?;
-    let pick = |codec| -> std::result::Result<Option<encode::Choice>, String> {
+    let pick = |codec, software: bool| -> std::result::Result<Option<encode::Choice>, String> {
         let found = encode::encoders(codec, Some(gpu.adapter)).map_err(|e| e.to_string())?;
-        Ok(found.into_iter().find(|c| c.hardware != options.software))
+        Ok(found.into_iter().find(|c| c.hardware != software))
     };
     let hdr10 = options.hdr10 && display.hdr;
-    let (codec, choice) = match hdr10.then(|| pick(Codec::Hdr10)).transpose()?.flatten() {
-        Some(choice) => (Codec::Hdr10, choice),
-        None => (Codec::H264, pick(Codec::H264)?.ok_or("no h.264 encoder found")?),
+    let asked = match hdr10.then(|| pick(Codec::Hdr10, options.software)).transpose()?.flatten() {
+        Some(choice) => Some((Codec::Hdr10, choice)),
+        None => pick(Codec::H264, options.software)?.map(|choice| (Codec::H264, choice)),
     };
+    let fallback = asked.is_none() && !options.software;
+    let (codec, choice) = match asked {
+        Some(found) => found,
+        None if fallback => (Codec::H264, pick(Codec::H264, true)?.ok_or("no h.264 encoder found")?),
+        None => return Err("no h.264 encoder found".into()),
+    };
+    let (fps, height) = match fallback {
+        true => (options.fps.min(CPU_FPS), options.height.min(CPU_HEIGHT)),
+        false => (options.fps, options.height),
+    };
+    let fps = fps.clamp(10, 240);
+    let mbps = options.mbps.clamp(1, 200);
     let source = capture::Source::start(&gpu, target, fps, display.hdr).map_err(|e| format!("capture failed: {e}"))?;
     let size = source.size();
-    let (width, height) = capture::output_size(size, options.height);
+    let (width, height) = capture::output_size(size, height);
     let format = Format { width, height, fps, bitrate: mbps * 1_000_000, codec };
     let mastering = matches!(codec, Codec::Hdr10)
         .then(|| hdr::mastering(target.monitor()))
@@ -196,13 +216,15 @@ fn prepare(options: &Options, target: Target) -> std::result::Result<Prepared, S
         .map_err(|e| format!("can't convert frames: {e}"))?;
     let encoder = encode::Encoder::open(&choice, &gpu.device, format, encode::Purpose::Capture)
         .map_err(|e| format!("can't open the encoder: {e}"))?;
-    Ok((source, pipeline, encoder, format, mastering, summary))
+    Ok((source, pipeline, encoder, format, mastering, summary, !choice.hardware))
 }
 
 /// A recording held in rings that can be saved from at any moment, until it stops.
 pub struct Session {
     pub clock: Clock,
     pub summary: String,
+    /// the encoder is the software one
+    pub on_cpu: bool,
     /// seconds the rings keep, and why that's less than asked for
     pub buffer: u32,
     pub short: Option<String>,
@@ -242,9 +264,9 @@ impl Session {
             std::thread::spawn(move || -> Result<()> {
                 unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
                 match prepare(&options, target) {
-                    Ok((source, pipeline, encoder, format, mastering, summary)) => {
+                    Ok((source, pipeline, encoder, format, mastering, summary, on_cpu)) => {
                         let clock = Clock::start();
-                        let _ = opened.send(Ok((format, mastering, summary, clock)));
+                        let _ = opened.send(Ok((format, mastering, summary, on_cpu, clock)));
                         capture::record(source, pipeline, encoder, format, clock, &ring, &stop, &shots)
                     }
                     Err(message) => {
@@ -254,7 +276,7 @@ impl Session {
                 }
             })
         };
-        let (format, mastering, summary, clock) = match ready.recv() {
+        let (format, mastering, summary, on_cpu, clock) = match ready.recv() {
             Ok(prepared) => prepared?,
             Err(_) => {
                 let reason = video.join().ok().and_then(|r| r.err()).map_or("it stopped".into(), |e| e.to_string());
@@ -272,6 +294,7 @@ impl Session {
         Ok(Self {
             clock,
             summary,
+            on_cpu,
             buffer,
             short,
             format,
@@ -489,14 +512,23 @@ fn find_window(text: &str) -> Option<HWND> {
 }
 
 fn list_encoders() -> Result<()> {
+    machine()?.iter().for_each(|line| println!("{line}"));
+    Ok(())
+}
+
+/// The gpu clip records on and every encoder this machine has for it, a line each.
+pub fn machine() -> Result<Vec<String>> {
     let gpu = capture::gpu()?;
+    let adapter = unsafe { gpu.device.cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>()?.GetAdapter()?.GetDesc()? };
+    let name = String::from_utf16_lossy(&adapter.Description);
+    let mut lines = vec![format!("gpu {}", name.trim_end_matches('\0'))];
     for codec in [Codec::H264, Codec::Hdr10] {
         for choice in encode::encoders(codec, Some(gpu.adapter))? {
             let kind = if choice.hardware { "hardware" } else { "software" };
-            println!("{codec:?} {kind} {}", choice.name);
+            lines.push(format!("{codec:?} {kind} {}", choice.name));
         }
     }
-    Ok(())
+    Ok(lines)
 }
 
 /// Runs synthetic frames through every stage after capture, on each encoder this machine has,

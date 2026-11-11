@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::UI::Shell::{
@@ -51,16 +52,40 @@ pub struct Marks {
     /// paths inside the clips folder, with forward slashes
     starred: HashSet<String>,
     marked: HashMap<String, Vec<f64>>,
+    /// whole lowercase paths of the files clip wrote, the only ones cleanup may delete
+    written: HashSet<String>,
+    /// the files in clip's own default folder were taken as written once
+    seeded: bool,
 }
 
 impl Marks {
-    pub fn load(file: &Path) -> Self {
-        std::fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    /// The library in `file`, or an empty one with what went wrong when it can't be read.
+    pub fn load(file: &Path) -> (Self, Option<String>) {
+        match read_json(file) {
+            Ok(marks) => (marks.unwrap_or_default(), None),
+            // a library that can't be read isn't seeded again, so its clips stay out of cleanup
+            Err(e) => (Self { seeded: true, ..Self::default() }, Some(e)),
+        }
     }
 
     pub fn store(&self, file: &Path) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(file, json).map_err(|e| format!("can't save the library: {e}"))
+        write_json(file, &json).map_err(|e| format!("can't save the library: {e}"))
+    }
+
+    pub fn wrote(&mut self, path: &Path) {
+        self.written.insert(whole(path));
+    }
+
+    pub fn ours(&self, path: &Path) -> bool {
+        self.written.contains(&whole(path))
+    }
+
+    /// Takes every clip and image already in `dir` as clip's, once, for clips saved before clip kept count.
+    pub fn seed(&mut self, dir: &Path) {
+        if !std::mem::replace(&mut self.seeded, true) {
+            self.written.extend(scan(dir, "").iter().map(|(entry, _)| whole(&entry.path())));
+        }
     }
 
     pub fn starred(&self, folder: &Path, path: &Path) -> bool {
@@ -95,16 +120,59 @@ impl Marks {
         if let Some(at) = self.marked.remove(&key(folder, from)) {
             self.marked.insert(key(folder, to), at);
         }
+        if self.written.remove(&whole(from)) {
+            self.written.insert(whole(to));
+        }
     }
 
     pub fn forget(&mut self, folder: &Path, path: &Path) {
         self.starred.remove(&key(folder, path));
         self.marked.remove(&key(folder, path));
+        self.written.remove(&whole(path));
     }
 }
 
 fn key(folder: &Path, path: &Path) -> String {
     path.strip_prefix(folder).unwrap_or(path).to_string_lossy().replace('\\', "/")
+}
+
+// windows paths match in any case
+fn whole(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").to_lowercase()
+}
+
+/// What a json file holds, None when there's none yet. One that won't parse is copied beside itself
+/// as `.bad` before clip goes on without it, so writing a fresh one can't lose it.
+pub fn read_json<T: DeserializeOwned>(file: &Path) -> Result<Option<T>, String> {
+    let text = match std::fs::read_to_string(file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        text => text.map_err(|e| format!("couldn't read {}: {e}", file.display()))?,
+    };
+    serde_json::from_str(&text).map(Some).map_err(|e| {
+        let bad = sibling(file, ".bad");
+        match std::fs::copy(file, &bad) {
+            Ok(_) => format!("{} couldn't be read ({e}), a copy is at {}", file.display(), bad.display()),
+            Err(copy) => format!("{} couldn't be read ({e}) or copied aside ({copy})", file.display()),
+        }
+    })
+}
+
+/// Writes `text` beside `file` and moves it over, so a crash or a full drive mid write leaves the
+/// old file whole.
+pub fn write_json(file: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let part = sibling(file, ".new");
+    let written = std::fs::File::create(&part).and_then(|mut out| {
+        out.write_all(text.as_bytes())?;
+        out.sync_all()
+    });
+    written.and_then(|()| std::fs::rename(&part, file)).inspect_err(|_| drop(std::fs::remove_file(&part)))
+}
+
+fn sibling(file: &Path, tail: &str) -> PathBuf {
+    let mut name = file.as_os_str().to_owned();
+    name.push(tail);
+    name.into()
 }
 
 /// What a file is by its extension, if the library shows it.
@@ -244,6 +312,23 @@ pub fn prune(thumbs: &Path, clips: &[Clip]) {
     }
 }
 
+/// Drops the art and icons of apps no clip is from any more.
+pub fn prune_apps<'a>(thumbs: &Path, apps: impl IntoIterator<Item = &'a str>) {
+    let kept: HashSet<String> = apps.into_iter().map(str::to_lowercase).collect();
+    let gone = |name: &str| !kept.contains(&name.to_lowercase());
+    for entry in std::fs::read_dir(thumbs.with_file_name("art")).into_iter().flatten().flatten() {
+        if gone(&entry.file_name().to_string_lossy()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    for entry in std::fs::read_dir(thumbs.with_file_name("icons")).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.file_stem().is_some_and(|app| gone(&app.to_string_lossy())) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// A new name for a clip, kept in its folder.
 pub fn renamed(path: &Path, name: &str) -> Result<PathBuf, String> {
     let name = name.trim();
@@ -307,11 +392,13 @@ pub fn settle(folder: &Path) {
     let _ = recycle(&kept);
 }
 
-/// Deletes the oldest unstarred clips, never the newest, until the folder's clips take at most `cap`
-/// bytes and none is older than `before`, in ms since 1970. Images and clips in other apps' folders
-/// are never touched. Returns the paths deleted.
-pub fn trim(clips: &[Clip], cap: u64, before: u64) -> Vec<PathBuf> {
-    let ours: Vec<&Clip> = clips.iter().filter(|clip| clip.kind == Kind::Clip && clip.source.is_none()).collect();
+/// Deletes the oldest unstarred clips clip wrote, never the newest, until they take at most `cap`
+/// bytes and none is older than `before`, in ms since 1970. Images, clips clip didn't write and
+/// clips in other apps' folders are never touched. Returns the paths deleted.
+pub fn trim(clips: &[Clip], marks: &Marks, cap: u64, before: u64) -> Vec<PathBuf> {
+    let ours: Vec<&Clip> = (clips.iter())
+        .filter(|clip| clip.kind == Kind::Clip && clip.source.is_none() && marks.ours(&clip.path))
+        .collect();
     let mut total: u64 = ours.iter().map(|clip| clip.bytes).sum();
     let mut deleted = Vec::new();
     for clip in ours.into_iter().skip(1).rev().filter(|clip| !clip.starred) {
@@ -437,6 +524,12 @@ mod tests {
         }
     }
 
+    fn ours(clips: &[Clip]) -> Marks {
+        let mut marks = Marks::default();
+        clips.iter().for_each(|clip| marks.wrote(&clip.path));
+        marks
+    }
+
     #[test]
     fn trimming_spares_stars_and_the_newest() {
         let clips =
@@ -444,10 +537,11 @@ mod tests {
         for clip in &clips {
             std::fs::write(&clip.path, b"x").unwrap();
         }
-        let deleted = trim(&clips, 120, 0);
+        let deleted = trim(&clips, &ours(&clips), 120, 0);
         assert_eq!(deleted, [clips[3].path.clone(), clips[2].path.clone()]);
         assert!(clips[0].path.exists() && clips[1].path.exists());
-        assert!(trim(&clips[..2], u64::MAX, u64::MAX).is_empty(), "the newest and the starred stay at any age");
+        let kept = trim(&clips[..2], &ours(&clips), u64::MAX, u64::MAX);
+        assert!(kept.is_empty(), "the newest and the starred stay at any age");
         let _ = std::fs::remove_file(&clips[0].path);
         let _ = std::fs::remove_file(&clips[1].path);
     }
@@ -459,7 +553,7 @@ mod tests {
             clip.modified = at;
             std::fs::write(&clip.path, b"x").unwrap();
         }
-        assert_eq!(trim(&clips, u64::MAX, 150), [clips[2].path.clone()]);
+        assert_eq!(trim(&clips, &ours(&clips), u64::MAX, 150), [clips[2].path.clone()]);
         clips.iter().for_each(|clip| drop(std::fs::remove_file(&clip.path)));
     }
 
@@ -471,9 +565,74 @@ mod tests {
         for clip in &clips {
             std::fs::write(&clip.path, b"x").unwrap();
         }
-        assert!(trim(&clips, 0, u64::MAX).is_empty());
+        assert!(trim(&clips, &ours(&clips), 0, u64::MAX).is_empty());
         assert!(clips.iter().all(|clip| clip.path.exists()));
         clips.iter().for_each(|clip| drop(std::fs::remove_file(&clip.path)));
+    }
+
+    #[test]
+    fn trimming_deletes_only_what_clip_wrote() {
+        let clips = [clip("trim-ours-new", 1, false), clip("trim-obs", 1, false), clip("trim-ours-old", 1, false)];
+        for clip in &clips {
+            std::fs::write(&clip.path, b"x").unwrap();
+        }
+        let mut marks = Marks::default();
+        marks.wrote(&clips[0].path);
+        // a path cased differently is the same file to windows
+        marks.wrote(&PathBuf::from(clips[2].path.to_string_lossy().to_uppercase()));
+        assert_eq!(trim(&clips, &marks, 0, u64::MAX), [clips[2].path.clone()]);
+        assert!(clips[1].path.exists(), "a file clip didn't write stays at any size or age");
+        clips.iter().for_each(|clip| drop(std::fs::remove_file(&clip.path)));
+    }
+
+    #[test]
+    fn written_files_follow_a_rename_and_seed_once() {
+        let root = std::env::temp_dir().join(format!("clip-seed-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Fortnite")).unwrap();
+        std::fs::write(root.join(r"Fortnite\old.mp4"), b"1").unwrap();
+        let mut marks = Marks::default();
+        marks.seed(&root);
+        assert!(marks.ours(&root.join(r"Fortnite\old.mp4")));
+        std::fs::write(root.join(r"Fortnite\later.mp4"), b"1").unwrap();
+        marks.seed(&root);
+        assert!(!marks.ours(&root.join(r"Fortnite\later.mp4")), "seeding happens once");
+        let (old, new) = (root.join(r"Fortnite\old.mp4"), root.join(r"Fortnite\renamed.mp4"));
+        marks.moved(&root, &old, &new);
+        assert!(marks.ours(&new) && !marks.ours(&old));
+        marks.forget(&root, &new);
+        assert!(!marks.ours(&new));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_broken_file_is_kept_aside_and_a_write_replaces_whole() {
+        let root = std::env::temp_dir().join(format!("clip-json-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("library.json");
+        assert_eq!(read_json::<Marks>(&file).map(|m| m.is_none()), Ok(true), "no file yet is no error");
+        std::fs::write(&file, b"{\"starred\": [").unwrap();
+        let (marks, problem) = Marks::load(&file);
+        assert!(problem.is_some_and(|e| e.contains("library.json.bad")));
+        assert!(marks.seeded, "a library that couldn't be read isn't seeded over");
+        assert_eq!(std::fs::read(root.join("library.json.bad")).unwrap(), b"{\"starred\": [");
+        marks.store(&file).unwrap();
+        assert!(Marks::load(&file).1.is_none() && !root.join("library.json.new").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn art_and_icons_go_with_the_last_clip_of_their_app() {
+        let root = std::env::temp_dir().join(format!("clip-prune-{}", std::process::id()));
+        for dir in ["art/Fortnite", "art/Old Game", "icons"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in ["art/Fortnite/cover.jpg", "icons/Fortnite.png", "icons/Old Game.png"] {
+            std::fs::write(root.join(file), b"1").unwrap();
+        }
+        prune_apps(&root.join("thumbs"), ["fortnite"]);
+        assert!(root.join("art/Fortnite/cover.jpg").exists() && root.join("icons/Fortnite.png").exists());
+        assert!(!root.join("art/Old Game").exists() && !root.join("icons/Old Game.png").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

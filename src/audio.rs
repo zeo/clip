@@ -345,7 +345,7 @@ fn run(
         std::thread::sleep(POLL);
         if changed.swap(false, Ordering::Relaxed) || scanned.elapsed() >= RESCAN {
             if let Err(e) = rescan(&mut channels, &mut sessions) {
-                eprintln!("couldn't look for new audio apps ({e})");
+                crate::log::write(format_args!("couldn't look for new audio apps ({e})"));
             }
             scanned = Instant::now();
         }
@@ -413,7 +413,7 @@ impl Channel {
             match Input::open(&self.source, pid) {
                 Ok(input) => self.feeds.push(Feed { pid, input, timeline: Timeline::at(self.position) }),
                 Err(e) => {
-                    eprintln!("can't record audio from process {pid} ({e})");
+                    crate::log::write(format_args!("can't record audio from process {pid} ({e})"));
                     self.failed.push((pid, Instant::now()));
                 }
             }
@@ -427,7 +427,7 @@ impl Channel {
         self.feeds.retain_mut(|feed| match feed.input.drain(clock, &mut feed.timeline) {
             Ok(()) => true,
             Err(e) => {
-                eprintln!("audio from process {} lost ({e})", feed.pid);
+                crate::log::write(format_args!("audio from process {} lost ({e})", feed.pid));
                 false
             }
         });

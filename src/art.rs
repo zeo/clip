@@ -10,8 +10,11 @@ use serde::Serialize;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData,
-    WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT,
+    SECURITY_FLAG_IGNORE_CERT_CN_INVALID, SECURITY_FLAG_IGNORE_CERT_DATE_INVALID, SECURITY_FLAG_IGNORE_UNKNOWN_CA,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_OPTION_SECURITY_FLAGS, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE,
 };
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
 
@@ -173,20 +176,28 @@ impl Drop for Handle {
 }
 
 /// The body of an https GET, with a bearer key when given. Redirects are followed by winhttp.
-fn get(url: &str, key: Option<&str>) -> Result<Vec<u8>, String> {
+/// On 127.0.0.1 the certificate isn't checked, since games there sign their own, and no redirect is
+/// followed, so that loose check never reaches past this pc.
+pub fn get(url: &str, key: Option<&str>) -> Result<Vec<u8>, String> {
     let rest = url.strip_prefix("https://").ok_or("only https")?;
     let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let (host, port) = match host.split_once(':') {
+        Some((host, port)) => (host, port.parse().map_err(|_| format!("{url} has a bad port"))?),
+        None => (host, INTERNET_DEFAULT_HTTPS_PORT),
+    };
+    let local = host == "127.0.0.1";
     let headers = key.map(|key| HSTRING::from(format!("Authorization: Bearer {key}")));
     unsafe {
         let session = Handle::new(WinHttpOpen(
-            w!("clip"),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            &HSTRING::from(concat!("clip/", env!("CARGO_PKG_VERSION"))),
+            if local { WINHTTP_ACCESS_TYPE_NO_PROXY } else { WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY },
             PCWSTR::null(),
             PCWSTR::null(),
             0,
         ))?;
-        WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 20_000).map_err(|e| e.to_string())?;
-        let connection = Handle::new(WinHttpConnect(session.0, &HSTRING::from(host), INTERNET_DEFAULT_HTTPS_PORT, 0))?;
+        let wait = if local { 2_000 } else { 10_000 };
+        WinHttpSetTimeouts(session.0, wait, wait, wait, 2 * wait).map_err(|e| e.to_string())?;
+        let connection = Handle::new(WinHttpConnect(session.0, &HSTRING::from(host), port, 0))?;
         let request = Handle::new(WinHttpOpenRequest(
             connection.0,
             w!("GET"),
@@ -196,6 +207,16 @@ fn get(url: &str, key: Option<&str>) -> Result<Vec<u8>, String> {
             std::ptr::null(),
             WINHTTP_FLAG_SECURE,
         ))?;
+        if local {
+            let loose = SECURITY_FLAG_IGNORE_UNKNOWN_CA
+                | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+            WinHttpSetOption(Some(request.0), WINHTTP_OPTION_SECURITY_FLAGS, Some(&loose.to_ne_bytes()))
+                .map_err(|e| e.to_string())?;
+            let stay = WINHTTP_DISABLE_REDIRECTS;
+            WinHttpSetOption(Some(request.0), WINHTTP_OPTION_DISABLE_FEATURE, Some(&stay.to_ne_bytes()))
+                .map_err(|e| e.to_string())?;
+        }
         WinHttpSendRequest(request.0, headers.as_deref(), None, 0, 0, 0).map_err(|e| e.to_string())?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|e| e.to_string())?;
         let mut status = 0u32;
@@ -244,6 +265,21 @@ fn steam() -> Option<PathBuf> {
         )
     };
     read.is_ok().then(|| PathBuf::from(String::from_utf16_lossy(&path[..(size as usize / 2).saturating_sub(1)])))
+}
+
+/// Where Steam installed the app, from the appmanifests in each library.
+pub fn install(appid: u32) -> Option<PathBuf> {
+    installed(&libraries(&steam()?), appid)
+}
+
+fn installed(libraries: &[PathBuf], appid: u32) -> Option<PathBuf> {
+    let name = format!("appmanifest_{appid}.acf");
+    libraries.iter().find_map(|library| {
+        let apps = library.join("steamapps");
+        let acf = std::fs::read_to_string(apps.join(&name)).ok()?;
+        let dir = pairs(&acf).find(|(key, _)| key.eq_ignore_ascii_case("installdir"))?.1;
+        Some(apps.join("common").join(dir)).filter(|path| path.is_dir())
+    })
 }
 
 /// Steam's own folder and every library listed in its libraryfolders.vdf.
@@ -319,10 +355,15 @@ mod tests {
         let game = library.join("steamapps/common/Counter-Strike Global Offensive/game/bin/win64/cs2.exe");
         let elsewhere = library.join("steamapps/common/Counter-Strike Global Offensive 2/cs2.exe");
         let (hit, miss) = (appid(&game, &found), appid(&elsewhere, &found));
+        let folder = library.join("steamapps/common/Counter-Strike Global Offensive");
+        let before = installed(&found, 730);
+        std::fs::create_dir_all(&folder).unwrap();
+        let (after, other) = (installed(&found, 730), installed(&found, 570));
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(hit, Some(730));
         assert_eq!(miss, None);
+        assert_eq!((before, after, other), (None, Some(folder), None), "an install is a manifest and its folder");
         assert_eq!(escape("Counter-Strike 2"), "Counter-Strike%202");
     }
 }

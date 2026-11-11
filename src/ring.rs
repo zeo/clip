@@ -121,7 +121,7 @@ impl Spool {
         static SESSIONS: AtomicU32 = AtomicU32::new(0);
         let free = room(dir);
         if free < need.saturating_add(ROOM) {
-            let gb = |bytes: u64| (bytes as f64 / 1e9).ceil();
+            let gb = |bytes: u64| (bytes as f64 / (1u64 << 30) as f64).ceil();
             return Err(format!("it needs {} GB and the drive has {} GB free", gb(need + ROOM), gb(free)));
         }
         std::fs::create_dir_all(dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;

@@ -1,0 +1,31 @@
+{
+  "provider": { "name": "Dota 2", "appid": 570, "version": 47, "timestamp": 1762800000 },
+  "map": {
+    "name": "start",
+    "matchid": "8012345678",
+    "game_time": 1260,
+    "clock_time": 1170,
+    "daytime": true,
+    "game_state": "DOTA_GAMERULES_STATE_GAME_IN_PROGRESS",
+    "paused": false,
+    "win_team": "none"
+  },
+  "player": {
+    "steamid": "76561198000000001",
+    "accountid": "39734273",
+    "name": "tux",
+    "activity": "playing",
+    "kills": 0,
+    "deaths": 2,
+    "assists": 6,
+    "last_hits": 112,
+    "denies": 9,
+    "kill_streak": 0,
+    "commands_issued": 4210,
+    "team_name": "radiant",
+    "gold": 1830,
+    "gpm": 512,
+    "xpm": 604
+  },
+  "auth": { "token": "0123456789abcdef0123456789abcdef" }
+}
