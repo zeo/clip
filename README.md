@@ -10,13 +10,13 @@ clip keeps the last stretch of your game and saves it when you press a key. It r
 
 Alt+F9 saves the last 30 seconds. Alt+F10 marks a moment and saves the clip around it. Counter-Strike 2, Dota 2 and League of Legends can clip their own big plays. The buffer runs from 15 seconds to 2 hours, kept on disk past 10 minutes, and clips land in `Videos\clip-recorder\<game>`, grouped by session under the game's cover art.
 
-## Install
+## install
 
-Run `clip-<version>-online-setup.exe` from the [releases page](https://github.com/zeo/clip/releases). The setup isn't code signed, so SmartScreen may stop it: click More info, then Run anyway. It downloads clip, checks the download's signature, installs WebView2 if Windows has none, and adds a Start menu entry and an uninstaller. clip looks for an update every 6 hours and says so in Settings, under About, where one click installs it. Updating restarts clip, which drops what the buffer holds.
+Run `clip-<version>-online-setup.exe` from the [releases page](https://github.com/zeo/clip/releases). The setup isn't code signed, so SmartScreen may stop it: click More info, then Run anyway. It downloads clip, checks the download's signature, installs WebView2 if Windows has none, and adds a Start menu entry and an uninstaller. clip looks for an update every 6 hours and says so in Settings, under About, where one click installs it. Updating restarts clip, which drops what the buffer holds. Uninstalling takes away the start with Windows value and the auto clips files in game folders, and leaves clips, settings and the cache folder where they are.
 
 The first start walks through the two hotkeys, the microphone and where clips go, then clip sits in the tray.
 
-## Privacy
+## privacy
 
 Clips stay on your pc. clip goes online only for game art, from Steam's store CDN or, once you paste a key, SteamGridDB, and through the rot installer to check for updates. Auto clips only talk to the game on this pc, over 127.0.0.1. No telemetry, no account.
 
@@ -34,11 +34,14 @@ clip capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
 clip encoders
 clip sync
 clip self-test [--live]
+clip uninstall
 ```
 
 `capture` records for `--for` seconds (10 by default) and saves the last `--buffer` seconds (30) to `--out` (`clip.mp4`). The default output is 1080p60 H.264 at 20 Mbps. Frames are scaled on the GPU with an area filter and encoded by the GPU's Media Foundation encoder: NVENC, AMF or QSV. Packets sit in a ring that drops whole one-second GOPs, so every clip starts on a keyframe. Saving copies packets into the MP4 without re-encoding.
 
 `encoders` lists the H.264 and HEVC Main10 encoders, hardware and software, that Media Foundation offers on the GPU clip captures with. With no hardware H.264 encoder, the tray app records with the software one at 720p, 30 fps and SDR at most, and the top bar says CPU.
+
+`uninstall` removes what clip leaves outside its folder: the start with Windows value, its notification id and the auto clips files. The uninstaller runs it.
 
 ## following the app
 
@@ -64,7 +67,7 @@ Three games report their own big plays, and the auto clips page in Settings swit
 - Dota 2: triple kills, ultra kills and rampages
 - League of Legends: multi-kills, first blood, aces, and baron, dragon and herald steals
 
-For Counter-Strike 2 and Dota 2, applying writes `gamestate_integration_clip.cfg` into the game's cfg folder, found through Steam's library folders. The game reads it at start and posts its state to `127.0.0.1:41877`, carrying a random token from the file, and clip ignores any post without it. Switching a game off takes the file away. Do that before uninstalling clip, or the game keeps posting to a port nobody listens on. League needs no file: while it is the game being recorded, clip asks Riot's live client data on `127.0.0.1:2999` once a second.
+For Counter-Strike 2 and Dota 2, applying writes `gamestate_integration_clip.cfg` into the game's cfg folder, found through Steam's library folders. The game reads it at start and posts its state to `127.0.0.1:41877`, carrying a random token from the file, and clip ignores any post without it. Switching a game off or uninstalling clip takes the file away. League needs no file: while it is the game being recorded, clip asks Riot's live client data on `127.0.0.1:2999` once a second.
 
 A play saves the 15 seconds before it and the 5 after, both set on that page. Plays inside the wait make one clip with a mark at each, named after the last, such as `2026-11-08 21-04-11 triple kill.mp4`. Plays only count while their game is the one recording.
 

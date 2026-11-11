@@ -48,7 +48,8 @@ clip capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
                [--fps N] [--mbps N] [--height N] [--scale FILTER] [--software] [--hdr10] [--mic] [--app EXE]... [--out FILE]
 clip sync
 clip encoders
-clip self-test [--live]";
+clip self-test [--live]
+clip uninstall";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -69,6 +70,7 @@ fn main() {
             Some("capture") => capture_command(&args[1..]),
             Some("sync") => sync::run(&args[1..]),
             Some("encoders") => list_encoders().map_err(|e| e.to_string()),
+            Some("uninstall") => app::uninstall(),
             Some("self-test") => self_test().map_err(|e| e.to_string()).and_then(|()| match args.get(1) {
                 Some(live) if live == "--live" => sync::run(&args[2..]),
                 _ => Ok(()),

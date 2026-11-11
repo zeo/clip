@@ -8,7 +8,7 @@ clip's own code is dual-licensed under MIT or Apache-2.0. `clip.exe` also carrie
 |---|---|---|
 | Source Sans 3, regular and medium | OFL-1.1 | https://github.com/adobe-fonts/source-sans |
 | Commit Mono V143 | OFL-1.1 | https://github.com/eigilnikolajsen/commit-mono |
-| `assets/saved.wav`, `screenshot.wav` from capscr, unchanged | MIT, copyright (c) 2024-2025 capscr contributors | https://github.com/zeo/capscr |
+| `assets/saved.wav` from capscr, unchanged | MIT, copyright (c) 2024-2025 capscr contributors | https://github.com/zeo/capscr |
 
 The font license texts are in `web/public/fonts`.
 

@@ -13,13 +13,15 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, WPARAM};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
-use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+use windows::Win32::System::Registry::{
+    RegDeleteKeyValueW, RegDeleteTreeW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThreadId, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
@@ -488,7 +490,10 @@ fn serve(restarted: bool) -> Result<(), String> {
                     std::thread::spawn(move || loop {
                         let (found, owner) = match update::check() {
                             Ok((found, owner)) => (found, Some(owner)),
-                            Err(error) => (Update { error, ..Update::default() }, None),
+                            Err(error) => {
+                                crate::log::write(format_args!("update check failed: {error}"));
+                                (Update { error, ..Update::default() }, None)
+                            }
                         };
                         let changed = {
                             let mut held = update.lock().expect("update poisoned");
@@ -1370,6 +1375,25 @@ fn louder(wav: &[u8], percent: u32) -> Vec<u8> {
         at = body.end + (size & 1);
     }
     out
+}
+
+/// What the rot installer runs before it removes clip: the run value, the notification id and the games' cfgs.
+pub fn uninstall() -> Result<(), String> {
+    let name = "clip-recorder";
+    let mut failed = Vec::new();
+    if let Err(e) = run_at_login(name, false) {
+        failed.push(format!("can't remove the start with windows value: {e}"));
+    }
+    let id = HSTRING::from(toast::key(&format!("lt.rot.{name}")));
+    match unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &id) } {
+        ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => {}
+        other => failed.push(format!("can't remove the notification id: {}", other.to_hresult().message())),
+    }
+    failed.extend(crate::events::GAMES.iter().filter_map(|game| game.connect(false, "").err()));
+    match failed.is_empty() {
+        true => Ok(()),
+        false => Err(failed.join("\n")),
+    }
 }
 
 fn run_at_login(name: &str, on: bool) -> windows::core::Result<()> {

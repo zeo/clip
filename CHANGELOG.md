@@ -2,7 +2,7 @@
 
 dates are release-tag dates.
 
-## [0.1.0] - 2026-11-11
+## [0.1.1] - 2026-11-11
 
 The first public release.
 
@@ -25,3 +25,9 @@ The first public release.
 - a three-step tour on the first start
 - Settings > About checks for updates every 6 hours through the rot installer, opens the logs folder and copies system info for a bug report
 - settings and the library are written whole or not at all, and a file that doesn't read is kept as `.bad`
+- uninstalling takes away the start with Windows value, the notification id and the auto clips files in game folders (`clip uninstall`)
+- a failed update check is written to `clip.log`
+
+## [0.1.0] - 2026-11-11
+
+Tagged, never published.
