@@ -1,0 +1,111 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    if: github.actor == 'zeo'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ vars.ROT_INSTALLER_REPOSITORY }}
+          ref: ${{ vars.ROT_INSTALLER_REF }}
+          path: .rot-installer
+          ssh-key: ${{ secrets.ROT_INSTALLER_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: stable
+
+      - name: Check the tag matches the package version
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $tauri = (Get-Content -Raw tauri.conf.json | ConvertFrom-Json).version
+          if ($cargo -ne $version) { throw "tag $version does not match Cargo.toml $cargo" }
+          if ($tauri -ne $version) { throw "tag $version does not match tauri.conf.json $tauri" }
+          if (-not (Select-String -Path CHANGELOG.md -Pattern "^## \[$([regex]::Escape($version))\]" -Quiet)) { throw "CHANGELOG.md has no $version entry" }
+
+      - name: Extract release notes
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]").LineNumber
+          $rest = $lines | Select-Object -Skip $start
+          $next = ($rest | Select-String -Pattern '^## \[' | Select-Object -First 1)
+          $body = if ($next) { $rest | Select-Object -First ($next.LineNumber - 1) } else { $rest }
+          ($body | Out-String).Trim() | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'notes.md')
+
+      - name: Build installer tools
+        shell: pwsh
+        run: |
+          cargo build --release --locked --manifest-path .rot-installer\Cargo.toml --bin rot-installer --bin rot-pack
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+
+      - name: Build clip
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+          npx tauri build --no-bundle --ci -- --locked
+          if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
+
+      - name: Package for the rot installer
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CLIP_SIGNING_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CLIP_SIGNING_KEY_PASSWORD }}
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $pack = '.rot-installer\target\release\rot-pack.exe'
+          $installer = '.rot-installer\target\release\rot-installer.exe'
+          function Invoke-Pack { & $pack @args; if ($LASTEXITCODE -ne 0) { throw "rot-pack $($args[0]) failed" } }
+          New-Item -ItemType Directory -Force dist\clip, release | Out-Null
+          Copy-Item target\release\clip.exe dist\clip\
+          $package = "release\clip-$version-windows-x86_64.rpack"
+          Invoke-Pack pack dist\clip $package --app clip --version $version
+          Invoke-Pack sign $package "$package.minisig"
+          $parts = & $pack parts $package
+          if ($LASTEXITCODE -ne 0) { throw "rot-pack parts failed" }
+          $base = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME"
+          $partArgs = foreach ($part in $parts) { '--part-url'; "$base/$(Split-Path $part -Leaf)" }
+          $notes = Get-Content -Raw (Join-Path $env:RUNNER_TEMP 'notes.md')
+          Invoke-Pack manifest $package release\installer.json @partArgs --signature "$package.minisig" `
+            --published-at ([DateTime]::UtcNow.ToString('o')) --target windows-x86_64 --notes $notes
+          Invoke-Pack sign release\installer.json release\installer.json.minisig
+          Invoke-Pack online $installer "release\clip-$version-online-setup.exe"
+          Invoke-Pack offline $installer $package "$package.minisig" "release\clip-$version-setup.exe" --app clip
+          Remove-Item $package
+
+      - name: Draft the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $assets = Get-ChildItem release -File | ForEach-Object { $_.FullName }
+          gh release create $env:GITHUB_REF_NAME --draft --title "clip $version" --notes-file (Join-Path $env:RUNNER_TEMP 'notes.md') @assets
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
