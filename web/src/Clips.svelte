@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
+  import { invoke, listen } from './host';
   import { SvelteSet } from 'svelte/reactivity';
   import Thumb from './Thumb.svelte';
   import { at, clock, day, size, title, type Clip, type Query } from './types';

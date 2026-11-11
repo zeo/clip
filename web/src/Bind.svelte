@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
+  import { invoke } from './host';
   import { chord, keyName } from './types';
 
   // plain takes a single key with no modifiers, for push to talk

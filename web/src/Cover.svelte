@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { convertFileSrc } from '@tauri-apps/api/core';
+  import { fileSrc } from './host';
   import { art } from './art.svelte';
   import Icon from './Icon.svelte';
   import Thumb from './Thumb.svelte';
@@ -13,7 +13,7 @@
 <button class="cover" onclick={onopen}>
   <span class="cover-art">
     {#if cover}
-      <img src={convertFileSrc(cover)} alt="" draggable="false" />
+      <img src={fileSrc(cover)} alt="" draggable="false" />
     {:else}
       <Thumb clip={newest} badge={false} />
       <span class="cover-plain"><Icon app={game.app} icon={game.icon} size={40} /></span>

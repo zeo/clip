@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
-  import { open } from '@tauri-apps/plugin-dialog';
+  import { dialog, invoke } from './host';
   import Bind from './Bind.svelte';
   import { ACTIONS, bufferCost, does, length, type Mic, type Settings } from './types';
 
@@ -31,7 +30,7 @@
   });
 
   async function pickFolder() {
-    const picked = await open({ directory: true, defaultPath: draft!.folder });
+    const picked = await dialog.open({ directory: true, defaultPath: draft!.folder });
     if (typeof picked === 'string') draft!.folder = picked;
   }
 

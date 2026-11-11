@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+  import { fileSrc, invoke } from './host';
 
   const LONG_SIDE = 640;
   // stills are made one at a time, so the library holds at most one media player of its own
@@ -21,7 +21,7 @@
   async function picture(path: string): Promise<string> {
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.src = convertFileSrc(path);
+    img.src = fileSrc(path);
     await img.decode();
     return keep(path, img, img.naturalWidth, img.naturalHeight);
   }
@@ -45,7 +45,7 @@
     video.muted = true;
     try {
       const loaded = once(video, 'loadeddata');
-      video.src = convertFileSrc(path);
+      video.src = fileSrc(path);
       await loaded;
       const seeked = once(video, 'seeked');
       video.currentTime = Math.min(1, video.duration / 2);
@@ -85,10 +85,10 @@
 </script>
 
 <div class="thumb" use:watch>
-  {#if shown}<img src={convertFileSrc(shown)} alt="" draggable="false" />{:else if failed}<span class="thumb-none">No preview</span>{/if}
+  {#if shown}<img src={fileSrc(shown)} alt="" draggable="false" />{:else if failed}<span class="thumb-none">No preview</span>{/if}
   {#if live && clip.kind === 'clip'}
     <!-- svelte-ignore a11y_media_has_caption -->
-    <video src={convertFileSrc(clip.path)} autoplay muted loop></video>
+    <video src={fileSrc(clip.path)} autoplay muted loop></video>
   {/if}
   {#if badge && clip.seconds > 0}<span class="duration mono">{clock(clip.seconds)}</span>{:else if badge && clip.path.toLowerCase().endsWith('.gif')}<span class="duration mono">GIF</span>{/if}
 </div>

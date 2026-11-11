@@ -1,9 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
-  import { getVersion } from '@tauri-apps/api/app';
-  import { open } from '@tauri-apps/plugin-dialog';
+  import { appVersion, dialog, fileSrc, invoke, listen } from './host';
   import Bind from './Bind.svelte';
   import { ACTIONS, PRESETS, at, chord, does, length, bufferCost, quality, resolution, sentence, size, type Corner, type AutoGame, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
   import { radios, reduced, say, view, zooms } from './view.svelte';
@@ -118,7 +115,7 @@
       },
       (e) => (error = `Can't read the settings: ${e}`)
     );
-    getVersion().then((v) => (version = v));
+    appVersion().then((v) => (version = v));
     invoke<typeof others>('other_folders').then(
       (found) => (others = found),
       (e) => say(`Can't look for other apps' folders: ${e}`, true)
@@ -239,7 +236,7 @@
 
   async function addSource() {
     if (!draft) return;
-    const picked = await open({ directory: true });
+    const picked = await dialog.open({ directory: true });
     if (typeof picked !== 'string') return;
     if (inside(picked)) say(`${known(picked)} is in the clips folder, so it's listed already`, true);
     else if (draft.sources.includes(picked)) say(`${known(picked)} is listed already`, true);
@@ -263,7 +260,7 @@
 
   async function pickFolder() {
     if (!draft) return;
-    const picked = await open({ directory: true, defaultPath: draft.folder });
+    const picked = await dialog.open({ directory: true, defaultPath: draft.folder });
     if (typeof picked === 'string') draft.folder = picked;
   }
 
@@ -321,7 +318,7 @@
       <span class="source-fixed"></span>
     {/if}
     {#if icon}
-      <img class="source-icon" src={convertFileSrc(icon)} alt="" draggable="false" />
+      <img class="source-icon" src={fileSrc(icon)} alt="" draggable="false" />
     {:else}
       <svg class="source-icon" viewBox="0 0 20 20" aria-hidden="true"><path d={glyph} /></svg>
     {/if}

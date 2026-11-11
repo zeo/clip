@@ -1,9 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
-  import { getCurrentWebview } from '@tauri-apps/api/webview';
-  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { appWindow, fileSrc, invoke, listen } from './host';
   import appIcon from '../../icons/icon.png';
   import { art } from './art.svelte';
   import ClipPage from './Clip.svelte';
@@ -32,7 +29,7 @@
     ['images', 'Screenshots and GIFs']
   ];
 
-  const win = getCurrentWindow();
+  const win = appWindow;
   let area = $state<Area>('home');
   let shelf = $state<Shelf>('games');
   let game = $state<string | null>(null);
@@ -180,7 +177,7 @@
   ]);
 
   $effect(() => {
-    getCurrentWebview().setZoom(view.zoom / 100);
+    appWindow.setZoom(view.zoom / 100);
   });
 
   async function refresh() {
@@ -328,7 +325,7 @@
 
 <div class="shell">
   <header class="bar">
-    <span class="glyph" data-tauri-drag-region>
+    <span class="glyph" data-drag-region>
       <img src={appIcon} alt="" draggable="false" />
     </span>
     <div class="now-wrap">
@@ -342,7 +339,7 @@
         title={sentence(status.message)}
         onclick={openQuick}
       >
-        {#if hero}<img src={convertFileSrc(hero)} alt="" draggable="false" />{/if}
+        {#if hero}<img src={fileSrc(hero)} alt="" draggable="false" />{/if}
         <span class="dot"></span>
         <span class="now-text">
           {#if status.recording}Recording <b>{status.app}</b>{:else if status.paused}Paused{:else}{sentence(status.message)}{/if}
@@ -421,7 +418,7 @@
         </div>
       {/if}
     </div>
-    <div class="hotkeys" data-tauri-drag-region>
+    <div class="hotkeys" data-drag-region>
       {#each status.hotkeys.filter((h) => h.key) as hotkey, i (i)}
         <button
           class="hotkey"
@@ -433,7 +430,7 @@
         </button>
       {/each}
     </div>
-    <span class="grow" data-tauri-drag-region></span>
+    <span class="grow" data-drag-region></span>
     <div class="bar-actions">
       <button class="gel" disabled={!status.recording} onclick={() => invoke('mark_clip')} title={does('mark', settings?.buffer ?? 30)}>Mark</button>
       <button class="gel default" disabled={!status.recording} onclick={() => invoke('save_clip')}>Save clip</button>

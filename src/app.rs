@@ -5,13 +5,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use ceri::{AppHandle, CommandCall, MenuItem, NativeHandle, TrayConfig, TrayEvent, WindowConfig, WindowControl};
 use serde::{Deserialize, Serialize};
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, WPARAM};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
@@ -257,6 +255,8 @@ struct Shared {
     cache: PathBuf,
     /// the run value that starts clip with windows
     login: String,
+    /// the app id notifications come from
+    identifier: String,
     first: AtomicBool,
     recorder: u32,
     /// made when the quick panel first asks
@@ -267,6 +267,17 @@ struct Shared {
     damaged: Mutex<Vec<String>>,
     /// the last update check and the installer to update with
     update: Arc<Mutex<(Update, Option<update::Owner>)>>,
+}
+
+static SHARED: OnceLock<Shared> = OnceLock::new();
+static APP: OnceLock<AppHandle> = OnceLock::new();
+
+fn shared() -> Result<&'static Shared, String> {
+    SHARED.get().ok_or_else(|| "clip is still starting".to_string())
+}
+
+fn handle() -> &'static AppHandle {
+    APP.get().expect("the app is kept before it runs")
 }
 
 /// Runs clip from the tray, keeping the last stretch of the focused app ready to save.
@@ -287,303 +298,227 @@ fn serve(restarted: bool) -> Result<(), String> {
     };
     // sfmg, once called clip, holds Clip for its install and library folders, run value and lt.rot.clip, and windows ignores case
     let name = format!("clip-recorder{suffix}");
-    let mut context = tauri::generate_context!();
-    context.config_mut().identifier = format!("lt.rot.{name}");
-    tauri::Builder::default()
+    let identifier = format!("lt.rot.{name}");
+    let menu = vec![
+        MenuItem::new("save", "save clip"),
+        MenuItem::new("rewind", "rewind the buffer"),
+        MenuItem::new("shot", "take screenshot"),
+        MenuItem::new("record", "start recording"),
+        MenuItem::Separator,
+        MenuItem::check("mic", "mute microphone", false),
+        MenuItem::check("pause", "pause recording", false),
+        MenuItem::new("show", "open clip"),
+        MenuItem::new("folder", "open clips folder"),
+        MenuItem::Separator,
+        MenuItem::new("quit", "quit"),
+    ];
+    let failed = Rc::new(Cell::new(None));
+    let app = ceri::App::new()
+        .identifier(&identifier)
+        .version(env!("CARGO_PKG_VERSION"))
+        .icon(include_bytes!("../icons/icon.png"))
+        .assets(ceri::embedded_assets!())
+        .capabilities(ceri::Capabilities::new(vec![ceri::Grant {
+            windows: vec!["main".into()],
+            origins: vec![ceri::APP_ORIGIN.into()],
+            commands: vec!["*".into()],
+        }]))
+        // closing the window only hides clip in the tray
+        .keep_running()
         // a second copy would record everything twice, so launching again opens the window instead
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
-        .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![
-            settings,
-            status,
-            first_run,
-            damaged,
-            log_folder,
-            system_info,
-            update_state,
-            install_update,
-            apply,
-            clips,
-            save_clip,
-            mark_clip,
-            take_shot,
-            toggle_mic,
-            toggle_recording,
-            rewind,
-            cost,
-            auto_games,
-            open,
-            reveal,
-            audio_apps,
-            app_icons,
-            windowed_apps,
-            star,
-            rename,
-            delete,
-            set_marks,
-            save_frame,
-            copy_files,
-            drag_out,
-            save_thumb,
-            track_audio,
-            export,
-            join,
-            cancel_export,
-            restore_original,
-            drop_original,
-            game_art,
-            pause,
-            hold_hotkeys,
-            key_names,
-            preview_sound,
-            mics,
-            mic_level,
-            test_notification,
-            disk,
-            other_folders,
-            import_folder
-        ])
-        .setup(move |app| {
-            let dir = app.path().config_dir()?.join(&name);
-            let file = dir.join("settings.json");
-            let marks_file = dir.join("library.json");
-            let cache = app.path().cache_dir()?.join(&name);
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::create_dir_all(&cache);
-            crate::log::open(&cache.join("clip.log"));
-            crate::crash::guard(&cache.join("crash.dmp"));
-            // not the whole cache, which holds crash dumps and the log
-            for part in ["thumbs", "art", "icons", "app-icons", "audio"] {
-                app.asset_protocol_scope().allow_directory(cache.join(part), true)?;
-            }
-            let icon = cache.join("icon.png");
-            if let Err(e) = std::fs::write(&icon, include_bytes!("../icons/icon.png"))
-                .map_err(|e| e.to_string())
-                .and_then(|()| toast::register(&app.config().identifier, "clip", &icon).map_err(|e| e.to_string()))
-            {
-                crate::log::write(format_args!("notifications can't show clip's name and icon: {e}"));
-            }
-            let mut damaged = Vec::new();
-            let stored = library::read_json::<Settings>(&file).unwrap_or_else(|e| {
-                damaged.push(format!("Settings were reset: {e}"));
-                None
-            });
-            let first = stored.is_none() && damaged.is_empty();
-            let had = stored.is_some();
-            let mut settings = stored.unwrap_or_default();
-            let default_folder = app.path().video_dir()?.join("clip-recorder");
-            if settings.folder.as_os_str().is_empty() {
-                settings.folder = default_folder.clone();
-            }
-            let (mut library, problem) = Marks::load(&marks_file);
-            damaged.extend(problem.map(|e| format!("Stars and marks were reset: {e}")));
-            library.seed(&default_folder);
-            if let Err(e) = library.store(&marks_file) {
-                crate::log::write(e);
-            }
-            damaged.iter().for_each(crate::log::write);
-            let marks = Arc::new(Mutex::new(library));
-            // a cfg carries the token, so a fresh one each start would leave the games unheard
-            if settings.gsi_token.is_empty() {
-                settings.gsi_token = crate::events::token();
-                // before the first apply there's no file, and no game to hear
-                let saved = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string());
-                if let Err(e) = saved.and_then(|json| match had {
-                    true => library::write_json(&file, &json).map_err(|e| e.to_string()),
-                    false => Ok(()),
-                }) {
-                    crate::log::write(format_args!("can't save the game token: {e}"));
+        .single_instance(|app, _, _| show(app))
+        .tray(
+            TrayConfig { tooltip: "clip: starting".into(), menu, ..TrayConfig::default() },
+            |app, event| match event {
+                TrayEvent::Click => show(app),
+                TrayEvent::Menu(id) => chosen(app, &id),
+            },
+        )
+        .on_start({
+            let failed = failed.clone();
+            move |app| {
+                if let Err(e) = start_up(app, &name, &identifier, restarted) {
+                    failed.set(Some(e));
+                    app.exit();
                 }
             }
-            // the games read their cfg at launch, and a steam library that moved leaves an old one behind
-            for game in crate::events::GAMES.iter().filter(|game| settings.auto.iter().any(|id| id == game.id)) {
-                if let Err(e) = game.connect(true, &settings.gsi_token) {
-                    crate::log::write(e);
-                }
-            }
-            app.asset_protocol_scope().allow_directory(&settings.folder, true)?;
-            for source in &settings.sources {
-                app.asset_protocol_scope().allow_directory(source, true)?;
-            }
-            if settings.start_with_windows {
-                if let Err(e) = run_at_login(&name, true) {
-                    crate::log::write(format_args!("can't start with windows: {e}"));
-                }
-            }
-            let pause = CheckMenuItem::with_id(app, "pause", "pause recording", true, false, None::<&str>)?;
-            let taping = MenuItem::with_id(app, "record", "start recording", true, None::<&str>)?;
-            let mute = CheckMenuItem::with_id(app, "mic", "mute microphone", true, false, None::<&str>)?;
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &MenuItem::with_id(app, "save", "save clip", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "rewind", "rewind the buffer", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "shot", "take screenshot", true, None::<&str>)?,
-                    &taping,
-                    &PredefinedMenuItem::separator(app)?,
-                    &mute,
-                    &pause,
-                    &MenuItem::with_id(app, "show", "open clip", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "folder", "open clips folder", true, None::<&str>)?,
-                    &PredefinedMenuItem::separator(app)?,
-                    &MenuItem::with_id(app, "quit", "quit", true, None::<&str>)?,
-                ],
-            )?;
-            let mut tray = TrayIconBuilder::with_id("clip")
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .tooltip("clip: starting")
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left, button_state: MouseButtonState::Up, ..
-                    } = event
-                    {
-                        show(tray.app_handle());
-                    }
-                });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
-            let tray = tray.build(app)?;
-            let settings = Arc::new(Mutex::new(settings));
-            let status = Arc::new(Mutex::new(Status::default()));
-            let (ready, recorder) = mpsc::channel();
-            let (heard, plays) = mpsc::channel();
-            {
-                let (app, settings, status) = (app.handle().clone(), settings.clone(), status.clone());
-                let library = (marks.clone(), marks_file.clone(), cache.join("thumbs"));
-                let tray = Tray { icon: tray, pause, taping, mute };
-                std::thread::spawn(move || record(&app, &tray, &settings, &status, &library, ready, plays));
-            }
-            let open_on_start = settings.lock().expect("settings poisoned").open_on_start;
-            let recorder = recorder.recv()?;
-            let send = move |game: &'static crate::events::Game, play: String| {
-                if heard.send((game, play)).is_ok() {
-                    post(recorder, WM_PLAY, 0);
-                }
-            };
-            let deaf = match crate::events::bind() {
-                Ok(listener) => {
-                    let settings = settings.clone();
-                    let token = move || settings.lock().expect("settings poisoned").gsi_token.clone();
-                    crate::events::listen(listener, token, send.clone());
-                    None
-                }
-                Err(e) => Some(format!("port {} is taken: {e}", crate::events::PORT)),
-            };
-            {
-                let (settings, status) = (settings.clone(), status.clone());
-                let league = crate::events::game("league").expect("league is listed");
-                crate::events::watch_league(
-                    move || {
-                        status.lock().expect("status poisoned").exe == league.exe
-                            && settings.lock().expect("settings poisoned").auto.iter().any(|id| id == league.id)
-                    },
-                    send,
-                );
-            }
-            let update = Arc::new(Mutex::new((Update::default(), None)));
-            match cfg!(debug_assertions) {
-                true => update.lock().expect("update poisoned").0.error = "a dev build doesn't update".into(),
-                false => {
-                    let (update, handle) = (update.clone(), app.handle().clone());
-                    std::thread::spawn(move || loop {
-                        let (found, owner) = match update::check() {
-                            Ok((found, owner)) => (found, Some(owner)),
-                            Err(error) => {
-                                crate::log::write(format_args!("update check failed: {error}"));
-                                (Update { error, ..Update::default() }, None)
-                            }
-                        };
-                        let changed = {
-                            let mut held = update.lock().expect("update poisoned");
-                            std::mem::replace(&mut *held, (found.clone(), owner)).0 != found
-                        };
-                        if changed {
-                            let _ = handle.emit("update", &found);
-                        }
-                        std::thread::sleep(update::EVERY);
-                    });
-                }
-            }
-            app.manage(Shared {
-                settings,
-                status,
-                file,
-                marks,
-                marks_file,
-                cache,
-                login: name.clone(),
-                first: AtomicBool::new(first),
-                recorder,
-                meter: Mutex::default(),
-                deaf,
-                damaged: Mutex::new(damaged),
-                update,
-            });
-            app.on_menu_event(|app, event| {
-                let shared = app.state::<Shared>();
-                match event.id.as_ref() {
-                    "save" => post(shared.recorder, WM_HOTKEY, SAVE),
-                    "shot" => post(shared.recorder, WM_HOTKEY, SHOT),
-                    "record" => post(shared.recorder, WM_HOTKEY, RECORD),
-                    "rewind" => post(shared.recorder, WM_HOTKEY, REWIND),
-                    "mic" => post(shared.recorder, WM_HOTKEY, MIC),
-                    "pause" => {
-                        let paused = shared.status.lock().expect("status poisoned").paused;
-                        post(shared.recorder, WM_PAUSE, !paused as usize);
-                    }
-                    "show" => show(app),
-                    "folder" => {
-                        let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
-                        let _ = std::fs::create_dir_all(&folder);
-                        let _ = Command::new("explorer").arg(folder).spawn();
-                    }
-                    "quit" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            remember(app, &window);
-                        }
-                        app.exit(0)
-                    }
-                    _ => {}
-                }
-            });
-            if !restarted && (first || open_on_start) {
-                show(app.handle());
-            }
-            Ok(())
         })
-        .build(context)
-        .map_err(|e| e.to_string())?
-        .run(|app, event| match event {
-            // a key box focused as the window went holds the hotkeys off, so they come back with it
-            RunEvent::WindowEvent { event: WindowEvent::Destroyed, .. } => {
-                post(app.state::<Shared>().recorder, WM_HOLD, 0);
+        .on_close_requested(|app, _| {
+            remember(app);
+            if shared().is_ok_and(|shared| !shared.settings.lock().expect("settings poisoned").close_to_tray) {
+                app.exit();
             }
-            RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { .. }, .. } => {
-                if let Some(window) = app.get_webview_window(&label) {
-                    remember(app, &window);
-                }
-                if !app.state::<Shared>().settings.lock().expect("settings poisoned").close_to_tray {
-                    app.exit(0);
-                }
+            true
+        })
+        // a key box focused as the window went holds the hotkeys off, so they come back with it
+        .on_closed(|_, _| {
+            if let Ok(shared) = shared() {
+                post(shared.recorder, WM_HOLD, 0);
             }
-            // closing the window only hides clip in the tray, quitting from the tray passes a code
-            RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
-            // a long recording only plays once it's closed, so quitting closes it first
-            RunEvent::Exit => {
-                let shared = app.state::<Shared>();
-                let taping = || shared.status.lock().expect("status poisoned").taping != 0;
-                if taping() {
-                    post(shared.recorder, WM_HOTKEY, RECORD);
-                    let until = Instant::now() + Duration::from_secs(10);
-                    while taping() && Instant::now() < until {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
+        })
+        // a long recording only plays once it's closed, so quitting closes it first
+        .on_exit(|| {
+            let Ok(shared) = shared() else { return };
+            let taping = || shared.status.lock().expect("status poisoned").taping != 0;
+            if taping() {
+                post(shared.recorder, WM_HOTKEY, RECORD);
+                let until = Instant::now() + Duration::from_secs(10);
+                while taping() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
-            _ => {}
         });
+    let _ = APP.set(app.handle());
+    commands(app).run()?;
+    failed.take().map_or(Ok(()), Err)
+}
+
+fn start_up(app: &AppHandle, name: &str, identifier: &str, restarted: bool) -> Result<(), String> {
+    let dir = ceri::dirs::config().ok_or("there's no folder for settings")?.join(name);
+    let file = dir.join("settings.json");
+    let marks_file = dir.join("library.json");
+    let cache = ceri::dirs::cache().ok_or("there's no folder for the cache")?.join(name);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&cache);
+    crate::log::open(&cache.join("clip.log"));
+    crate::crash::guard(&cache.join("crash.dmp"));
+    // not the whole cache, which holds crash dumps and the log
+    for part in ["thumbs", "art", "icons", "app-icons", "audio"] {
+        app.files().allow(cache.join(part))?;
+    }
+    let icon = cache.join("icon.png");
+    if let Err(e) = std::fs::write(&icon, include_bytes!("../icons/icon.png"))
+        .map_err(|e| e.to_string())
+        .and_then(|()| toast::register(identifier, "clip", &icon).map_err(|e| e.to_string()))
+    {
+        crate::log::write(format_args!("notifications can't show clip's name and icon: {e}"));
+    }
+    let mut damaged = Vec::new();
+    let stored = library::read_json::<Settings>(&file).unwrap_or_else(|e| {
+        damaged.push(format!("Settings were reset: {e}"));
+        None
+    });
+    let first = stored.is_none() && damaged.is_empty();
+    let had = stored.is_some();
+    let mut settings = stored.unwrap_or_default();
+    let default_folder = ceri::dirs::videos().ok_or("there's no videos folder")?.join("clip-recorder");
+    if settings.folder.as_os_str().is_empty() {
+        settings.folder = default_folder.clone();
+    }
+    let (mut library, problem) = Marks::load(&marks_file);
+    damaged.extend(problem.map(|e| format!("Stars and marks were reset: {e}")));
+    library.seed(&default_folder);
+    if let Err(e) = library.store(&marks_file) {
+        crate::log::write(e);
+    }
+    damaged.iter().for_each(crate::log::write);
+    let marks = Arc::new(Mutex::new(library));
+    // a cfg carries the token, so a fresh one each start would leave the games unheard
+    if settings.gsi_token.is_empty() {
+        settings.gsi_token = crate::events::token();
+        // before the first apply there's no file, and no game to hear
+        let saved = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string());
+        if let Err(e) = saved.and_then(|json| match had {
+            true => library::write_json(&file, &json).map_err(|e| e.to_string()),
+            false => Ok(()),
+        }) {
+            crate::log::write(format_args!("can't save the game token: {e}"));
+        }
+    }
+    // the games read their cfg at launch, and a steam library that moved leaves an old one behind
+    for game in crate::events::GAMES.iter().filter(|game| settings.auto.iter().any(|id| id == game.id)) {
+        if let Err(e) = game.connect(true, &settings.gsi_token) {
+            crate::log::write(e);
+        }
+    }
+    for dir in std::iter::once(&settings.folder).chain(&settings.sources) {
+        app.files().allow(dir)?;
+    }
+    if settings.start_with_windows {
+        if let Err(e) = run_at_login(name, true) {
+            crate::log::write(format_args!("can't start with windows: {e}"));
+        }
+    }
+    let settings = Arc::new(Mutex::new(settings));
+    let status = Arc::new(Mutex::new(Status::default()));
+    let (ready, recorder) = mpsc::channel();
+    let (heard, plays) = mpsc::channel();
+    {
+        let (app, identifier, settings, status) =
+            (app.clone(), identifier.to_string(), settings.clone(), status.clone());
+        let library = (marks.clone(), marks_file.clone(), cache.join("thumbs"));
+        std::thread::spawn(move || record(&app, &identifier, &settings, &status, &library, ready, plays));
+    }
+    let open_on_start = settings.lock().expect("settings poisoned").open_on_start;
+    let recorder = recorder.recv().map_err(|e| e.to_string())?;
+    let send = move |game: &'static crate::events::Game, play: String| {
+        if heard.send((game, play)).is_ok() {
+            post(recorder, WM_PLAY, 0);
+        }
+    };
+    let deaf = match crate::events::bind() {
+        Ok(listener) => {
+            let settings = settings.clone();
+            let token = move || settings.lock().expect("settings poisoned").gsi_token.clone();
+            crate::events::listen(listener, token, send.clone());
+            None
+        }
+        Err(e) => Some(format!("port {} is taken: {e}", crate::events::PORT)),
+    };
+    {
+        let (settings, status) = (settings.clone(), status.clone());
+        let league = crate::events::game("league").expect("league is listed");
+        crate::events::watch_league(
+            move || {
+                status.lock().expect("status poisoned").exe == league.exe
+                    && settings.lock().expect("settings poisoned").auto.iter().any(|id| id == league.id)
+            },
+            send,
+        );
+    }
+    let update = Arc::new(Mutex::new((Update::default(), None)));
+    match cfg!(debug_assertions) {
+        true => update.lock().expect("update poisoned").0.error = "a dev build doesn't update".into(),
+        false => {
+            let (update, handle) = (update.clone(), app.clone());
+            std::thread::spawn(move || loop {
+                let (found, owner) = match update::check() {
+                    Ok((found, owner)) => (found, Some(owner)),
+                    Err(error) => {
+                        crate::log::write(format_args!("update check failed: {error}"));
+                        (Update { error, ..Update::default() }, None)
+                    }
+                };
+                let changed = {
+                    let mut held = update.lock().expect("update poisoned");
+                    std::mem::replace(&mut *held, (found.clone(), owner)).0 != found
+                };
+                if changed {
+                    handle.emit("update", &found);
+                }
+                std::thread::sleep(update::EVERY);
+            });
+        }
+    }
+    let _ = SHARED.set(Shared {
+        settings,
+        status,
+        file,
+        marks,
+        marks_file,
+        cache,
+        login: name.into(),
+        identifier: identifier.into(),
+        first: AtomicBool::new(first),
+        recorder,
+        meter: Mutex::default(),
+        deaf,
+        damaged: Mutex::new(damaged),
+        update,
+    });
+    if !restarted && (first || open_on_start) {
+        show(app);
+    }
     Ok(())
 }
 
@@ -591,31 +526,60 @@ fn post(thread: u32, message: u32, key: usize) {
     let _ = unsafe { PostThreadMessageW(thread, message, WPARAM(key), LPARAM(0)) };
 }
 
-/// Brings the window up, creating it if it was closed.
-fn show(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        return;
+/// What a tray menu item does.
+fn chosen(app: &AppHandle, id: &str) {
+    if id == "show" {
+        return show(app);
     }
-    let app = app.clone();
-    // building a webview inside an event handler deadlocks on windows
-    std::thread::spawn(move || {
-        let Some(mut config) = app.config().app.windows.first().cloned() else { return };
-        match placement(&app) {
-            Some(placed) => {
-                (config.width, config.height, config.maximized) = (placed.width, placed.height, placed.maximized);
-                if let Some((x, y)) = placed.x.zip(placed.y).filter(|&(x, y)| on_screen(&app, x, y)) {
-                    (config.x, config.y, config.center) = (Some(x), Some(y), false);
-                }
+    let Ok(shared) = shared() else { return };
+    match id {
+        "save" => post(shared.recorder, WM_HOTKEY, SAVE),
+        "shot" => post(shared.recorder, WM_HOTKEY, SHOT),
+        "record" => post(shared.recorder, WM_HOTKEY, RECORD),
+        "rewind" => post(shared.recorder, WM_HOTKEY, REWIND),
+        "mic" => post(shared.recorder, WM_HOTKEY, MIC),
+        "pause" => {
+            let paused = shared.status.lock().expect("status poisoned").paused;
+            post(shared.recorder, WM_PAUSE, !paused as usize);
+        }
+        "folder" => {
+            let folder = shared.settings.lock().expect("settings poisoned").folder.clone();
+            let _ = std::fs::create_dir_all(&folder);
+            let _ = Command::new("explorer").arg(folder).spawn();
+        }
+        "quit" => {
+            remember(app);
+            app.exit();
+        }
+        _ => {}
+    }
+}
+
+/// Brings the window up, opening it if it was closed.
+fn show(app: &AppHandle) {
+    let Some(windows) = app.windows() else { return };
+    let mut config = WindowConfig {
+        label: "main".into(),
+        title: "clip".into(),
+        width: 1080,
+        height: 700,
+        minimum_width: 760,
+        minimum_height: 480,
+        decorations: false,
+        background: [0x12, 0x13, 0x15],
+        ..WindowConfig::default()
+    };
+    match placement() {
+        Some(placed) => {
+            (config.width, config.height, config.maximized) =
+                (placed.width.round() as u32, placed.height.round() as u32, placed.maximized);
+            if let Some((x, y)) = placed.x.zip(placed.y).filter(|&(x, y)| on_screen(windows, x, y)) {
+                config.position = Some((x.round() as i32, y.round() as i32));
             }
-            None => config.maximized = true,
         }
-        if let Err(e) = WebviewWindowBuilder::from_config(&app, &config).and_then(|window| window.build()) {
-            crate::log::write(format_args!("the window didn't open: {e}"));
-        }
-    });
+        None => config.maximized = true,
+    }
+    windows.open(config);
 }
 
 /// Where the window was when it last closed, in logical pixels.
@@ -628,56 +592,145 @@ struct Placement {
     maximized: bool,
 }
 
-fn placement_file(app: &AppHandle) -> PathBuf {
-    app.state::<Shared>().file.with_file_name("window.json")
+fn placement_file() -> Option<PathBuf> {
+    Some(shared().ok()?.file.with_file_name("window.json"))
 }
 
-fn placement(app: &AppHandle) -> Option<Placement> {
-    serde_json::from_str(&std::fs::read_to_string(placement_file(app)).ok()?).ok()
+fn placement() -> Option<Placement> {
+    serde_json::from_str(&std::fs::read_to_string(placement_file()?).ok()?).ok()
 }
 
-fn remember(app: &AppHandle, window: &WebviewWindow) {
-    if window.is_minimized().unwrap_or(true) {
+fn remember(app: &AppHandle) {
+    let (Some(state), Some(file)) = (app.windows().and_then(|windows| windows.state("main")), placement_file()) else {
+        return;
+    };
+    if state.minimized {
         return;
     }
-    let maximized = window.is_maximized().unwrap_or(false);
+    let maximized = state.maximized;
     let placed = if maximized {
         // a maximized window's bounds are the monitor's, so the last normal ones are kept for restoring
-        let fallback = app.config().app.windows.first().map_or((1080.0, 700.0), |config| (config.width, config.height));
-        let last =
-            placement(app).unwrap_or(Placement { x: None, y: None, width: fallback.0, height: fallback.1, maximized });
+        let last = placement().unwrap_or(Placement { x: None, y: None, width: 1080.0, height: 700.0, maximized });
         Placement { maximized, ..last }
     } else {
-        let (Ok(scale), Ok(at), Ok(size)) = (window.scale_factor(), window.outer_position(), window.inner_size())
-        else {
-            return;
-        };
-        let (at, size) = (at.to_logical::<f64>(scale), size.to_logical::<f64>(scale));
-        Placement { x: Some(at.x), y: Some(at.y), width: size.width, height: size.height, maximized }
+        let scale = state.scale;
+        Placement {
+            x: Some(f64::from(state.position.0) / scale),
+            y: Some(f64::from(state.position.1) / scale),
+            width: f64::from(state.size.0) / scale,
+            height: f64::from(state.size.1) / scale,
+            maximized,
+        }
     };
     let json = serde_json::to_string(&placed).expect("a placement is json");
-    if let Err(e) = library::write_json(&placement_file(app), &json) {
+    if let Err(e) = library::write_json(&file, &json) {
         crate::log::write(format_args!("can't keep where the window was: {e}"));
     }
 }
 
 /// Whether a window placed at `x`, `y` would have its title bar on a monitor that is still there.
-fn on_screen(app: &AppHandle, x: f64, y: f64) -> bool {
-    app.available_monitors().unwrap_or_default().iter().any(|monitor| {
-        let (at, size) = (
-            monitor.position().to_logical::<f64>(monitor.scale_factor()),
-            monitor.size().to_logical::<f64>(monitor.scale_factor()),
-        );
-        (at.x..at.x + size.width).contains(&(x + 60.0)) && (at.y..at.y + size.height).contains(&(y + 10.0))
+fn on_screen(windows: &WindowControl, x: f64, y: f64) -> bool {
+    windows.monitors().iter().any(|monitor| {
+        let (left, top) =
+            (f64::from(monitor.position.0) / monitor.scale, f64::from(monitor.position.1) / monitor.scale);
+        let (width, height) = (f64::from(monitor.size.0) / monitor.scale, f64::from(monitor.size.1) / monitor.scale);
+        (left..left + width).contains(&(x + 60.0)) && (top..top + height).contains(&(y + 10.0))
     })
 }
 
-/// The tray menu items the recorder keeps up to date.
-struct Tray {
-    icon: TrayIcon,
-    pause: CheckMenuItem<Wry>,
-    taping: MenuItem<Wry>,
-    mute: CheckMenuItem<Wry>,
+/// The commands the window calls, each answered on a thread of its own.
+fn commands(app: ceri::App) -> ceri::App {
+    app.blocking_json_command("settings", ceri::command!(|| settings(shared()?)))
+        .blocking_json_command("status", ceri::command!(|| status(shared()?)))
+        .blocking_json_command("first_run", ceri::command!(|| first_run(shared()?)))
+        .blocking_json_command("damaged", ceri::command!(|| damaged(shared()?)))
+        .blocking_json_command("log_folder", ceri::command!(|| log_folder(shared()?)))
+        .blocking_json_command("system_info", ceri::command!(|| system_info(shared()?)))
+        .blocking_json_command("update_state", ceri::command!(|| update_state(shared()?)))
+        .blocking_json_command("install_update", ceri::command!(|| install_update(handle(), shared()?)))
+        .blocking_json_command("apply", ceri::command!(|settings: Settings| apply(handle(), shared()?, settings)))
+        .blocking_json_command("clips", ceri::command!(|| clips(shared()?)))
+        .blocking_json_command("save_clip", ceri::command!(|| save_clip(shared()?)))
+        .blocking_json_command("mark_clip", ceri::command!(|| mark_clip(shared()?)))
+        .blocking_json_command("take_shot", ceri::command!(|| take_shot(shared()?)))
+        .blocking_json_command("toggle_mic", ceri::command!(|| toggle_mic(shared()?)))
+        .blocking_json_command("toggle_recording", ceri::command!(|| toggle_recording(shared()?)))
+        .blocking_json_command("rewind", ceri::command!(|| rewind(shared()?)))
+        .blocking_json_command("cost", ceri::command!(|| cost(shared()?)))
+        .blocking_json_command("auto_games", ceri::command!(|| auto_games(shared()?)))
+        .blocking_json_command("open", ceri::command!(|path: PathBuf| open(shared()?, path)))
+        .blocking_json_command("reveal", ceri::command!(|path: PathBuf| reveal(shared()?, path)))
+        .blocking_json_command("audio_apps", ceri::command!(|| audio_apps()))
+        .blocking_json_command("app_icons", ceri::command!(|exes: Vec<String>| app_icons(shared()?, exes)))
+        .blocking_json_command("windowed_apps", ceri::command!(|| windowed_apps()))
+        .blocking_json_command(
+            "star",
+            ceri::command!(|paths: Vec<PathBuf>, on: bool| star(handle(), shared()?, paths, on)),
+        )
+        .blocking_json_command(
+            "rename",
+            ceri::command!(|path: PathBuf, name: String| rename(handle(), shared()?, path, name)),
+        )
+        .blocking_json_command("delete", ceri::command!(|paths: Vec<PathBuf>| delete(handle(), shared()?, paths)))
+        .blocking_json_command(
+            "set_marks",
+            ceri::command!(|path: PathBuf, at: Vec<f64>| set_marks(handle(), shared()?, path, at)),
+        )
+        .blocking_json_command("save_frame", ceri::command!(|call| save_frame(shared()?, call)))
+        .blocking_json_command(
+            "copy_files",
+            ceri::command!(|call, paths: Vec<PathBuf>| copy_files(&call.window, shared()?, paths)),
+        )
+        .blocking_json_command(
+            "drag_out",
+            ceri::command!(|call, paths: Vec<PathBuf>| drag_out(&call.window, shared()?, paths)),
+        )
+        .blocking_json_command(
+            "save_thumb",
+            ceri::command!(|path: PathBuf, jpeg: Vec<u8>| save_thumb(shared()?, path, jpeg)),
+        )
+        .blocking_json_command("track_audio", ceri::command!(|path: PathBuf| track_audio(shared()?, path)))
+        .blocking_json_command(
+            "export",
+            ceri::command!(|path: PathBuf,
+                            ranges: Vec<(f64, f64)>,
+                            tracks: Vec<usize>,
+                            mix: bool,
+                            fit: Option<u64>,
+                            portrait: Option<f64>,
+                            replace: bool| export(
+                handle(),
+                shared()?,
+                path,
+                ranges,
+                tracks,
+                mix,
+                fit,
+                portrait,
+                replace
+            )),
+        )
+        .blocking_json_command("join", ceri::command!(|paths: Vec<PathBuf>| join(handle(), shared()?, paths)))
+        .blocking_json_command("cancel_export", ceri::command!(|| cancel_export()))
+        .blocking_json_command(
+            "restore_original",
+            ceri::command!(|path: PathBuf| restore_original(handle(), shared()?, path)),
+        )
+        .blocking_json_command("drop_original", ceri::command!(|path: PathBuf| drop_original(shared()?, path)))
+        .blocking_json_command("game_art", ceri::command!(|app: String| game_art(handle(), shared()?, app)))
+        .blocking_json_command("pause", ceri::command!(|on: bool| pause(shared()?, on)))
+        .blocking_json_command("hold_hotkeys", ceri::command!(|on: bool| hold_hotkeys(shared()?, on)))
+        .blocking_json_command("key_names", ceri::command!(|| key_names()))
+        .blocking_json_command("preview_sound", ceri::command!(|percent: u32| preview_sound(percent)))
+        .blocking_json_command("mics", ceri::command!(|| mics()))
+        .blocking_json_command("mic_level", ceri::command!(|device: String| mic_level(device)))
+        .blocking_json_command("test_notification", ceri::command!(|| test_notification(shared()?)))
+        .blocking_json_command("disk", ceri::command!(|folder: PathBuf| disk(folder)))
+        .blocking_json_command("other_folders", ceri::command!(|| other_folders()))
+        .blocking_json_command(
+            "import_folder",
+            ceri::command!(|source: PathBuf| import_folder(handle(), shared()?, source)),
+        )
 }
 
 /// A long recording, written as it goes for as long as the session it follows lives.
@@ -762,7 +815,7 @@ type Library = (Arc<Mutex<Marks>>, PathBuf, PathBuf);
 /// hotkeys, and starting over on WM_RESTART.
 fn record(
     app: &AppHandle,
-    menu: &Tray,
+    identifier: &str,
     settings: &Mutex<Settings>,
     status: &Mutex<Status>,
     (marks, marks_file, thumbs): &Library,
@@ -774,7 +827,7 @@ fn record(
     let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
     let _ = ready.send(unsafe { GetCurrentThreadId() });
     let (bound, held, paused) = (RefCell::new(Vec::<Bound>::new()), Cell::new(false), Cell::new(false));
-    let (tray, pause) = (&menu.icon, &menu.pause);
+    let tray = app.tray().expect("the tray is made before clip starts");
     let taping_since = Cell::new(0u64);
     let rebind = || {
         let mut bound = bound.borrow_mut();
@@ -860,14 +913,14 @@ fn record(
                 summary: recording.session.summary.clone(),
             },
         };
-        let _ = pause.set_checked(next.paused);
-        let _ = menu.mute.set_checked(next.mic_muted);
-        let _ = menu.taping.set_text(if next.taping == 0 { "start recording" } else { "stop recording" });
-        let _ = tray.set_tooltip(Some(match next.recording {
+        tray.set_checked("pause", next.paused);
+        tray.set_checked("mic", next.mic_muted);
+        tray.set_text("record", if next.taping == 0 { "start recording" } else { "stop recording" });
+        tray.set_tooltip(&match next.recording {
             true => format!("clip: recording {}, {}", next.app, next.message),
             false => format!("clip: {}", next.message),
-        }));
-        let _ = app.emit("status", &next);
+        });
+        app.emit("status", &next);
         *status.lock().expect("status poisoned") = next;
     };
     // nothing shows over clip's own window, where the window says it
@@ -897,7 +950,7 @@ fn record(
             (false, None) => {}
         }
         note(&text, bad, game);
-        let _ = app.emit("saved", (text, bad));
+        app.emit("saved", (text, bad));
     };
     // writes the buffer into the game's folder with its marks, and lets the library know
     let keep = |recording: &Recording, marked: &[i64], seconds: Option<u32>, tail: &str| {
@@ -919,7 +972,7 @@ fn record(
         marks.mark(&folder, &out, at);
         marks.wrote(&out);
         trim(&folder, &mut marks, marks_file, thumbs, cap, keep_days);
-        let _ = app.emit("clips", ());
+        app.emit("clips", ());
         Ok::<_, String>((saved, out))
     };
     let save = |recording: &Recording, marked: &[i64], seconds: Option<u32>, tail: &str| {
@@ -939,7 +992,7 @@ fn record(
             }
         }
         if notify {
-            let id = &app.config().identifier;
+            let id = identifier;
             let _ = match &saved {
                 Ok((saved, out)) => {
                     let body = format!("{}, {:.0} s, {}", recording.app, saved.seconds, size(saved.bytes as u64));
@@ -949,7 +1002,7 @@ fn record(
             };
         }
         // the window says it too, where a screen reader hears it
-        let _ = app.emit(
+        app.emit(
             "saved",
             match &saved {
                 Ok((saved, _)) => {
@@ -965,7 +1018,7 @@ fn record(
             Err(e) => note(&format!("Clip not saved: {e}"), true, recording.window),
         }
         if let Err(e) = saved {
-            let _ = tray.set_tooltip(Some(format!("clip: {e}")));
+            tray.set_tooltip(&format!("clip: {e}"));
         }
     };
     {
@@ -994,7 +1047,7 @@ fn record(
                     false,
                     recording.window,
                 );
-                let _ = app.emit("clips", ());
+                app.emit("clips", ());
             }
             Err(e) => feedback(format!("Screenshot not saved: {e}"), true, recording.window),
         }
@@ -1019,7 +1072,7 @@ fn record(
                 let mut marks = marks.lock().expect("marks poisoned");
                 marks.wrote(&out);
                 trim(&folder, &mut marks, marks_file, thumbs, cap, keep_days);
-                let _ = app.emit("clips", ());
+                app.emit("clips", ());
             }
             Err(e) => feedback(format!("Recording not saved: {e}"), true, window),
         }
@@ -1163,7 +1216,7 @@ fn record(
                 if settings.lock().expect("settings poisoned").mic {
                     let muted = !crate::audio::MIC_MUTED.fetch_xor(true, Ordering::Relaxed);
                     note(if muted { "Mic muted" } else { "Mic on" }, false, window);
-                    let _ = app.emit("saved", (if muted { "Mic muted" } else { "Mic on" }, false));
+                    app.emit("saved", (if muted { "Mic muted" } else { "Mic on" }, false));
                     report(&current);
                 } else {
                     feedback("The mic isn't recorded, turn it on in Audio".into(), true, window);
@@ -1198,7 +1251,7 @@ fn record(
                                     checked: Instant::now(),
                                 });
                                 note(&format!("Recording {}", recording.app), false, recording.window);
-                                let _ = app.emit("saved", (format!("Recording {}", recording.app), false));
+                                app.emit("saved", (format!("Recording {}", recording.app), false));
                             }
                             Err(e) => feedback(format!("Recording not started: {e}"), true, recording.window),
                         }
@@ -1217,7 +1270,7 @@ fn record(
                         match keep(recording, marked.map_or(&[], |p| &p.marks), seconds, REWOUND) {
                             Ok((_, out)) => {
                                 show(app);
-                                let _ = app.emit("rewind", out);
+                                app.emit("rewind", out);
                             }
                             Err(e) => feedback(format!("Couldn't rewind: {e}"), true, recording.window),
                         }
@@ -1265,7 +1318,7 @@ fn record(
                     }
                     Err(e) => {
                         let _ = unsafe { MessageBeep(MB_ICONHAND) };
-                        let _ = tray.set_tooltip(Some(format!("clip: {e}")));
+                        tray.set_tooltip(&format!("clip: {e}"));
                     }
                 }
                 None
@@ -1420,37 +1473,31 @@ fn run_at_login(name: &str, on: bool) -> windows::core::Result<()> {
     result.ok()
 }
 
-#[tauri::command]
-fn settings(shared: State<Shared>) -> Settings {
+fn settings(shared: &Shared) -> Settings {
     shared.settings.lock().expect("settings poisoned").clone()
 }
 
-#[tauri::command]
-fn status(shared: State<Shared>) -> Status {
+fn status(shared: &Shared) -> Status {
     shared.status.lock().expect("status poisoned").clone()
 }
 
-#[tauri::command]
-fn first_run(shared: State<Shared>) -> bool {
+fn first_run(shared: &Shared) -> bool {
     shared.first.load(Ordering::Relaxed)
 }
 
 /// What couldn't be read at start, said once.
-#[tauri::command]
-fn damaged(shared: State<Shared>) -> Vec<String> {
+fn damaged(shared: &Shared) -> Vec<String> {
     std::mem::take(&mut *shared.damaged.lock().expect("damaged poisoned"))
 }
 
-#[tauri::command]
-fn log_folder(shared: State<Shared>) -> Result<(), String> {
+fn log_folder(shared: &Shared) -> Result<(), String> {
     Command::new("explorer").arg(&shared.cache).spawn().map(drop).map_err(|e| e.to_string())
 }
 
 /// clip's version, the windows build, the gpu and its encoders, and what's being recorded, for a bug report.
-#[tauri::command]
-async fn system_info(shared: State<'_, Shared>) -> Result<String, String> {
+fn system_info(shared: &Shared) -> Result<String, String> {
     let summary = shared.status.lock().expect("status poisoned").summary.clone();
-    let machine = blocking(|| crate::machine().map_err(|e| e.message())).await;
+    let machine = blocking(|| crate::machine().map_err(|e| e.message()));
     let mut lines = vec![format!("clip {}", env!("CARGO_PKG_VERSION")), windows_build()];
     lines.extend(machine.unwrap_or_else(|e| vec![format!("no gpu: {e}")]));
     lines.push(match summary.is_empty() {
@@ -1460,20 +1507,18 @@ async fn system_info(shared: State<'_, Shared>) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-#[tauri::command]
-fn update_state(shared: State<Shared>) -> Update {
+fn update_state(shared: &Shared) -> Update {
     shared.update.lock().expect("update poisoned").0.clone()
 }
 
 /// Quits clip for the installer, which opens it again once it's updated.
-#[tauri::command]
-fn install_update(app: AppHandle, shared: State<Shared>) -> Result<(), String> {
+fn install_update(app: &AppHandle, shared: &Shared) -> Result<(), String> {
     let owner = {
         let held = shared.update.lock().expect("update poisoned");
         held.1.clone().filter(|_| held.0.available)
     };
     update::install(&owner.ok_or("there's no update to install")?)?;
-    app.exit(0);
+    app.exit();
     Ok(())
 }
 
@@ -1515,8 +1560,7 @@ fn windows_build() -> String {
     format!("windows {} build {}.{ubr}", text(w!("DisplayVersion")), text(w!("CurrentBuild")))
 }
 
-#[tauri::command]
-fn apply(app: AppHandle, shared: State<Shared>, mut settings: Settings) -> Result<(), String> {
+fn apply(app: &AppHandle, shared: &Shared, mut settings: Settings) -> Result<(), String> {
     if settings.folder.as_os_str().is_empty() || !settings.folder.is_absolute() {
         return Err("pick a folder for clips".into());
     }
@@ -1563,7 +1607,7 @@ fn apply(app: AppHandle, shared: State<Shared>, mut settings: Settings) -> Resul
     run_at_login(&shared.login, settings.start_with_windows)
         .map_err(|e| format!("can't change start with windows: {e}"))?;
     for dir in std::iter::once(&settings.folder).chain(&settings.sources) {
-        app.asset_protocol_scope().allow_directory(dir, true).map_err(|e| e.to_string())?;
+        app.files().allow(dir)?;
     }
     shared.first.store(false, Ordering::Relaxed);
     let (restart, rebind) = {
@@ -1578,15 +1622,14 @@ fn apply(app: AppHandle, shared: State<Shared>, mut settings: Settings) -> Resul
     if restart {
         post(shared.recorder, WM_RESTART, 0);
     }
-    let _ = app.emit("clips", ());
+    app.emit("clips", ());
     match failed.is_empty() {
         true => Ok(()),
         false => Err(failed.join("; ")),
     }
 }
 
-#[tauri::command]
-fn clips(shared: State<Shared>) -> Vec<Clip> {
+fn clips(shared: &Shared) -> Vec<Clip> {
     let (folder, sources) = {
         let settings = shared.settings.lock().expect("settings poisoned");
         (settings.folder.clone(), settings.sources.clone())
@@ -1609,60 +1652,53 @@ fn marked(shared: &Shared, change: impl FnOnce(&mut Marks, &Path)) -> Result<(),
     marks.store(&shared.marks_file)
 }
 
-#[tauri::command]
-fn star(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>, on: bool) -> Result<(), String> {
-    paths.iter().try_for_each(|path| listed(&shared, path))?;
-    marked(&shared, |marks, folder| paths.iter().for_each(|path| marks.star(folder, path, on)))?;
-    let _ = app.emit("clips", ());
+fn star(app: &AppHandle, shared: &Shared, paths: Vec<PathBuf>, on: bool) -> Result<(), String> {
+    paths.iter().try_for_each(|path| listed(shared, path))?;
+    marked(shared, |marks, folder| paths.iter().for_each(|path| marks.star(folder, path, on)))?;
+    app.emit("clips", ());
     Ok(())
 }
 
-#[tauri::command]
-fn rename(app: AppHandle, shared: State<Shared>, path: PathBuf, name: String) -> Result<PathBuf, String> {
-    clip_in_folder(&shared, &path)?;
+fn rename(app: &AppHandle, shared: &Shared, path: PathBuf, name: String) -> Result<PathBuf, String> {
+    clip_in_folder(shared, &path)?;
     let to = library::renamed(&path, &name)?;
     std::fs::rename(&path, &to).map_err(|e| format!("couldn't rename: {e}"))?;
-    marked(&shared, |marks, folder| marks.moved(folder, &path, &to))?;
-    let _ = app.emit("clips", ());
+    marked(shared, |marks, folder| marks.moved(folder, &path, &to))?;
+    app.emit("clips", ());
     Ok(to)
 }
 
-#[tauri::command]
-fn delete(app: AppHandle, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
-    paths.iter().try_for_each(|path| saved_in_folder(&shared, path))?;
+fn delete(app: &AppHandle, shared: &Shared, paths: Vec<PathBuf>) -> Result<(), String> {
+    paths.iter().try_for_each(|path| saved_in_folder(shared, path))?;
     let recycled = library::recycle(&paths);
     // a cancelled operation can still have moved some of them
     let gone = paths.iter().filter(|path| !path.exists());
-    marked(&shared, |marks, folder| gone.for_each(|path| marks.forget(folder, path)))?;
-    let _ = app.emit("clips", ());
+    marked(shared, |marks, folder| gone.for_each(|path| marks.forget(folder, path)))?;
+    app.emit("clips", ());
     recycled
 }
 
-#[tauri::command]
-fn set_marks(app: AppHandle, shared: State<Shared>, path: PathBuf, mut at: Vec<f64>) -> Result<(), String> {
-    listed(&shared, &path)?;
+fn set_marks(app: &AppHandle, shared: &Shared, path: PathBuf, mut at: Vec<f64>) -> Result<(), String> {
+    listed(shared, &path)?;
     at.retain(|t| t.is_finite() && *t >= 0.0);
     at.sort_by(f64::total_cmp);
     at.dedup_by(|a, b| (*a - *b).abs() < 0.05);
-    marked(&shared, |marks, folder| marks.mark(folder, &path, at))?;
-    let _ = app.emit("clips", ());
+    marked(shared, |marks, folder| marks.mark(folder, &path, at))?;
+    app.emit("clips", ());
     Ok(())
 }
 
 /// Saves the png the webview drew of a paused frame, or the gif it made of a cut, beside its clip.
 /// The body is the image, so a 4k frame isn't sent as a json list of numbers, and the headers say
 /// which clip and from when.
-#[tauri::command]
-fn save_frame(shared: State<Shared>, request: tauri::ipc::Request) -> Result<PathBuf, String> {
-    let header = |name: &str| {
-        let value = request.headers().get(name).and_then(|v| v.to_str().ok());
-        value.and_then(unescape).ok_or_else(|| format!("the frame came without its {name}"))
-    };
+fn save_frame(shared: &Shared, call: &CommandCall) -> Result<PathBuf, String> {
+    let header =
+        |name: &str| call.header(name).and_then(unescape).ok_or_else(|| format!("the frame came without its {name}"));
     let path = PathBuf::from(header("clip")?);
     let at: f64 = header("at")?.parse().map_err(|_| "the frame's time isn't a number")?;
-    listed(&shared, &path)?;
-    let dir = home(&shared, &path)?;
-    let tauri::ipc::InvokeBody::Raw(image) = request.body() else {
+    listed(shared, &path)?;
+    let dir = home(shared, &path)?;
+    let Some(image) = &call.body else {
         return Err("the frame has to come as bytes".into());
     };
     let kind = match image.as_slice() {
@@ -1701,31 +1737,33 @@ fn unescape(text: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-#[tauri::command]
-fn copy_files(window: WebviewWindow, shared: State<Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
-    paths.iter().try_for_each(|path| listed(&shared, path))?;
-    crate::clipboard::copy_files(window.hwnd().map_err(|e| e.to_string())?, &paths)
+fn copy_files(window: &str, shared: &Shared, paths: Vec<PathBuf>) -> Result<(), String> {
+    paths.iter().try_for_each(|path| listed(shared, path))?;
+    crate::clipboard::copy_files(HWND(hwnd(window)? as _), &paths)
+}
+
+/// The native handle of one of clip's windows, which isn't Send while its value is.
+fn hwnd(window: &str) -> Result<isize, String> {
+    match handle().windows().and_then(|windows| windows.state(window)).and_then(|state| state.handle) {
+        Some(NativeHandle::Win32 { hwnd }) => Ok(hwnd),
+        _ => Err("the window has closed".into()),
+    }
 }
 
 /// Hands the files to windows to drag out, from a dragstart in the library while the button is still down.
-#[tauri::command]
-async fn drag_out(window: WebviewWindow, shared: State<'_, Shared>, paths: Vec<PathBuf>) -> Result<(), String> {
-    paths.iter().try_for_each(|path| listed(&shared, path))?;
-    // a window handle isn't Send, its value is
-    let owner = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+fn drag_out(window: &str, shared: &Shared, paths: Vec<PathBuf>) -> Result<(), String> {
+    paths.iter().try_for_each(|path| listed(shared, path))?;
+    let owner = hwnd(window)?;
     let (done, dropped) = mpsc::channel();
     // ole drags run on the thread that owns the window
-    window
-        .run_on_main_thread(move || {
-            let _ = done.send(crate::clipboard::drag_files(HWND(owner as _), &paths));
-        })
-        .map_err(|e| e.to_string())?;
+    handle().windows().ok_or("the window has closed")?.run_on_loop(move || {
+        let _ = done.send(crate::clipboard::drag_files(HWND(owner as _), &paths));
+    });
     dropped.recv().map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-fn save_thumb(shared: State<Shared>, path: PathBuf, jpeg: Vec<u8>) -> Result<PathBuf, String> {
-    listed(&shared, &path)?;
+fn save_thumb(shared: &Shared, path: PathBuf, jpeg: Vec<u8>) -> Result<PathBuf, String> {
+    listed(shared, &path)?;
     if !jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Err("a still has to be a jpeg".into());
     }
@@ -1741,8 +1779,7 @@ fn save_thumb(shared: State<Shared>, path: PathBuf, jpeg: Vec<u8>) -> Result<Pat
 
 /// A game's cover, hero and logo as far as they're on disk. Missing ones are fetched in the background
 /// and arrive in an `art` event.
-#[tauri::command]
-fn game_art(handle: AppHandle, shared: State<Shared>, app: String) -> Result<Art, String> {
+fn game_art(handle: &'static AppHandle, shared: &Shared, app: String) -> Result<Art, String> {
     let mut parts = Path::new(&app).components();
     if !matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None)) {
         return Err(format!("{app} is not an app"));
@@ -1753,7 +1790,7 @@ fn game_art(handle: AppHandle, shared: State<Shared>, app: String) -> Result<Art
     if art::due(&dir, &have, &key) {
         std::thread::spawn(move || {
             if let Some(art) = art::fetch(&dir, &app, &key) {
-                let _ = handle.emit("art", &art);
+                handle.emit("art", &art);
             }
         });
     }
@@ -1768,9 +1805,8 @@ struct Track {
 }
 
 /// Decodes every audio track of a clip to its own wav, since the webview only plays the first.
-#[tauri::command]
-async fn track_audio(shared: State<'_, Shared>, path: PathBuf) -> Result<Vec<Track>, String> {
-    listed(&shared, &path)?;
+fn track_audio(shared: &Shared, path: PathBuf) -> Result<Vec<Track>, String> {
+    listed(shared, &path)?;
     let audio = shared.cache.join("audio");
     blocking(move || {
         let tracks = crate::export::tracks(&path)?;
@@ -1788,7 +1824,6 @@ async fn track_audio(shared: State<'_, Shared>, path: PathBuf) -> Result<Vec<Tra
             })
             .collect()
     })
-    .await
 }
 
 // one export runs at a time, the window waits on it before starting another
@@ -1799,10 +1834,9 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 /// window centred that far across, and with `replace` it takes the clip's place while the clip
 /// waits beside it as `.orig` for an undo. Sends `export-progress` in percent as it goes.
 #[allow(clippy::too_many_arguments)] // each is a field of the request the webview sends
-#[tauri::command]
-async fn export(
-    app: AppHandle,
-    shared: State<'_, Shared>,
+fn export(
+    app: &AppHandle,
+    shared: &Shared,
     path: PathBuf,
     ranges: Vec<(f64, f64)>,
     tracks: Vec<usize>,
@@ -1812,10 +1846,10 @@ async fn export(
     replace: bool,
 ) -> Result<PathBuf, String> {
     match replace {
-        true => clip_in_folder(&shared, &path)?,
-        false => listed(&shared, &path)?,
+        true => clip_in_folder(shared, &path)?,
+        false => listed(shared, &path)?,
     }
-    let dir = home(&shared, &path)?;
+    let dir = home(shared, &path)?;
     if ranges.is_empty() || ranges.iter().any(|&(start, end)| !(start >= 0.0 && end > start)) {
         return Err("each part has to end after it starts".into());
     }
@@ -1852,7 +1886,7 @@ async fn export(
         let report = |done: f64| {
             let percent = (done.clamp(0.0, 1.0) * 100.0) as u32;
             if sent.replace(percent) != percent {
-                let _ = progress.emit("export-progress", percent);
+                progress.emit("export-progress", percent);
             }
         };
         let job = crate::export::Job { fit, portrait, progress: Some(&report), cancel: Some(&CANCEL) };
@@ -1866,9 +1900,8 @@ async fn export(
         }
         Ok((path, out))
     })
-    .await
     .and_then(|(path, out)| {
-        marked(&shared, |marks, folder| {
+        marked(shared, |marks, folder| {
             marks.mark(folder, &out, carried(&marks.marks(folder, &path), &ranges));
             // a replace keeps the clip's place and whether clip wrote it
             if out != path {
@@ -1877,18 +1910,17 @@ async fn export(
         })?;
         Ok(out)
     });
-    let _ = app.emit("clips", ());
+    app.emit("clips", ());
     out
 }
 
 /// Joins `paths` in order into one new clip beside the first, with every clip's marks moved along.
-#[tauri::command]
-async fn join(app: AppHandle, shared: State<'_, Shared>, paths: Vec<PathBuf>) -> Result<PathBuf, String> {
+fn join(app: &AppHandle, shared: &Shared, paths: Vec<PathBuf>) -> Result<PathBuf, String> {
     if paths.len() < 2 {
         return Err("pick two clips or more to join".into());
     }
-    paths.iter().try_for_each(|path| in_folder(&shared, path, &["mp4"], true))?;
-    let dir = home(&shared, &paths[0])?;
+    paths.iter().try_for_each(|path| in_folder(shared, path, &["mp4"], true))?;
+    let dir = home(shared, &paths[0])?;
     CANCEL.store(false, Ordering::Relaxed);
     let progress = app.clone();
     let clips = paths.clone();
@@ -1898,7 +1930,7 @@ async fn join(app: AppHandle, shared: State<'_, Shared>, paths: Vec<PathBuf>) ->
         let report = |done: f64| {
             let percent = (done.clamp(0.0, 1.0) * 100.0) as u32;
             if sent.replace(percent) != percent {
-                let _ = progress.emit("export-progress", percent);
+                progress.emit("export-progress", percent);
             }
         };
         let job = crate::export::Job { progress: Some(&report), cancel: Some(&CANCEL), ..Default::default() };
@@ -1910,9 +1942,8 @@ async fn join(app: AppHandle, shared: State<'_, Shared>, paths: Vec<PathBuf>) ->
             }
         }
     })
-    .await
     .and_then(|(out, starts)| {
-        marked(&shared, |marks, folder| {
+        marked(shared, |marks, folder| {
             let moved = paths
                 .iter()
                 .zip(starts)
@@ -1923,7 +1954,7 @@ async fn join(app: AppHandle, shared: State<'_, Shared>, paths: Vec<PathBuf>) ->
         })?;
         Ok(out)
     });
-    let _ = app.emit("clips", ());
+    app.emit("clips", ());
     joined
 }
 
@@ -1962,29 +1993,26 @@ fn take_place(clip: &Path, trimmed: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
 fn cancel_export() {
     CANCEL.store(true, Ordering::Relaxed);
 }
 
 /// Undoes a replace: the trimmed clip goes to the recycle bin and the original takes its place again.
-#[tauri::command]
-fn restore_original(app: AppHandle, shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    clip_in_folder(&shared, &path)?;
+fn restore_original(app: &AppHandle, shared: &Shared, path: PathBuf) -> Result<(), String> {
+    clip_in_folder(shared, &path)?;
     let original = path.with_extension("mp4.orig");
     if !original.is_file() {
         return Err("the original is gone already".into());
     }
     library::recycle(std::slice::from_ref(&path))?;
     std::fs::rename(&original, &path).map_err(|e| format!("can't put the original back: {e}"))?;
-    let _ = app.emit("clips", ());
+    app.emit("clips", ());
     Ok(())
 }
 
 /// Sends a replaced clip's original to the recycle bin once its undo has run out.
-#[tauri::command]
-fn drop_original(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    clip_in_folder(&shared, &path)?;
+fn drop_original(shared: &Shared, path: PathBuf) -> Result<(), String> {
+    clip_in_folder(shared, &path)?;
     let original = path.with_extension("mp4.orig");
     match original.is_file() {
         true => library::recycle(&[original]),
@@ -1992,28 +2020,21 @@ fn drop_original(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
     }
 }
 
-/// Runs media foundation work off the webview's threads.
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.map_err(|e| e.to_string())?;
-        work()
-    })
-    .await
-    .map_err(|e| e.to_string())?
+/// Runs media foundation work on a command's own thread.
+fn blocking<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.map_err(|e| e.to_string())?;
+    work()
 }
 
-#[tauri::command]
-fn pause(shared: State<Shared>, on: bool) {
+fn pause(shared: &Shared, on: bool) {
     post(shared.recorder, WM_PAUSE, on as usize);
 }
 
-#[tauri::command]
-fn hold_hotkeys(shared: State<Shared>, on: bool) {
+fn hold_hotkeys(shared: &Shared, on: bool) {
     post(shared.recorder, WM_HOLD, on as usize);
 }
 
 /// What the punctuation keys print on this keyboard layout, which differs from the us names.
-#[tauri::command]
 fn key_names() -> BTreeMap<u32, String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
     (0xba..=0xc0)
@@ -2027,15 +2048,13 @@ fn key_names() -> BTreeMap<u32, String> {
         .collect()
 }
 
-#[tauri::command]
 fn preview_sound(percent: u32) {
     play_saved(percent);
 }
 
-#[tauri::command]
-fn test_notification(app: AppHandle) -> Result<(), String> {
+fn test_notification(shared: &Shared) -> Result<(), String> {
     let body = "Saved clips show up like this";
-    toast::show(&app.config().identifier, "Clip saved", body, None, true)
+    toast::show(&shared.identifier, "Clip saved", body, None, true)
 }
 
 #[derive(Serialize)]
@@ -2045,7 +2064,6 @@ struct Disk {
 }
 
 /// Space on the drive a folder is on, which may not exist yet.
-#[tauri::command]
 fn disk(folder: PathBuf) -> Result<Disk, String> {
     let found =
         folder.ancestors().find(|dir| dir.is_dir()).ok_or_else(|| format!("{} is on no drive", folder.display()))?;
@@ -2071,43 +2089,35 @@ fn size(bytes: u64) -> String {
     }
 }
 
-#[tauri::command]
-fn save_clip(shared: State<Shared>) {
+fn save_clip(shared: &Shared) {
     post(shared.recorder, WM_HOTKEY, SAVE);
 }
 
-#[tauri::command]
-fn mark_clip(shared: State<Shared>) {
+fn mark_clip(shared: &Shared) {
     post(shared.recorder, WM_HOTKEY, MARK);
 }
 
-#[tauri::command]
-fn take_shot(shared: State<Shared>) {
+fn take_shot(shared: &Shared) {
     post(shared.recorder, WM_HOTKEY, SHOT);
 }
 
-#[tauri::command]
-fn toggle_mic(shared: State<Shared>) {
+fn toggle_mic(shared: &Shared) {
     post(shared.recorder, WM_HOTKEY, MIC);
 }
 
-#[tauri::command]
-fn toggle_recording(shared: State<Shared>) {
+fn toggle_recording(shared: &Shared) {
     post(shared.recorder, WM_HOTKEY, RECORD);
 }
 
-#[tauri::command]
-fn auto_games(shared: State<Shared>) -> Vec<crate::events::Found> {
+fn auto_games(shared: &Shared) -> Vec<crate::events::Found> {
     crate::events::GAMES.iter().map(|game| game.found(shared.deaf.as_deref())).collect()
 }
 
-#[tauri::command]
-fn cost(shared: State<Shared>) -> crate::cost::Cost {
+fn cost(shared: &Shared) -> crate::cost::Cost {
     shared.meter.lock().expect("meter poisoned").get_or_insert_with(crate::cost::Meter::new).read()
 }
 
-#[tauri::command]
-fn rewind(shared: State<Shared>) {
+fn rewind(shared: &Shared) {
     post(shared.recorder, WM_HOTKEY, REWIND);
 }
 
@@ -2160,10 +2170,8 @@ struct Found {
 }
 
 /// The folders other clipping apps save to by default that this pc has.
-#[tauri::command]
-fn other_folders(app: AppHandle) -> Vec<Found> {
-    let paths = app.path();
-    let (videos, documents) = (paths.video_dir().unwrap_or_default(), paths.document_dir().unwrap_or_default());
+fn other_folders() -> Vec<Found> {
+    let (videos, documents) = (ceri::dirs::videos().unwrap_or_default(), ceri::dirs::documents().unwrap_or_default());
     let medal =
         [PathBuf::from(r"C:\Medal\Clips"), PathBuf::from(r"C:\Medal"), videos.join("Medal"), documents.join("Medal")];
     let real = |dir: &PathBuf| dir.is_absolute() && dir.is_dir();
@@ -2180,8 +2188,7 @@ fn other_folders(app: AppHandle) -> Vec<Found> {
 
 /// Copies the clips and images of one of the other folders into the clips folder, sending
 /// `import-progress` in percent. Returns how many were copied.
-#[tauri::command]
-async fn import_folder(app: AppHandle, shared: State<'_, Shared>, source: PathBuf) -> Result<usize, String> {
+fn import_folder(app: &AppHandle, shared: &Shared, source: PathBuf) -> Result<usize, String> {
     let folder = {
         let settings = shared.settings.lock().expect("settings poisoned");
         if !settings.sources.contains(&source) {
@@ -2192,23 +2199,20 @@ async fn import_folder(app: AppHandle, shared: State<'_, Shared>, source: PathBu
     let progress = app.clone();
     let copied = blocking(move || {
         library::import(&source, &folder, |done, total| {
-            let _ = progress.emit("import-progress", done * 100 / total.max(1));
+            progress.emit("import-progress", done * 100 / total.max(1));
         })
-    })
-    .await;
-    let _ = app.emit("clips", ());
+    });
+    app.emit("clips", ());
     copied
 }
 
-#[tauri::command]
-fn open(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    listed(&shared, &path)?;
+fn open(shared: &Shared, path: PathBuf) -> Result<(), String> {
+    listed(shared, &path)?;
     Command::new("explorer").arg(&path).spawn().map(drop).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn reveal(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
-    listed(&shared, &path)?;
+fn reveal(shared: &Shared, path: PathBuf) -> Result<(), String> {
+    listed(shared, &path)?;
     // explorer reads /select, with the path quoted after the comma, which std's quoting can't produce
     Command::new("explorer")
         .raw_arg(format!("/select,\"{}\"", path.display()))
@@ -2217,14 +2221,12 @@ fn reveal(shared: State<Shared>, path: PathBuf) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn audio_apps() -> Result<Vec<String>, String> {
+fn audio_apps() -> Result<Vec<String>, String> {
     crate::audio::playing().map_err(|e| e.to_string())
 }
 
 /// Each exe's icon, saved from a running copy the first time and kept for when it isn't running.
-#[tauri::command]
-async fn app_icons(shared: State<'_, Shared>, exes: Vec<String>) -> Result<BTreeMap<String, PathBuf>, String> {
+fn app_icons(shared: &Shared, exes: Vec<String>) -> Result<BTreeMap<String, PathBuf>, String> {
     let dir = shared.cache.join("app-icons");
     let kept: Vec<String> = {
         let settings = shared.settings.lock().expect("settings poisoned");
@@ -2250,7 +2252,6 @@ async fn app_icons(shared: State<'_, Shared>, exes: Vec<String>) -> Result<BTree
             |exe: String| Some(dir.join(format!("{exe}.png"))).filter(|icon| icon.is_file()).map(|icon| (exe, icon));
         Ok(exes.into_iter().filter_map(icon).collect())
     })
-    .await
 }
 
 #[derive(Serialize)]
@@ -2259,20 +2260,17 @@ struct Mic {
     name: String,
 }
 
-#[tauri::command]
-async fn mics() -> Result<Vec<Mic>, String> {
+fn mics() -> Result<Vec<Mic>, String> {
     let mics = crate::audio::mics().map_err(|e| e.to_string())?;
     Ok(mics.into_iter().map(|(id, name)| Mic { id, name }).collect())
 }
 
 /// How loud a microphone is right now, 0 to 1, from an empty id's default one.
-#[tauri::command]
-async fn mic_level(device: String) -> Result<f32, String> {
-    blocking(move || crate::audio::mic_peak(&device).map_err(|e| e.to_string())).await
+fn mic_level(device: String) -> Result<f32, String> {
+    blocking(move || crate::audio::mic_peak(&device).map_err(|e| e.to_string()))
 }
 
-#[tauri::command]
-async fn windowed_apps() -> Vec<String> {
+fn windowed_apps() -> Vec<String> {
     focus::windowed()
 }
 

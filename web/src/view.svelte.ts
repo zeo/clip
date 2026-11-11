@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from './host';
 import { MediaQuery, SvelteSet } from 'svelte/reactivity';
 import type { Query } from './types';
 

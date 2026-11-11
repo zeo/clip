@@ -130,10 +130,11 @@ Windows only gives a per-app capture the app's own sound and that of its direct 
 
 ```
 npm ci
-npx tauri build --no-bundle
+npm run build
+cargo build --release
 ```
 
-Needs Rust 1.93 or newer and Node 24. The exe lands in `target\release\clip.exe`. `npx tauri dev` runs it against the Vite dev server. Only Windows 11 build 26340 with an NVIDIA GPU is tested.
+Needs Rust 1.93 or newer, Node 24 and a ceri checkout at `../../hAugust/ceri`. The exe lands in `target\release\clip.exe` with the built page compiled in. Only Windows 11 build 26340 with an NVIDIA GPU is tested.
 
 ## tests
 

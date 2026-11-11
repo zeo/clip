@@ -1,8 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
-  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { appWindow, fileSrc, invoke, listen } from './host';
   import { CANCELLED, LONGEST, gif } from './gif';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
@@ -85,7 +83,7 @@
     return { x, span: width, left, top: (shown.height - picture.height * scale) / 2, width: narrow * width, height: picture.height * scale };
   });
   const fps = $derived(clip.fps || 60);
-  const source = $derived(convertFileSrc(clip.path) + (version ? `?v=${version}` : ''));
+  const source = $derived(fileSrc(clip.path) + (version ? `?v=${version}` : ''));
   const parts = $derived([...others, [start, end] as [number, number]].sort((a, b) => a[0] - b[0]));
   const kept = $derived(parts.reduce((sum, [a, b]) => sum + b - a, 0));
   const gaps = $derived([0, ...parts.flat(), duration].flatMap((t, i, edges) => (i % 2 === 0 && edges[i + 1] > t ? [[t, edges[i + 1]]] : [])));
@@ -123,7 +121,7 @@
       silence();
       context.close();
       // stepping to the next clip keeps the screen filled, anything else gives the window back
-      if (full) setTimeout(() => document.querySelector('.theater.full') || getCurrentWindow().setFullscreen(false));
+      if (full) setTimeout(() => document.querySelector('.theater.full') || appWindow.setFullscreen(false));
     };
   });
 
@@ -132,7 +130,7 @@
       const tracks = await invoke<Track[]>('track_audio', { path: clip.path });
       lanes = await Promise.all(
         tracks.map(async (track) => {
-          const data = await (await fetch(convertFileSrc(track.path))).arrayBuffer();
+          const data = await (await fetch(fileSrc(track.path))).arrayBuffer();
           const buffer = await context.decodeAudioData(data);
           return { name: track.name, buffer, peaks: peaks(buffer), muted: false, solo: false };
         })
@@ -278,7 +276,7 @@
 
   async function fill(on = !full) {
     full = on;
-    await getCurrentWindow()
+    await appWindow
       .setFullscreen(on)
       .catch((e) => say(String(e), true));
   }

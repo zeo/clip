@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+  import { fileSrc, invoke } from './host';
   import Icon from './Icon.svelte';
   import { at, day, size, title, type Clip } from './types';
   import { discard, say } from './view.svelte';
@@ -75,7 +75,7 @@
 <div class="theater">
   <div class="screen">
     <img
-      src={convertFileSrc(clip.path)}
+      src={fileSrc(clip.path)}
       alt={title(clip)}
       draggable="false"
       onload={(e) => {

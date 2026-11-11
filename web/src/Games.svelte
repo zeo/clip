@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { convertFileSrc } from '@tauri-apps/api/core';
+  import { fileSrc } from './host';
   import { art } from './art.svelte';
   import Clips from './Clips.svelte';
   import Cover from './Cover.svelte';
@@ -34,8 +34,8 @@
     {@const sessions = sessionCount(game.clips)}
     {@const list = shown.filter((clip) => clip.app === game.app)}
     <header class="banner">
-      {#if found?.hero}<img src={convertFileSrc(found.hero)} alt="" draggable="false" />{:else}<Thumb clip={newest} badge={false} />{/if}
-      {#if found?.logo}<img class="banner-logo" src={convertFileSrc(found.logo)} alt={game.app} draggable="false" />{/if}
+      {#if found?.hero}<img src={fileSrc(found.hero)} alt="" draggable="false" />{:else}<Thumb clip={newest} badge={false} />{/if}
+      {#if found?.logo}<img class="banner-logo" src={fileSrc(found.logo)} alt={game.app} draggable="false" />{/if}
       <div class="banner-foot">
         {#if !found?.logo}
           <Icon app={game.app} icon={game.icon} size={52} />

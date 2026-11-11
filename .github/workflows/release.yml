@@ -43,9 +43,7 @@ jobs:
         run: |
           $version = $env:GITHUB_REF_NAME -replace '^v', ''
           $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          $tauri = (Get-Content -Raw tauri.conf.json | ConvertFrom-Json).version
           if ($cargo -ne $version) { throw "tag $version does not match Cargo.toml $cargo" }
-          if ($tauri -ne $version) { throw "tag $version does not match tauri.conf.json $tauri" }
           if (-not (Select-String -Path CHANGELOG.md -Pattern "^## \[$([regex]::Escape($version))\]" -Quiet)) { throw "CHANGELOG.md has no $version entry" }
 
       - name: Extract release notes
@@ -70,8 +68,10 @@ jobs:
         run: |
           npm ci
           if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
-          npx tauri build --no-bundle --ci -- --locked
-          if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "web build failed" }
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
       - name: Package for the rot installer
         shell: pwsh
