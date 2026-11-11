@@ -1,4 +1,9 @@
-# clip
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/banner-dark.png">
+    <img src="docs/banner.png" alt="clip" width="360">
+  </picture>
+</p>
 
 clip keeps the last stretch of your game and saves it when you press a key. It records only the game in focus, gives every sound source a track of its own, and trims, marks, joins and shrinks clips for Discord without another app. Nothing is injected into the game: video comes from Windows Graphics Capture and audio from per-process loopback, so anti-cheat has nothing to object to.
 
