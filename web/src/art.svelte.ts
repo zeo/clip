@@ -11,7 +11,11 @@ listen<Art>('art', (e) => (found[e.payload.app] = e.payload));
 export function art(app: string): Art | undefined {
   if (!asked.has(app)) {
     asked.add(app);
-    invoke<Art>('game_art', { app }).then((got) => (found[app] ??= got));
+    // a failed ask is tried again the next time the app is drawn
+    invoke<Art>('game_art', { app }).then(
+      (got) => (found[app] ??= got),
+      () => asked.delete(app)
+    );
   }
   return found[app];
 }

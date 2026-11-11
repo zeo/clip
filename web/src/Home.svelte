@@ -1,6 +1,6 @@
 <script lang="ts">
   import Clips from './Clips.svelte';
-  import { keyFor, length, sentence, sessionCount, size, type Clip, type Status } from './types';
+  import { keyFor, lastWeek, length, markWait, sentence, sessionCount, size, type Clip, type Status } from './types';
 
   let {
     clips,
@@ -19,7 +19,7 @@
     onopen: (clip: Clip, list: Clip[]) => void;
     onkeys: () => void;
   } = $props();
-  const since = Date.now() - 7 * 864e5;
+  const since = lastWeek();
   const recent = $derived(clips.filter((clip) => clip.modified >= since));
   const feed = $derived(shown.filter((clip) => clip.modified >= since));
 </script>
@@ -45,7 +45,7 @@
       <h1>Play something, then press <kbd>{keyFor(status, 'save') ?? 'Save clip'}</kbd></h1>
       <p>
         The last {length(buffer)} of the game in focus land here.
-        {#if keyFor(status, 'mark')}<kbd>{keyFor(status, 'mark')}</kbd> marks a moment and saves it 15 s later, so the moment sits
+        {#if keyFor(status, 'mark')}<kbd>{keyFor(status, 'mark')}</kbd> marks a moment and saves it {markWait(buffer)} later, so the moment sits
           in the middle of the clip.{/if}
       </p>
       <p>Coming from Medal, the NVIDIA App, SteelSeries Moments or AMD? <button class="link" onclick={onkeys}>Use the keys you know</button></p>

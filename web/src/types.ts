@@ -1,3 +1,5 @@
+import { keys } from './view.svelte';
+
 export type Settings = {
   buffer: number;
   fps: number;
@@ -25,7 +27,13 @@ export type Settings = {
   ignore: string[];
   notice: boolean;
   noticeCorner: Corner;
+  auto: string[];
+  autoBefore: number;
+  autoAfter: number;
+  gsiToken: string;
 };
+
+export type AutoGame = { id: string; name: string; plays: string; missing: string | null };
 
 export type Corner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 
@@ -35,7 +43,7 @@ export type Action = 'save' | 'mark' | 'shot' | 'mic' | 'record' | 'rewind';
 
 export const ACTIONS: Record<Action, { name: string; does: string; key: string }> = {
   save: { name: 'Save a clip', does: 'Saves what the buffer holds', key: 'Save' },
-  mark: { name: 'Mark a moment', does: 'Marks now and saves 15 s later', key: 'Mark' },
+  mark: { name: 'Mark a moment', does: 'Marks now and saves a moment later', key: 'Mark' },
   shot: { name: 'Take a screenshot', does: 'Saves the next frame as a png', key: 'Screenshot' },
   mic: { name: 'Mute the mic', does: 'Mutes or unmutes the mic in clips', key: 'Mic' },
   record: { name: 'Start or stop recording', does: 'Records until pressed again', key: 'Record' },
@@ -71,7 +79,26 @@ export type Status = {
   mic_muted: boolean;
   // ms since 1970 a long recording started, 0 when none runs
   taping: number;
+  // no hardware encoder was found, so the cpu records at 720p30
+  on_cpu: boolean;
+  // the encoder, size, rate and colour being recorded
+  summary: string;
 };
+
+// how long after a mark the clip saves, which a short buffer halves so the mark stays in it
+export function markWait(buffer: number): string {
+  return length(Math.min(15, Math.floor(buffer / 2)));
+}
+
+export function does(action: Action, buffer: number): string {
+  return action === 'mark' ? `Marks now and saves ${markWait(buffer)} later` : ACTIONS[action].does;
+}
+
+export const resolution = (height: number) => (height >= 4320 ? 'Native size' : `${height}p`);
+
+export function quality(s: Pick<Settings, 'height' | 'fps' | 'mbps'>): string {
+  return `${resolution(s.height)}, ${s.fps} fps, ${s.mbps} Mbps`;
+}
 
 const named: Record<number, string> = {
   0x08: 'Backspace', 0x09: 'Tab', 0x0d: 'Enter', 0x13: 'Pause', 0x14: 'Caps Lock', 0x1b: 'Esc', 0x20: 'Space',
@@ -85,7 +112,7 @@ export function keyName(vk: number): string {
   if (vk >= 0x70 && vk <= 0x87) return `F${vk - 0x6f}`;
   if ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5a)) return String.fromCharCode(vk);
   if (vk >= 0x60 && vk <= 0x69) return `Num ${vk - 0x60}`;
-  return named[vk] ?? `Key ${vk}`;
+  return keys[vk] ?? named[vk] ?? `Key ${vk}`;
 }
 
 export function chord(hotkey: Pick<Hotkey, 'mods' | 'key'>): string {
@@ -138,15 +165,23 @@ export const IN_MEMORY = 600;
 export function bufferCost(s: Settings): string {
   const tracks = 2 + s.apps.length + (s.mic ? 1 : 0);
   const bytes = (s.buffer * (s.mbps * 1e6 + tracks * 192e3)) / 8;
-  if (s.buffer <= IN_MEMORY) return `About ${Math.round(bytes / 1e6)} MB of memory`;
+  if (s.buffer <= IN_MEMORY) return `About ${size(bytes, 0)} of memory`;
   const drive = /^[a-z]:/i.exec(s.folder)?.[0] ?? 'the clips drive';
-  return `About ${Math.ceil(bytes / 1e9)} GB on ${drive}, in a hidden .buffer folder`;
+  return `About ${size(bytes, 0)} on ${drive}, in a hidden .buffer folder`;
 }
 
-export function size(bytes: number): string {
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
-  return bytes >= 1e5 || bytes === 0 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.ceil(bytes / 1e3)} KB`;
+export const GB = 2 ** 30;
+const MB = 2 ** 20;
+
+// in the powers of 1024 explorer shows, so a size here matches the file's properties
+export function size(bytes: number, digits?: number): string {
+  const n = (value: number, places: number) =>
+    value.toLocaleString(undefined, { minimumFractionDigits: digits ?? places, maximumFractionDigits: digits ?? places });
+  if (bytes >= GB) return `${n(bytes / GB, 2)} GB`;
+  return bytes >= 100 * 1024 || bytes === 0 ? `${n(bytes / MB, 1)} MB` : `${n(Math.ceil(bytes / 1024), 0)} KB`;
 }
+
+export const lastWeek = () => Date.now() - 7 * 864e5;
 
 export function clock(seconds: number, hundredths = false): string {
   const m = Math.floor(seconds / 60);
@@ -170,8 +205,10 @@ export function day(ms: number): string {
 }
 
 // clips keep the time they were saved as their name until renamed
+// a name that's only the time it was saved reads as that time, and an auto clip keeps its play after it
 export function title(clip: Clip): string {
-  return /^\d{4}-\d\d-\d\d \d\d-\d\d-\d\d$/.test(clip.name) ? at(clip.modified) : clip.name;
+  const stamped = /^\d{4}-\d\d-\d\d \d\d-\d\d-\d\d( .+)?$/.exec(clip.name);
+  return stamped ? at(clip.modified) + (stamped[1] ?? '') : clip.name;
 }
 
 // clips arrive newest first, so games come out in order of their latest clip and keep their clips in that order
@@ -206,7 +243,7 @@ const orders: Partial<Record<Query['sort'], (a: Clip, b: Clip) => number>> = {
 };
 
 export function choose(clips: Clip[], query: Query): Clip[] {
-  const since = { all: 0, starred: 0, images: 0, today: new Date().setHours(0, 0, 0, 0), week: Date.now() - 7 * 864e5 }[query.show];
+  const since = { all: 0, starred: 0, images: 0, today: new Date().setHours(0, 0, 0, 0), week: lastWeek() }[query.show];
   const words = query.search.trim().toLowerCase();
   const kept = clips.filter(
     (clip) =>

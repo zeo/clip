@@ -5,7 +5,7 @@
   import { getVersion } from '@tauri-apps/api/app';
   import { open } from '@tauri-apps/plugin-dialog';
   import Bind from './Bind.svelte';
-  import { ACTIONS, PRESETS, chord, length, bufferCost, size, type Corner, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
+  import { ACTIONS, PRESETS, at, chord, does, length, bufferCost, quality, resolution, sentence, size, type Corner, type AutoGame, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
   import { radios, reduced, say, view, zooms } from './view.svelte';
 
   let {
@@ -24,7 +24,8 @@
         { id: 'hotkeys', title: 'Hotkeys', blurb: 'Keys that save clips, mark, record and take screenshots from inside a game', path: 'M2.5 6h15v9h-15zM5.5 9h1M8.5 9h1M11.5 9h1M14.5 9h0M6.5 12h7' },
         { id: 'recorder', title: 'Recorder', blurb: 'What clip records and how much it keeps', path: 'M10 3.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM10 8a2 2 0 1 0 0 4 2 2 0 0 0 0-4z' },
         { id: 'quality', title: 'Quality', blurb: 'Resolution, frame rate and bitrate of the video', path: 'M3 4.5h14v10H3zM7 14.5v2M13 14.5v2M5.5 16.5h9' },
-        { id: 'audio', title: 'Audio', blurb: 'A track for each source, its volume and the microphone', path: 'M3.5 8h3l4-3.5v11l-4-3.5h-3zM13.5 7.5c1.2 1.4 1.2 3.6 0 5M15.5 5.5c2.4 2.6 2.4 6.4 0 9' }
+        { id: 'audio', title: 'Audio', blurb: 'A track for each source, its volume and the microphone', path: 'M3.5 8h3l4-3.5v11l-4-3.5h-3zM13.5 7.5c1.2 1.4 1.2 3.6 0 5M15.5 5.5c2.4 2.6 2.4 6.4 0 9' },
+        { id: 'auto', title: 'Auto clips', blurb: 'Clips that save themselves on big plays, in games that report them', path: 'M11.5 2.5 4.5 11h5l-1 6.5 7-8.5h-5z' }
       ]
     },
     {
@@ -38,7 +39,8 @@
         { id: 'sounds', title: 'Alerts', blurb: 'The sound and the note on screen that say a clip was saved', path: 'M6 13V9a4 4 0 0 1 8 0v4l1.5 1.5h-11zM8.5 16.5h3' },
         { id: 'notifications', title: 'Notifications', blurb: 'A Windows notification for each saved clip', path: 'M3.5 4h13v9h-6l-3.5 3v-3H3.5z' },
         { id: 'startup', title: 'Startup and window', blurb: 'When clip opens and what closing the window does', path: 'M10 3v6M6.2 5.8a6 6 0 1 0 7.6 0' },
-        { id: 'art', title: 'Game art', blurb: 'Covers and banners for the library', path: 'M3 4.5h14v11H3zM3 13l4-4 3 3 2-2 5 5' }
+        { id: 'art', title: 'Game art', blurb: 'Covers and banners for the library', path: 'M3 4.5h14v11H3zM3 13l4-4 3 3 2-2 5 5' },
+        { id: 'about', title: 'About', blurb: 'The version, updates, and what to send with a bug report', path: 'M10 3a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM10 9v4.5M10 6.5v0' }
       ]
     }
   ];
@@ -74,6 +76,11 @@
   let windowed = $state<string[]>([]);
   let mics = $state<Mic[]>([]);
   let disk = $state<Disk | null>(null);
+  // null until the games have been looked for
+  let games = $state<AutoGame[] | null>(null);
+  let gamesError = $state('');
+  let update = $state<{ available: boolean; version: string; notes: string; error: string } | null>(null);
+  let updating = $state(false);
   let level = $state<number | null>(null);
   let sent = $state('');
   let version = $state('');
@@ -102,14 +109,51 @@
   // exe icons by lowercase exe name, saved the first time each one runs
   let icons = $state<Record<string, string>>({});
 
-  onMount(async () => {
-    const s = await invoke<Settings>('settings');
-    saved = JSON.stringify(s);
-    draft = s;
+  onMount(() => {
+    invoke<Settings>('settings').then(
+      (s) => {
+        saved = JSON.stringify(s);
+        draft = s;
+        look();
+      },
+      (e) => (error = `Can't read the settings: ${e}`)
+    );
     getVersion().then((v) => (version = v));
-    invoke<typeof others>('other_folders').then((found) => (others = found));
-    await look();
+    invoke<typeof others>('other_folders').then(
+      (found) => (others = found),
+      (e) => say(`Can't look for other apps' folders: ${e}`, true)
+    );
+    findGames();
+    invoke<typeof update>('update_state').then((u) => (update = u));
+    const heard = listen<typeof update>('update', (e) => (update = e.payload));
+    return () => heard.then((stop) => stop());
   });
+
+  function findGames() {
+    invoke<AutoGame[]>('auto_games').then(
+      (found) => ((games = found), (gamesError = '')),
+      (e) => (gamesError = String(e))
+    );
+  }
+
+  async function install() {
+    updating = true;
+    try {
+      await invoke('install_update');
+    } catch (e) {
+      say(String(e), true);
+      updating = false;
+    }
+  }
+
+  async function copyInfo() {
+    try {
+      await navigator.clipboard.writeText(await invoke<string>('system_info'));
+      say('Copied the system info, paste into a bug report');
+    } catch (e) {
+      say(`Can't copy the system info: ${e}`, true);
+    }
+  }
 
   $effect(() => {
     if (draft?.folder) invoke<Disk>('disk', { folder: draft.folder }).then((d) => (disk = d), () => (disk = null));
@@ -154,7 +198,7 @@
     }
   }
 
-  function pick(list: 'apps' | 'record' | 'ignore', exe: string, on: boolean) {
+  function pick(list: 'apps' | 'record' | 'ignore' | 'auto', exe: string, on: boolean) {
     if (!draft) return;
     draft[list] = on ? [...draft[list], exe] : draft[list].filter((app) => app !== exe);
   }
@@ -239,10 +283,15 @@
       say(restarts ? 'Settings applied, a new buffer started' : 'Settings applied');
       saved = JSON.stringify(draft);
       onapplied();
+      // the apply bar and its focused button go, so focus lands on the page instead of the body
+      await tick();
+      body?.querySelector<HTMLElement>('.page-head h1')?.focus();
     } catch (e) {
       error = String(e);
     } finally {
       busy = false;
+      // a cfg written or taken away changes what each game says
+      findGames();
     }
   }
 
@@ -253,7 +302,7 @@
   {@const p = pages.find((p) => p.id === id)!}
   <header class="page-head" class:small={searching}>
     <svg viewBox="0 0 20 20" aria-hidden="true"><path d={p.path} /></svg>
-    <h1>{p.title}</h1>
+    <h1 tabindex="-1">{p.title}</h1>
     {#if !searching}<p>{p.blurb}</p>{/if}
   </header>
 {/snippet}
@@ -339,7 +388,7 @@
                 <div class="row">
                   <span class="row-label">
                     {ACTIONS[hotkey.action].key} hotkey
-                    <small class:bad={taken(hotkey)}>{taken(hotkey) ? 'Another app holds this key' : ACTIONS[hotkey.action].does}</small>
+                    <small class:bad={taken(hotkey)}>{taken(hotkey) ? 'Another app holds this key' : does(hotkey.action, draft.buffer)}</small>
                   </span>
                   <Bind bind:mods={hotkey.mods} bind:key={hotkey.key} label="Keys for hotkey {i + 1}" />
                   <select class="field" aria-label="Action" bind:value={hotkey.action}>
@@ -407,6 +456,48 @@
         </section>
       {/if}
 
+      {#if drawn('auto')}
+        <section data-page="auto">
+          {@render head('auto')}
+          <section class="group">
+            <p class="form-hint">
+              These games tell clip about their big plays themselves, nothing reads the game. For Counter-Strike 2 and Dota 2, applying writes gamestate_integration_clip.cfg into the game's cfg folder, which the game reads when it starts. Switching one off takes the file away. League of Legends needs no file: while it's being recorded, clip asks the game's own live data on this pc. Valorant, Fortnite and Apex Legends report nothing, so they can't be clipped this way.
+            </p>
+            <div class="rows">
+              {#each games ?? [] as game (game.id)}
+                <label class="row">
+                  <span class="row-label" class:dim={!!game.missing}>{game.name}<small class:bad={!!game.missing}>{game.missing ?? game.plays}</small></span>
+                  <input type="checkbox" checked={draft.auto.includes(game.id)} disabled={!!game.missing && !draft.auto.includes(game.id)} onchange={(e) => pick('auto', game.id, e.currentTarget.checked)} />
+                </label>
+              {:else}
+                <div class="row">
+                  <span class="row-label" class:dim={!gamesError}>{gamesError ? "Can't look for the games" : 'Looking for the games'}{#if gamesError}<small class="bad">{gamesError}</small>{/if}</span>
+                  {#if gamesError}<button class="gel" onclick={findGames}>Look again</button>{/if}
+                </div>
+              {/each}
+            </div>
+          </section>
+          <section class="group">
+            <h2 class="group-head">Each clip</h2>
+            <p class="form-hint">Plays close together make one clip with a mark at each play, named after the last, such as {at(new Date(2026, 10, 8, 21, 4).getTime())} triple kill.</p>
+            <div class="rows">
+              <label class="row">
+                <span class="row-label">Before the play</span>
+                <select class="field" bind:value={draft.autoBefore}>
+                  {#each [5, 10, 15, 20, 30, 45, 60].filter((s) => s < draft!.buffer || s === draft!.autoBefore) as s (s)}<option value={s}>{s} seconds</option>{/each}
+                </select>
+              </label>
+              <label class="row">
+                <span class="row-label">After the last play</span>
+                <select class="field" bind:value={draft.autoAfter}>
+                  {#each [0, 3, 5, 10, 15, 20, 30] as s (s)}<option value={s}>{s} seconds</option>{/each}
+                </select>
+              </label>
+            </div>
+          </section>
+        </section>
+      {/if}
+
       {#if drawn('quality')}
         <section data-page="quality">
           {@render head('quality')}
@@ -430,7 +521,7 @@
               <label class="row">
                 <span class="row-label">Resolution</span>
                 <select class="field" bind:value={draft.height}>
-                  {#each heights as h (h)}<option value={h}>{h >= 4320 ? 'Native' : `${h}p`}</option>{/each}
+                  {#each heights as h (h)}<option value={h}>{resolution(h)}</option>{/each}
                 </select>
               </label>
               <label class="row">
@@ -449,9 +540,7 @@
               </label>
               <div class="row">
                 <span class="row-label">Result<small>{bufferCost(draft)} for {length(draft.buffer)}</small></span>
-                <span class="mono">
-                  {draft.height >= 4320 ? 'native' : `${draft.height}p`}{draft.fps}, {draft.mbps} Mbps, {draft.hdr10 ? 'HEVC HDR10 on HDR' : 'H.264 SDR'}
-                </span>
+                <span>{quality(draft)}, {draft.hdr10 ? 'HEVC HDR10 on HDR' : 'H.264 SDR'}</span>
               </div>
             </div>
           </section>
@@ -490,7 +579,7 @@
               </label>
               <div class="row">
                 <span class="row-label">Test microphone level<small>{mics.length ? 'Speak and watch the bar for up to 10 s' : 'No microphone is plugged in'}</small></span>
-                <span class="meter level"><span style:width="{Math.min(100, (level ?? 0) * 100)}%"></span></span>
+                <span class="meter level" role="meter" aria-label="Microphone level" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(Math.min(100, (level ?? 0) * 100))}><span style:width="{Math.min(100, (level ?? 0) * 100)}%"></span></span>
                 <button class="gel" aria-pressed={level !== null} disabled={!mics.length} onclick={test}>{level !== null ? 'Stop' : 'Test'}</button>
               </div>
               <div class="row">
@@ -601,7 +690,7 @@
                 <span class="row-label">Sound volume</span>
                 <input type="range" min="0" max="150" step="5" aria-label="Sound volume" bind:value={draft.soundVolume} disabled={!draft.sound} style:--pct={draft.soundVolume / 150} style:--steps={3} />
                 <span class="mono readout">{draft.soundVolume}%</span>
-                <button class="gel" onclick={() => invoke('preview_sound', { percent: draft!.soundVolume })}>Play</button>
+                <button class="gel" onclick={() => invoke('preview_sound', { percent: draft!.soundVolume }).catch((e) => say(String(e), true))}>Play</button>
               </div>
             </div>
           </section>
@@ -684,6 +773,39 @@
           </section>
         </section>
       {/if}
+
+      {#if drawn('about')}
+        <section data-page="about">
+          {@render head('about')}
+          <section class="group">
+            <div class="rows">
+              <div class="row">
+                <span class="row-label"
+                  >Updates<small class:bad={!!update?.error}
+                    >{!update
+                      ? 'Not checked yet'
+                      : update.error
+                        ? sentence(update.error)
+                        : update.available
+                          ? `clip ${update.version} is out, this is ${version}. Updating restarts clip, which drops what the buffer holds.`
+                          : `clip ${version} is the newest, checked every 6 hours`}</small
+                  ></span
+                >
+                {#if update?.available}<button class="gel default" disabled={updating} onclick={install}>{updating ? 'Updating' : `Update to ${update.version}`}</button>{/if}
+              </div>
+              {#if update?.available && update.notes}<p class="row notes">{update.notes}</p>{/if}
+              <div class="row">
+                <span class="row-label">Logs<small>clip.log, and crash.dmp after a crash</small></span>
+                <button class="gel" onclick={() => invoke('log_folder').catch((e) => say(String(e), true))}>Open logs folder</button>
+              </div>
+              <div class="row">
+                <span class="row-label">System info<small>The version, Windows build, GPU, its encoders and what's being recorded, for a bug report</small></span>
+                <button class="gel" onclick={copyInfo}>Copy system info</button>
+              </div>
+            </div>
+          </section>
+        </section>
+      {/if}
     </div>
 
     {#if changed || first || error}
@@ -698,5 +820,7 @@
         <button class="gel default" disabled={(!changed && !first) || busy} onclick={apply}>Apply</button>
       </div>
     {/if}
+  {:else if error}
+    <div class="settings-body"><p class="form-error" role="alert">{error}</p></div>
   {/if}
 </main>

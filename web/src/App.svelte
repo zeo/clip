@@ -13,7 +13,8 @@
   import Home from './Home.svelte';
   import Icon from './Icon.svelte';
   import Preferences from './Preferences.svelte';
-  import { ACTIONS, choose, chord, games, length, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
+  import Tour from './Tour.svelte';
+  import { ACTIONS, choose, chord, does, games, GB, length, quality, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
   import { cards, gone, radios, say, toasts, view, zooms } from './view.svelte';
 
   type Area = 'home' | 'library' | 'settings';
@@ -27,7 +28,7 @@
     ['all', 'All clips'],
     ['starred', 'Starred'],
     ['today', 'Today'],
-    ['week', 'This week'],
+    ['week', 'Last 7 days'],
     ['images', 'Screenshots and GIFs']
   ];
 
@@ -39,9 +40,11 @@
   // a whole buffer saved to be cut down, open until it's kept, cut or thrown away
   let rewound = $state<string | null>(null);
   let page = $state('hotkeys');
-  let status = $state<Status>({ recording: false, app: '', exe: '', message: 'starting', paused: false, hotkeys: [], mic_muted: false, taping: 0 });
+  let status = $state<Status>({ recording: false, app: '', exe: '', message: 'starting', paused: false, hotkeys: [], mic_muted: false, taping: 0, on_cpu: false, summary: '' });
   let settings = $state<Settings | null>(null);
   let found = $state<Clip[]>([]);
+  // an empty library only says so once the clips have been read
+  let loaded = $state(false);
   const clips = $derived(found.filter((clip) => !gone.has(clip.path)));
   let disk = $state<Disk | null>(null);
   let mics = $state<Mic[]>([]);
@@ -81,9 +84,9 @@
   );
   // a game switched off stops being in focus for clip, so the panel keeps offering every one switched off
   const switchable = $derived(settings ? [...new Set([status.exe, ...settings.ignore])].filter(Boolean) : []);
-  const cap = $derived(settings?.cap ? settings.cap * 1e9 : null);
+  const cap = $derived(settings?.cap ? settings.cap * GB : null);
   const room = $derived(cap ?? (disk ? used + disk.free : null));
-  const does = (h: Hotkey) => (h.action === 'save' && h.seconds ? `Save ${length(h.seconds)}` : ACTIONS[h.action].key);
+  const short = (h: Hotkey) => (h.action === 'save' && h.seconds ? `Save ${length(h.seconds)}` : ACTIONS[h.action].key);
   let now = $state(Date.now());
   $effect(() => {
     if (!status.taping) return;
@@ -94,7 +97,7 @@
   let cost = $state<{ cpu: number | null; memory: number; encoder: number | null } | null>(null);
   $effect(() => {
     if (!quick) return;
-    const read = () => invoke<typeof cost>('cost').then((c) => (cost = c));
+    const read = () => invoke<typeof cost>('cost').then((c) => (cost = c), () => (cost = null));
     read();
     const timer = setInterval(read, 2000);
     return () => clearInterval(timer);
@@ -126,6 +129,7 @@
       'Clips',
       [
         [['Arrows', 'Home', 'End'], 'Move between clips'],
+        [['Page Up', 'Page Down'], 'Move a screen of clips'],
         [['Enter'], 'Open the clip'],
         [['Space', 'Ctrl+Click'], 'Select a clip'],
         [['Shift+Space', 'Shift+Click'], 'Select every clip up to it'],
@@ -158,10 +162,20 @@
       ]
     ],
     [
+      'Viewing a screenshot',
+      [
+        [['Left', 'Right'], 'Previous or next'],
+        [['S'], 'Star or unstar'],
+        [['Del'], 'Delete, with a few seconds to undo'],
+        [['Ctrl+C'], 'Copy the file to paste anywhere'],
+        [['Esc'], 'Back']
+      ]
+    ],
+    [
       'In games',
       status.hotkeys
         .filter((h) => h.key)
-        .map((h): [string[], string] => [[chord(h)], h.action === 'save' ? `${does(h)} clip` : ACTIONS[h.action].does])
+        .map((h): [string[], string] => [[chord(h)], h.action === 'save' ? `${short(h)} clip` : does(h.action, settings?.buffer ?? 30)])
     ]
   ]);
 
@@ -170,7 +184,14 @@
   });
 
   async function refresh() {
-    [settings, found] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+    try {
+      [settings, found] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+    } catch (e) {
+      say(`Can't read the clips: ${e}`, true);
+      return;
+    } finally {
+      loaded = true;
+    }
     // a clip in the recycle bin stops being listed, so it no longer needs hiding
     for (const path of gone) if (!found.some((clip) => clip.path === path)) gone.delete(path);
     invoke<Disk>('disk', { folder: settings.folder }).then((d) => (disk = d), () => (disk = null));
@@ -178,10 +199,8 @@
 
   onMount(() => {
     invoke<Status>('status').then((s) => (status = s));
-    invoke<boolean>('first_run').then((f) => {
-      first = f;
-      if (f) go('settings');
-    });
+    invoke<boolean>('first_run').then((f) => (first = f));
+    invoke<string[]>('damaged').then((all) => all.forEach((text) => say(text, true)));
     refresh();
     const sized = () => win.isMaximized().then((m) => (maximized = m));
     sized();
@@ -217,18 +236,33 @@
   }
 
   function back() {
-    if (opened) opened = null;
+    if (opened) close();
     else game = null;
   }
 
-  async function change(patch: Partial<Settings>) {
+  // back on the list, the clip that was open keeps the focus
+  async function close() {
+    const was = opened;
+    opened = null;
+    await tick();
+    if (was) document.querySelector<HTMLElement>(`.view [data-path="${CSS.escape(was)}"]`)?.focus();
+  }
+
+  // a switch that failed to apply goes back to what's in effect
+  async function change(patch: Partial<Settings>, undo: () => void) {
     if (!settings) return;
-    await invoke('apply', { settings: { ...settings, ...patch } });
+    try {
+      await invoke('apply', { settings: { ...settings, ...patch } });
+    } catch (e) {
+      say(String(e), true);
+      undo();
+    }
     await refresh();
   }
 
-  function record(exe: string, on: boolean) {
-    if (settings) change({ ignore: on ? settings.ignore.filter((e) => e !== exe) : [...settings.ignore, exe] });
+  function record(exe: string, box: HTMLInputElement) {
+    const on = box.checked;
+    if (settings) change({ ignore: on ? settings.ignore.filter((e) => e !== exe) : [...settings.ignore, exe] }, () => (box.checked = !on));
   }
 
   async function openQuick() {
@@ -314,6 +348,7 @@
           {#if status.recording}Recording <b>{status.app}</b>{:else if status.paused}Paused{:else}{sentence(status.message)}{/if}
         </span>
         {#if status.taping}<span class="tape mono">REC {taped}</span>{/if}
+        {#if status.on_cpu}<span class="cpu mono" title="No hardware video encoder was found, so the CPU records at 720p and 30 fps">CPU</span>{/if}
         {#if status.mic_muted}
           <svg class="muted" viewBox="0 0 20 20" role="img" aria-label="Mic muted">
             <path d="M10 3a2.5 2.5 0 0 0-2.5 2.5v4a2.5 2.5 0 0 0 5 0v-4A2.5 2.5 0 0 0 10 3zM5.5 9.5a4.5 4.5 0 0 0 9 0M10 14v3M4 4l12 12" />
@@ -330,7 +365,7 @@
           {#each switchable as exe (exe)}
             <label class="quick-row">
               <span class="grow">Record {exe === status.exe && status.app ? status.app : exe}<small class="mono">{exe}</small></span>
-              <input type="checkbox" class="switch" checked={!settings.ignore.includes(exe)} onchange={(e) => record(exe, e.currentTarget.checked)} />
+              <input type="checkbox" class="switch" checked={!settings.ignore.includes(exe)} onchange={(e) => record(exe, e.currentTarget)} />
             </label>
           {/each}
           <div class="quick-row">
@@ -348,8 +383,8 @@
             <button class="gel" disabled={!status.recording} onclick={() => invoke('take_shot')}>Take</button>
           </div>
           <button class="quick-row" onclick={() => settle('quality')}>
-            <span class="grow">Quality<small class="mono">
-                {settings.height >= 4320 ? 'native' : `${settings.height}p`}{settings.fps}, {settings.mbps} Mbps, last {length(settings.buffer)}
+            <span class="grow">Quality<small>
+                {status.on_cpu ? 'On the CPU, 720p, 30 fps' : quality(settings)}, last {length(settings.buffer)}
               </small></span>
             <span class="go">›</span>
           </button>
@@ -359,8 +394,10 @@
               class="field"
               value={settings.mic ? settings.micDevice || 'default' : 'off'}
               onchange={(e) => {
-                const v = e.currentTarget.value;
-                change({ mic: v !== 'off', micDevice: v === 'off' ? settings!.micDevice : v === 'default' ? '' : v });
+                const box = e.currentTarget;
+                const v = box.value;
+                const was = settings!.mic ? settings!.micDevice || 'default' : 'off';
+                change({ mic: v !== 'off', micDevice: v === 'off' ? settings!.micDevice : v === 'default' ? '' : v }, () => (box.value = was));
               }}
             >
               <option value="off">Off</option>
@@ -392,13 +429,13 @@
           title={hotkey.taken ? 'Another app holds this key, pick another' : 'Change hotkeys'}
           onclick={() => settle('hotkeys')}
         >
-          <kbd>{chord(hotkey)}</kbd>{does(hotkey)}
+          <kbd>{chord(hotkey)}</kbd>{short(hotkey)}
         </button>
       {/each}
     </div>
     <span class="grow" data-tauri-drag-region></span>
     <div class="bar-actions">
-      <button class="gel" disabled={!status.recording} onclick={() => invoke('mark_clip')} title="Marks now and saves 15 s later">Mark</button>
+      <button class="gel" disabled={!status.recording} onclick={() => invoke('mark_clip')} title={does('mark', settings?.buffer ?? 30)}>Mark</button>
       <button class="gel default" disabled={!status.recording} onclick={() => invoke('save_clip')}>Save clip</button>
     </div>
     <div class="controls">
@@ -461,7 +498,7 @@
       {#if current}
         {#key current.path}
           {#if current.kind === 'image'}
-            <Shot clip={current} prev={step.prev} next={step.next} onopen={open} onclose={() => (opened = null)} />
+            <Shot clip={current} prev={step.prev} next={step.next} onopen={open} onclose={close} />
           {:else}
           <ClipPage
             clip={current}
@@ -469,7 +506,7 @@
             prev={step.prev}
             next={step.next}
             onopen={open}
-            onclose={() => (opened = null)}
+            onclose={close}
             onmoved={async (to) => {
               siblings = siblings.map((path) => (path === opened ? to : path));
               await refresh();
@@ -537,7 +574,9 @@
           </select>
           <input class="field search" type="search" placeholder="Search" aria-label="Search clips and games" bind:value={query.search} />
         </div>
-        {#if area === 'home'}
+        {#if !loaded}
+          <div class="view"></div>
+        {:else if area === 'home'}
           <Home clips={clips.filter((clip) => clip.kind === 'clip')} {shown} {status} grouped={view.sort === 'newest'} buffer={settings?.buffer ?? 30} onopen={open} onkeys={() => settle('hotkeys')} />
         {:else if game || shelf === 'games'}
           <Games {clips} {shown} app={game} grouped={view.sort === 'newest'} onpick={(app) => browse('games', app)} onopen={open} />
@@ -551,7 +590,11 @@
                     ? 'Star a clip and it stays here. The storage limit never deletes it.'
                     : shelf === 'images'
                       ? 'Screenshots from the screenshot key, and frames and GIFs saved from clips, show up here.'
-                      : 'No clips here yet.'}
+                      : shelf === 'today'
+                        ? 'Clips saved since midnight show up here.'
+                        : shelf === 'week'
+                          ? 'Clips saved in the last 7 days show up here. Older ones are under All clips.'
+                          : 'No clips here yet.'}
               </p>
             {:else}
               <Clips clips={shown} grouped={view.sort === 'newest'} onopen={open} />
@@ -562,6 +605,8 @@
     </main>
   {/if}
 </div>
+
+{#if first}<Tour ondone={applied} />{/if}
 
 <div class="toasts" role="status">
   {#each toasts as toast (toast.id)}

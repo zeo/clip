@@ -6,7 +6,14 @@ export const zooms = [90, 100, 110, 125, 150];
 export const cards = [170, 220, 280, 340];
 
 // how the window looks is this window's business, so it lives here and never in the recorder's settings
-const stored = JSON.parse(localStorage.getItem('view') ?? '{}');
+const stored = (() => {
+  // a hand-edited or cut-off entry just starts the look over
+  try {
+    return JSON.parse(localStorage.getItem('view') ?? '{}') ?? {};
+  } catch {
+    return {};
+  }
+})();
 export const view = $state({
   zoom: 100,
   previews: true,
@@ -27,6 +34,10 @@ $effect.root(() => {
 });
 
 export const reduced = new MediaQuery('prefers-reduced-motion: reduce');
+
+// what the punctuation keys print on this keyboard layout, by virtual key
+export const keys = $state<Record<number, string>>({});
+invoke<Record<number, string>>('key_names').then((names) => Object.assign(keys, names));
 
 export type Toast = { id: number; text: string; bad: boolean; undo?: () => void };
 

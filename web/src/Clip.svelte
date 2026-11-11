@@ -59,6 +59,7 @@
   let mix = $state(true);
   let busy = $state('');
   let error = $state('');
+  let audioError = $state('');
   let naming = $state<string | null>(null);
   let rate = $state(1);
   let loop = $state(false);
@@ -137,7 +138,7 @@
         })
       );
     } catch (e) {
-      error = String(e);
+      audioError = String(e);
     } finally {
       loading = false;
     }
@@ -194,7 +195,7 @@
 
   function played() {
     paused = false;
-    context.resume().then(sound);
+    context.resume().then(sound, (e) => say(`Can't play the sound: ${e}`, true));
     frame = requestAnimationFrame(follow);
   }
 
@@ -205,11 +206,14 @@
     if (video) now = video.currentTime;
   }
 
+  // a pause that cuts a play short is no failure
+  const playVideo = () => video?.play().catch((e) => e.name === 'AbortError' || say(`Can't play ${title(clip)}: ${e.message ?? e}`, true));
+
   function ended() {
     stopped();
     if (loop) {
       seek(parts[0][0]);
-      video?.play();
+      playVideo();
     }
   }
 
@@ -253,7 +257,18 @@
     if (!video.paused) return video.pause();
     const [a, b] = ahead(now);
     if (loop && (now < a || now >= b - 1 / fps)) seek(a);
-    video.play();
+    playVideo();
+  }
+
+  // a frame per arrow, a second with shift, and as far as the part can go with home and end
+  function nudge(e: KeyboardEvent, what: 'in' | 'out') {
+    const by = ({ ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 } as Record<string, number>)[e.key];
+    const to = by ? (what === 'in' ? start : end) + by * (e.shiftKey ? 1 : 1 / fps) : e.key === 'Home' ? lo : e.key === 'End' ? hi : null;
+    if (to === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (what === 'in') start = Math.max(lo, Math.min(to, end - 1 / fps));
+    else end = Math.min(hi, Math.max(to, start + 1 / fps));
   }
 
   const step = (frames: number) => (video?.pause(), seek(now + frames / fps));
@@ -415,7 +430,7 @@
 
   function copy() {
     invoke('copy_files', { paths: [clip.path] }).then(
-      () => say(`Copied ${title(clip)}, paste it into a chat or folder`),
+      () => say(`Copied ${title(clip)}, paste into a chat or folder`),
       (e) => say(String(e), true)
     );
   }
@@ -521,9 +536,9 @@
   <span class="grow"></span>
   {#if rewind}
     <button class="gel" disabled={busy !== ''} title="Keep all of it as a clip" onclick={keepAll}>Keep all</button>
-    <button class="gel danger" disabled={busy !== ''} onclick={remove}>Discard</button>
+    <button class="gel danger" disabled={busy !== ''} onclick={remove}>Delete</button>
   {:else}
-  <button class="gel" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred })}>
+  <button class="gel" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred }).catch((e) => say(String(e), true))}>
     {clip.starred ? 'Starred' : 'Star'}
   </button>
   {#if clip.source}
@@ -636,8 +651,32 @@
             }}
           ></button>
         {/each}
-        <div class="handle" style:left={pct(start)} role="presentation" onpointerdown={(e) => drag(e, 'in')}></div>
-        <div class="handle out" style:left={pct(end)} role="presentation" onpointerdown={(e) => drag(e, 'out')}></div>
+        <div
+          class="handle"
+          style:left={pct(start)}
+          role="slider"
+          tabindex="0"
+          aria-label="Where the cut starts"
+          aria-valuemin={lo}
+          aria-valuemax={end}
+          aria-valuenow={start}
+          aria-valuetext={clock(start, true)}
+          onpointerdown={(e) => drag(e, 'in')}
+          onkeydown={(e) => nudge(e, 'in')}
+        ></div>
+        <div
+          class="handle out"
+          style:left={pct(end)}
+          role="slider"
+          tabindex="0"
+          aria-label="Where the cut ends"
+          aria-valuemin={start}
+          aria-valuemax={hi}
+          aria-valuenow={end}
+          aria-valuetext={clock(end, true)}
+          onpointerdown={(e) => drag(e, 'out')}
+          onkeydown={(e) => nudge(e, 'out')}
+        ></div>
         <div class="playhead" style:left={pct(now)}></div>
       </div>
       {#each lanes as lane, i (i)}
@@ -655,7 +694,7 @@
         </div>
       {:else}
         <span></span>
-        <p class="form-hint">{loading ? 'Reading the audio tracks' : 'No audio tracks'}</p>
+        <p class="form-hint" class:form-error={!!audioError}>{loading ? 'Reading the audio tracks' : audioError ? `Can't read the audio tracks: ${audioError}` : 'No audio tracks'}</p>
       {/each}
     </div>
   </div>
@@ -674,8 +713,8 @@
         <div><dt>Tracks</dt><dd>{loading ? '...' : lanes.length}</dd></div>
       </dl>
       <div class="gel-row">
-        <button class="gel" onclick={() => invoke('open', { path: clip.path })}>Open</button>
-        <button class="gel" onclick={() => invoke('reveal', { path: clip.path })}>Show in folder</button>
+        <button class="gel" onclick={() => invoke('open', { path: clip.path }).catch((e) => say(String(e), true))}>Open</button>
+        <button class="gel" onclick={() => invoke('reveal', { path: clip.path }).catch((e) => say(String(e), true))}>Show in folder</button>
         <button class="gel" title="Copy the file to paste into a chat or folder (Ctrl+C)" onclick={copy}>Copy file</button>
       </div>
     </section>
