@@ -318,6 +318,12 @@ fn serve(restarted: bool) -> Result<(), String> {
         .version(env!("CARGO_PKG_VERSION"))
         .icon(include_bytes!("../icons/icon.png"))
         .assets(ceri::embedded_assets!())
+        .content_security_policy(
+            "default-src 'self'; media-src 'self' https://files.ceri.invalid; \
+             img-src 'self' data: https://files.ceri.invalid; \
+             connect-src 'self' https://files.ceri.invalid; \
+             style-src 'self' 'unsafe-inline'; font-src 'self'",
+        )
         .capabilities(ceri::Capabilities::new(vec![ceri::Grant {
             windows: vec!["main".into()],
             origins: vec![ceri::APP_ORIGIN.into()],
