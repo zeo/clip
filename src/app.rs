@@ -312,9 +312,15 @@ fn serve(restarted: bool) -> Result<(), String> {
         MenuItem::Separator,
         MenuItem::new("quit", "quit"),
     ];
+    // the tauri build kept the view settings in webview2's storage, under the same identifier
+    let webview_storage = ceri::dirs::local_data()
+        .ok_or("there's no folder for app data")?
+        .join(&identifier)
+        .join("EBWebView/Default/Local Storage/leveldb");
     let failed = Rc::new(Cell::new(None));
     let app = ceri::App::new()
         .identifier(&identifier)
+        .import_local_storage(webview_storage, "http://tauri.localhost")
         .version(env!("CARGO_PKG_VERSION"))
         .icon(include_bytes!("../icons/icon.png"))
         .assets(ceri::embedded_assets!())
