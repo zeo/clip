@@ -45,6 +45,7 @@
   let found = $state<Clip[]>([]);
   // an empty library only says so once the clips have been read
   let loaded = $state(false);
+  let refreshes = 0;
   const clips = $derived(found.filter((clip) => !gone.has(clip.path)));
   let disk = $state<Disk | null>(null);
   let mics = $state<Mic[]>([]);
@@ -184,10 +185,14 @@
   });
 
   async function refresh() {
+    const ticket = ++refreshes;
     try {
-      [settings, found] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+      const read = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+      // a refresh that started later may have finished first, and its list is the newer one
+      if (ticket !== refreshes) return;
+      [settings, found] = read;
     } catch (e) {
-      say(`Can't read the clips: ${e}`, true);
+      if (ticket === refreshes) say(`Can't read the clips: ${e}`, true);
       return;
     } finally {
       loaded = true;

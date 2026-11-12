@@ -20,6 +20,9 @@ dates are release-tag dates.
 - every encoder clip opens is shut down when it's done with, so the GPU's encoder sessions and worker threads don't pile up across recordings, exports and switches between games
 - a crash on the audio thread no longer stops clip from recording anything until it's restarted
 - the editor streams a clip's tracks instead of decoding them whole, and draws their waveforms from peaks clip works out as it reads them, so opening an hour-long recording no longer takes gigabytes of memory or a long wait
+- a second shift click redraws the range from where the first started, so it can shrink as well as grow, and shift with the arrows starts from the clip in focus
+- a clip whose preview never loads stops holding up the previews after it
+- the library can no longer fall back to an older list when two refreshes cross
 - the release build runs without the signing key, which only reaches a separate signing job that runs for `v*` tags and builds the installer tools from a pinned commit
 
 ## [0.1.1] - 2026-11-11

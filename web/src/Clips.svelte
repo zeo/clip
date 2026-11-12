@@ -18,8 +18,9 @@
   // the one clip in the tab order, the first until another takes focus
   let focused = $state<string | null>(null);
   const selected = new SvelteSet<string>();
-  // where a shift click's range starts
+  // where a shift click's range starts, and what the last range from there added
   let anchor: string | null = null;
+  let ranged: string[] = [];
   const columns: [string, Query['sort'] | null][] = [
     ['Name', 'name'],
     ['Game', 'game'],
@@ -64,13 +65,19 @@
     const from = anchor === null ? -1 : clips.findIndex((c) => c.path === anchor);
     const to = clips.indexOf(clip);
     if (range && from >= 0) {
-      for (const c of clips.slice(Math.min(from, to), Math.max(from, to) + 1)) selected.add(c.path);
-    } else if (selected.has(clip.path)) {
-      selected.delete(clip.path);
-    } else {
-      selected.add(clip.path);
+      // a range redrawn from the same start gives back what the last one took, as explorer does
+      for (const path of ranged) selected.delete(path);
+      ranged = clips
+        .slice(Math.min(from, to), Math.max(from, to) + 1)
+        .map((c) => c.path)
+        .filter((path) => !selected.has(path));
+      for (const path of ranged) selected.add(path);
+      return;
     }
+    if (selected.has(clip.path)) selected.delete(clip.path);
+    else selected.add(clip.path);
     anchor = clip.path;
+    ranged = [];
   }
 
   function copy(files: Clip[]) {
@@ -151,7 +158,10 @@
       const path = to();
       if (!path) return;
       move(path);
-      if (!e.shiftKey) return;
+      if (!e.shiftKey) {
+        [anchor, ranged] = [path, []];
+        return;
+      }
       anchor ??= clip.path;
       pick(clips.find((c) => c.path === path)!, true);
       return;
