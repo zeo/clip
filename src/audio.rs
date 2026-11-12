@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -296,6 +296,8 @@ fn assign(sources: &[Source], processes: &Processes, sessions: &[u32], own: u32)
 pub struct Recording {
     pub rings: Vec<Arc<Mutex<Ring>>>,
     thread: JoinHandle<Result<()>>,
+    /// why the thread ended, when it ended on an error
+    died: Arc<OnceLock<String>>,
 }
 
 impl Recording {
@@ -310,23 +312,40 @@ impl Recording {
             (0..lanes.len()).map(&ring).map(|(ring, keep)| (Arc::new(Mutex::new(ring)), keep)).unzip();
         let sources: Vec<(Source, u32)> = lanes.iter().map(|lane| (lane.source.clone(), lane.gain)).collect();
         let (opened, ready) = mpsc::sync_channel(1);
+        let died = Arc::new(OnceLock::new());
         let thread = {
-            let rings = rings.clone();
-            std::thread::spawn(move || run(&sources, clock, &rings, keeps, &stop, opened))
+            let (rings, died) = (rings.clone(), died.clone());
+            std::thread::spawn(move || {
+                let ran = run(&sources, clock, &rings, keeps, &stop, opened);
+                if let Err(e) = &ran {
+                    let _ = died.set(e.to_string());
+                }
+                ran
+            })
         };
         match ready.recv() {
-            Ok(Ok(())) => Ok(Self { rings, thread }),
+            Ok(Ok(())) => Ok(Self { rings, thread, died }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
             }
-            Err(_) => Err(thread.join().expect("audio thread panicked").err().unwrap_or(E_FAIL.into())),
+            Err(_) => Err(joined(thread).err().unwrap_or(E_FAIL.into())),
         }
     }
 
-    pub fn finish(self) -> Result<()> {
-        self.thread.join().expect("audio thread panicked")
+    /// Why the lanes stopped recording, once their thread has ended on its own.
+    pub fn dead(&self) -> Option<String> {
+        let why = || self.died.get().cloned().unwrap_or_else(|| "the audio thread panicked".into());
+        self.thread.is_finished().then(why)
     }
+
+    pub fn finish(self) -> Result<()> {
+        joined(self.thread)
+    }
+}
+
+fn joined(thread: JoinHandle<Result<()>>) -> Result<()> {
+    thread.join().unwrap_or_else(|_| Err(windows::core::Error::new(E_FAIL, "the audio thread panicked")))
 }
 
 fn run(

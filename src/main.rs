@@ -23,7 +23,7 @@ mod update;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::core::{Interface, Result, BOOL, HSTRING};
@@ -239,6 +239,8 @@ pub struct Session {
     stop: Arc<AtomicBool>,
     shots: capture::Shots,
     video: Option<std::thread::JoinHandle<Result<()>>>,
+    /// why capture ended, when it ended on an error
+    died: Arc<OnceLock<String>>,
     sound: Option<audio::Recording>,
 }
 
@@ -263,11 +265,13 @@ impl Session {
         let stop = Arc::new(AtomicBool::new(false));
         let shots = capture::Shots::default();
         let (opened, ready) = std::sync::mpsc::sync_channel(1);
+        let died = Arc::new(OnceLock::new());
         let video = {
-            let (options, ring, stop, shots) = (options.clone(), ring.clone(), stop.clone(), shots.clone());
+            let (options, ring, stop, shots, died) =
+                (options.clone(), ring.clone(), stop.clone(), shots.clone(), died.clone());
             std::thread::spawn(move || -> Result<()> {
                 unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
-                match prepare(&options, target) {
+                let recorded = match prepare(&options, target) {
                     Ok((source, pipeline, encoder, format, mastering, summary, on_cpu)) => {
                         let clock = Clock::start();
                         let _ = opened.send(Ok((format, mastering, summary, on_cpu, clock)));
@@ -277,7 +281,11 @@ impl Session {
                         let _ = opened.send(Err(message));
                         Ok(())
                     }
+                };
+                if let Err(e) = &recorded {
+                    let _ = died.set(e.to_string());
                 }
+                recorded
             })
         };
         let (format, mastering, summary, on_cpu, clock) = match ready.recv() {
@@ -310,6 +318,7 @@ impl Session {
             stop,
             shots,
             video: Some(video),
+            died,
             sound: Some(sound),
         })
     }
@@ -320,6 +329,18 @@ impl Session {
             Some(_) => self.buffer.min(IN_MEMORY),
             None => self.buffer,
         }
+    }
+
+    /// Why recording stopped on its own, once the capture or the audio thread ended without being asked to.
+    pub fn dead(&self) -> Option<String> {
+        if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let video = self.video.as_ref().is_some_and(std::thread::JoinHandle::is_finished).then(|| {
+            let why = self.died.get().map_or("the capture thread panicked", String::as_str);
+            format!("recording failed: {why}")
+        });
+        video.or_else(|| self.sound.as_ref()?.dead().map(|why| format!("audio failed: {why}")))
     }
 
     /// Why the rings keep less than asked for.

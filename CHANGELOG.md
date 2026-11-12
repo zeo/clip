@@ -13,6 +13,9 @@ dates are release-tag dates.
 - two quick switches in the top bar's menu (recording an app, the microphone) both stick instead of the second undoing the first
 - when the long buffer's drive fails, every track goes back to memory together, the top bar says why, and plays stop waiting for a buffer that's gone; before, a failing audio track kept a longer span than the video and the status kept the old length
 - writing the long buffer to disk no longer holds up a save or a rewind
+- a recording whose capture or audio fails partway (a driver reset, an encoder error) starts again by itself, up to 3 times a minute, and the top bar and clip.log say why; before, the top bar kept saying it was recording while the buffer stood still
+- an encoder that reports an error mid-stream counts as failed instead of being waited on until it stalls
+- a crash on the audio thread no longer stops clip from recording anything until it's restarted
 
 ## [0.1.1] - 2026-11-11
 

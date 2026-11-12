@@ -119,6 +119,12 @@ pub fn encoders(codec: Codec, adapter: Option<LUID>) -> Result<Vec<Choice>> {
     Ok(found)
 }
 
+/// The error an async encoder reported, which ends its stream.
+fn failed(event: &IMFMediaEvent) -> windows::core::Error {
+    let code = unsafe { event.GetStatus() }.unwrap_or(E_FAIL);
+    windows::core::Error::new(if code.is_ok() { E_FAIL } else { code }, "the encoder failed")
+}
+
 fn friendly_name(activate: &IMFActivate) -> String {
     let mut text = windows::core::PWSTR::null();
     let mut len = 0;
@@ -278,6 +284,7 @@ impl Encoder {
                 Ok(event) => match MF_EVENT_TYPE(unsafe { event.GetType()? } as i32) {
                     METransformHaveOutput => out.extend(self.pull()?),
                     METransformDrainComplete => break,
+                    MEError => return Err(failed(&event)),
                     _ => {}
                 },
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => std::thread::sleep(Duration::from_millis(1)),
@@ -298,6 +305,7 @@ impl Encoder {
         match MF_EVENT_TYPE(unsafe { event.GetType()? } as i32) {
             METransformNeedInput => self.credit += 1,
             METransformHaveOutput => out.extend(self.pull()?),
+            MEError => return Err(failed(&event)),
             _ => {}
         }
         Ok(true)

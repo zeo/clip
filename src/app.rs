@@ -1033,6 +1033,8 @@ fn record(
     let mut follow = Follow::default();
     let mut refused = None;
     let mut restart = true;
+    // when sessions that ended on their own were started again, at most three a minute
+    let mut revived: Vec<Instant> = Vec::new();
     loop {
         if restart {
             restart = false;
@@ -1061,6 +1063,16 @@ fn record(
             continue;
         }
         if msg.message == WM_TIMER {
+            if let Some((why, window)) = current.as_ref().ok().and_then(|r| Some((r.session.dead()?, r.window))) {
+                crate::log::write(format_args!("recording ended on its own: {why}"));
+                if revive(&mut revived, Instant::now()) {
+                    restart = true;
+                } else {
+                    current = Err(format!("{why}, recording stopped after starting again 3 times in a minute"));
+                    refused = Some(window);
+                    report(&current);
+                }
+            }
             if current.as_ref().ok().and_then(|recording| recording.session.short()) != *told.borrow() {
                 report(&current);
             }
@@ -1291,6 +1303,16 @@ fn record(
             report(&current);
         }
     }
+}
+
+/// Whether a session that ended on its own starts again, which it does three times a minute at most.
+fn revive(revived: &mut Vec<Instant>, now: Instant) -> bool {
+    revived.retain(|&at| now.duration_since(at) < Duration::from_secs(60));
+    let again = revived.len() < 3;
+    if again {
+        revived.push(now);
+    }
+    again
 }
 
 /// Moves recording to `window`, leaving the app it was on recording for a while in case focus
@@ -2308,6 +2330,16 @@ mod tests {
         assert_eq!(due(first, first + 20 * s, buffer), first + 28 * s);
         assert_eq!(due(first, first + 29 * s, buffer), first + 29 * s);
         assert_eq!(due(first, first, 10 * s), first + 5 * s);
+    }
+
+    #[test]
+    fn a_recording_that_keeps_dying_starts_again_three_times_a_minute() {
+        let (start, s) = (Instant::now(), Duration::from_secs(1));
+        let mut revived = Vec::new();
+        assert!([0, 10, 20].iter().all(|&at| revive(&mut revived, start + at * s)));
+        assert!(!revive(&mut revived, start + 30 * s));
+        assert!(revive(&mut revived, start + 61 * s), "the first one is a minute old");
+        assert!(!revive(&mut revived, start + 62 * s));
     }
 
     #[test]
