@@ -149,6 +149,8 @@ pub struct Encoder {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     format: Format,
+    /// for capture, the knob that forces a keyframe and the pts of the last one
+    keys: Option<(ICodecAPI, Option<i64>)>,
 }
 
 // hardware encoders answer within a frame or two, this only trips on a wedged driver
@@ -179,7 +181,8 @@ impl Encoder {
             let _ = attributes.SetUINT32(&MF_LOW_LATENCY, capture as u32);
 
             // vendors support different subsets, so each knob is best effort
-            if let Ok(codec) = transform.cast::<ICodecAPI>() {
+            let api = transform.cast::<ICodecAPI>().ok();
+            if let Some(codec) = &api {
                 let set = |api: GUID, value: VARIANT| {
                     let _ = codec.SetValue(&api, &value);
                 };
@@ -230,6 +233,7 @@ impl Encoder {
                 device: device.clone(),
                 context: device.GetImmediateContext()?,
                 format,
+                keys: api.filter(|_| capture).map(|api| (api, None)),
             })
         }
     }
@@ -239,6 +243,13 @@ impl Encoder {
         unsafe {
             sample.SetSampleTime(pts)?;
             sample.SetSampleDuration(self.format.frame())?;
+        }
+        // a clip can only start on a keyframe, so one that's two seconds late is asked for
+        if let Some((api, keyed)) = &mut self.keys {
+            if pts - *keyed.get_or_insert(pts) >= 2 * SECOND {
+                let _ = unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)) };
+                *keyed = Some(pts);
+            }
         }
         let mut out = Vec::new();
         if self.events.is_some() {
@@ -262,6 +273,9 @@ impl Encoder {
             while let Some(packet) = self.pull()? {
                 out.push(packet);
             }
+        }
+        if let (Some((_, Some(keyed))), Some(key)) = (&mut self.keys, out.iter().rfind(|p| p.key)) {
+            *keyed = (*keyed).max(key.pts);
         }
         Ok(out)
     }
