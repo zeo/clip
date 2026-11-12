@@ -392,6 +392,7 @@ impl Session {
         let first = first.load().map_err(|e| format!("can't read the buffer back: {e}"))?;
         let writer = save::Writer::open(out, &first, self.format, self.rings.len(), true)
             .map_err(|e| format!("can't start the recording: {e}"))?;
+        writer.keep_names(&self.names);
         Ok(Tape {
             writer,
             ring: self.ring.clone(),
@@ -812,11 +813,14 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     let first = ring.lock().expect("ring poisoned").since(i64::MIN)[0]
         .load()
         .map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
+    let names: Vec<String> = vec!["tone 440".into(), "tone 660".into()];
+    let writer = save::Writer::open(&path, &first, format, rings.len(), true).map_err(at("open tape"))?;
+    writer.keep_names(&names);
     let mut tape = Tape {
-        writer: save::Writer::open(&path, &first, format, rings.len(), true).map_err(at("open tape"))?,
+        writer,
         ring: ring.clone(),
         rings: rings.clone(),
-        names: vec!["tone 440".into(), "tone 660".into()],
+        names: names.clone(),
         mastering: None,
         video: first.pts - 1,
         audio: vec![first.pts - 1; rings.len()],
@@ -839,13 +843,14 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     let late = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         std::fs::copy(&partial, &crashed).map_err(|e| fail(format!("copy the unfinished tape: {e}")))?;
-        match save::defragment(&crashed) {
+        match save::recover(&crashed) {
             Ok(()) => break,
             Err(_) if std::time::Instant::now() < late => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(fail(format!("rebuild the unfinished tape: {e}"))),
         }
     }
     let kept = read_back(&crashed).map_err(at("read back the unfinished tape"))?;
+    let named = save::probe(&crashed).map_err(|e| fail(format!("probe the unfinished tape: {e}")))?.tracks;
     let saved = tape.finish().map_err(fail)?;
     let streams = read_back(&path).map_err(at("read back"))?;
     let end = format.time(frames - 1);
@@ -857,15 +862,16 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
                 && *last == end
                 && heard.iter().map(|s| s.0 as usize).eq(sound.iter().copied())
                 && kept.len() == streams.len()
-                && kept.iter().all(|s| s.0 > 0) =>
+                && kept.iter().all(|s| s.0 > 0)
+                && named == names =>
         {
             let kept: Vec<u32> = kept.iter().map(|s| s.0).collect();
             Ok(format!(
-                "{count} frames and aac packets {sound:?} written in pulls, none twice or missing; cut off before the end it keeps {kept:?}"
+                "{count} frames and aac packets {sound:?} written in pulls, none twice or missing; cut off before the end it keeps {kept:?} named {named:?}"
             ))
         }
         other => Err(fail(format!(
-            "want {frames} frames to {end} and aac packets {sound:?}, got {other:?}, and {kept:?} cut off before the end"
+            "want {frames} frames to {end} and aac packets {sound:?}, got {other:?}, and {kept:?} named {named:?} cut off before the end"
         ))),
     }
 }

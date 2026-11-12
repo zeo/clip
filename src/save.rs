@@ -160,6 +160,14 @@ impl Writer {
         sound.try_for_each(|(lane, p)| unsafe { write_sample(sink, lane, p, self.base) })
     }
 
+    /// Leaves the track names beside a fragmented file, where [`recover`] finds them after a crash.
+    pub fn keep_names(&self, names: &[String]) {
+        if self.fragments {
+            // drives without alternate streams, like exfat ones, recover recordings without names
+            let _ = std::fs::write(names_beside(&self.partial), names.join("\n"));
+        }
+    }
+
     /// Closes the file, names its tracks, and moves it to its final name.
     pub fn finish(mut self, names: &[&str], mastering: Option<Mastering>) -> Result<()> {
         let sink = self.sink.take().expect("open until finished");
@@ -174,6 +182,7 @@ impl Writer {
                 label(&self.partial, names, mastering).map_err(|e| windows::core::Error::new(E_LABEL, e.to_string()))
             })
             .and_then(|()| {
+                let _ = std::fs::remove_file(names_beside(&self.partial));
                 std::fs::rename(&self.partial, &self.path)
                     .map_err(|e| windows::core::Error::new(E_RENAME, e.to_string()))
             });
@@ -270,6 +279,27 @@ fn top(file: &mut std::fs::File, at: u64, len: u64) -> std::io::Result<Option<([
     };
     let kind = [head[4], head[5], head[6], head[7]];
     Ok((size >= 8 && at + size <= len).then_some((kind, size)))
+}
+
+/// Rebuilds a fragmented recording a crash cut off, see [`defragment`], and gives its tracks the
+/// names [`Writer::keep_names`] left beside it.
+pub fn recover(path: &Path) -> std::io::Result<()> {
+    defragment(path)?;
+    let beside = names_beside(path);
+    if let Ok(names) = std::fs::read_to_string(&beside) {
+        let names: Vec<&str> = names.split('\n').collect();
+        // a recording that plays without names beats none
+        let _ = label(path, &names, None);
+        let _ = std::fs::remove_file(&beside);
+    }
+    Ok(())
+}
+
+/// An alternate data stream, which moves and goes away with its file.
+fn names_beside(path: &Path) -> PathBuf {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":clip-names");
+    stream.into()
 }
 
 /// Turns a fragmented mp4 into a plain one where it lies: the fragments' indexes become one moov
@@ -926,6 +956,12 @@ mod tests {
         std::fs::write(&path, &cut).unwrap();
         defragment(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), data, "the next start finishes freeing them");
+
+        std::fs::write(&path, &file).unwrap();
+        std::fs::write(names_beside(&path), "game").unwrap();
+        recover(&path).unwrap();
+        assert_eq!(super::probe(&path).unwrap().tracks, ["game"]);
+        assert!(!names_beside(&path).exists(), "the names go once they're in the moov");
         std::fs::remove_file(&path).unwrap();
     }
 }

@@ -30,7 +30,7 @@ dates are release-tag dates.
 - the update check asks the next rot installer when one can read clip's install but can't look clip up, so a shared installer in Program Files no longer fails every check (`http: empty string` in clip.log) while the per-user one would have answered
 - Settings > About has a Test encoders button that runs the same encode, mix and save checks as `clip self-test` and adds their lines to Copy system info
 - the release build runs without the signing key, which only reaches a separate signing job that runs for `v*` tags and builds the installer tools from a pinned commit
-- a long recording in H.264 survives a crash or power loss: it's written in fragments of about a quarter second, and the next start turns what was written whole into a playable clip (without its track names); HDR10 long recordings are still lost, since Windows' fragmented mp4 writer refuses HEVC
+- a long recording in H.264 survives a crash or power loss: it's written in fragments of about a quarter second, and the next start turns what was written whole into a playable clip with its track names (on NTFS drives, where clip keeps them beside the unfinished file); HDR10 long recordings are still lost, since Windows' fragmented mp4 writer refuses HEVC
 
 ## [0.1.1] - 2026-11-11
 

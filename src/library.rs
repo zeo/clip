@@ -391,7 +391,7 @@ pub fn settle(folder: &Path) -> Vec<PathBuf> {
         let out = part.with_extension("");
         let rebuilt = lower(&part).ends_with(&format!(".mp4{PART}"))
             && !out.exists()
-            && crate::save::defragment(&part).is_ok()
+            && crate::save::recover(&part).is_ok()
             && std::fs::rename(&part, &out).is_ok();
         match rebuilt {
             true => recovered.push(out),
