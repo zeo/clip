@@ -324,6 +324,8 @@ fn serve(restarted: bool) -> Result<(), String> {
         .version(env!("CARGO_PKG_VERSION"))
         .icon(include_bytes!("../icons/icon.png"))
         .assets(ceri::embedded_assets!())
+        // a debug build loads the pages from `npm run dev` so edits show up live
+        .dev_url("http://localhost:1420")
         .content_security_policy(
             "default-src 'self'; media-src 'self' https://files.ceri.invalid; \
              img-src 'self' data: https://files.ceri.invalid; \

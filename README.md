@@ -134,7 +134,7 @@ npm run build
 cargo build --release
 ```
 
-Needs Rust 1.93 or newer, Node 24 and a ceri checkout at `../../hAugust/ceri`. The exe lands in `target\release\clip.exe` with the built page compiled in. Only Windows 11 build 26340 with an NVIDIA GPU is tested.
+Needs Rust 1.93 or newer, Node 24 and a ceri checkout at `../../hAugust/ceri`. The exe lands in `target\release\clip.exe` with the built page compiled in. A debug build loads the page from the Vite dev server instead, so run `npm run dev` next to `cargo run` and page edits apply without a rebuild. Only Windows 11 build 26340 with an NVIDIA GPU is tested.
 
 ## tests
 
