@@ -1,6 +1,6 @@
 import { invoke as call, type InvokeOptions } from '@ceri/app';
 
-export { appVersion, appWindow, dialog, fileSrc, listen } from '@ceri/app';
+export { appVersion, appWindow, fileSrc, listen } from '@ceri/app';
 
 // the views show a failed command's message as it is
 export function invoke<T = unknown>(command: string, args?: unknown, options?: InvokeOptions): Promise<T> {

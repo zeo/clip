@@ -668,7 +668,10 @@ fn commands(app: ceri::App) -> ceri::App {
         .blocking_json_command("test_encoders", ceri::command!(|| test_encoders()))
         .blocking_json_command("update_state", ceri::command!(|| update_state(shared()?)))
         .blocking_json_command("install_update", ceri::command!(|| install_update(handle(), shared()?)))
-        .blocking_json_command("apply", ceri::command!(|settings: Settings, sgdb: Option<String>| apply(handle(), shared()?, settings, sgdb)))
+        .blocking_json_command(
+            "apply",
+            ceri::command!(|settings: Settings, sgdb: Option<String>| apply(handle(), shared()?, settings, sgdb)),
+        )
         .blocking_json_command("clips", ceri::command!(|| clips(shared()?)))
         .blocking_json_command("save_clip", ceri::command!(|| save_clip(shared()?)))
         .blocking_json_command("mark_clip", ceri::command!(|| mark_clip(shared()?)))
