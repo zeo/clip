@@ -89,12 +89,14 @@ pub struct Writer {
 impl Writer {
     /// Opens a file for video starting on the keyframe `first`, with `lanes` audio tracks.
     pub fn open(path: &Path, first: &Packet, format: Format, lanes: usize) -> Result<Self> {
-        let partial = path.with_extension("mp4.part");
+        let mut partial = path.as_os_str().to_owned();
+        partial.push(crate::library::PART);
+        let partial = PathBuf::from(partial);
         unsafe {
             let mut attributes = None;
             MFCreateAttributes(&mut attributes, 2)?;
             let attributes = attributes.expect("created");
-            // the container comes from this attribute, so the .part extension is fine
+            // the container comes from this attribute, so the part extension is fine
             attributes.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)?;
             attributes.SetUINT32(&MF_READWRITE_DISABLE_CONVERTERS, 1)?;
             let sink = MFCreateSinkWriterFromURL(&HSTRING::from(partial.as_os_str()), None, &attributes)?;

@@ -2,6 +2,11 @@
 
 dates are release-tag dates.
 
+## [Unreleased]
+
+### fixes
+- clip's unfinished writes end in `.clip-part`, and a start clears only those, so another app's `.part` download in the clips folder is left alone
+
 ## [0.1.1] - 2026-11-11
 
 The first public release.
