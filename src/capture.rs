@@ -21,7 +21,7 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 
 use crate::encode::{Codec, Encoder, Format};
 use crate::hdr::{self, Display, Filter, Pq, Scaler, Tonemap};
-use crate::ring::{Clock, Ring, SECOND};
+use crate::ring::{Clock, Keep, Ring, SECOND};
 
 #[derive(Clone)]
 pub struct Gpu {
@@ -483,7 +483,7 @@ fn still(frame: &ID3D11Texture2D, content: (u32, u32), white: f32) -> Result<Sti
 
 /// Captures `target` into `ring` at a constant frame rate until `stop` is set, handing a copy of
 /// the next frame to whoever waits in `shots`.
-#[allow(clippy::too_many_arguments)] // the capture thread owns the first four, the rest are shared with the session
+#[allow(clippy::too_many_arguments)] // the capture thread owns the first four and `keep`, the rest are shared with the session
 /// Each frame shows from the slot nearest the moment the compositor drew it, and when the source
 /// sends nothing new the last frame repeats, so every clip is constant frame rate.
 pub fn record(
@@ -493,6 +493,7 @@ pub fn record(
     format: Format,
     clock: Clock,
     ring: &Arc<Mutex<Ring>>,
+    mut keep: Keep,
     stop: &AtomicBool,
     shots: &Shots,
 ) -> Result<()> {
@@ -557,17 +558,13 @@ pub fn record(
             let _ = frame.Close();
         }
         if let Some(texture) = &last {
-            let packets = encoder.encode(texture, format.time(tick as i64))?;
-            let mut ring = ring.lock().expect("ring poisoned");
-            packets.into_iter().for_each(|p| ring.push(p));
+            keep.fill(ring, encoder.encode(texture, format.time(tick as i64))?);
         }
         // after a stall, repeat the last frame through the missed ticks, but never fall more than a second behind
         let reached = (started.elapsed().as_nanos() / period.as_nanos()) as u64;
         tick = (tick + 1).max(reached.saturating_sub(format.fps as u64));
     }
-    let packets = encoder.finish()?;
-    let mut ring = ring.lock().expect("ring poisoned");
-    packets.into_iter().for_each(|p| ring.push(p));
+    keep.fill(ring, encoder.finish()?);
     Ok(())
 }
 

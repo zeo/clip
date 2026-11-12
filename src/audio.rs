@@ -22,7 +22,7 @@ use windows::Win32::System::Variant::VT_BLOB;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 use crate::encode::packet;
-use crate::ring::{Clock, Packet, Ring, SECOND};
+use crate::ring::{Clock, Keep, Packet, Ring, SECOND};
 
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
@@ -300,13 +300,19 @@ pub struct Recording {
 
 impl Recording {
     /// Returns once every lane is recording into the `n`th of `ring`, or with the reason one couldn't start.
-    pub fn start(lanes: &[Lane], ring: impl Fn(usize) -> Ring, clock: Clock, stop: Arc<AtomicBool>) -> Result<Self> {
-        let rings: Vec<_> = (0..lanes.len()).map(|n| Arc::new(Mutex::new(ring(n)))).collect();
+    pub fn start(
+        lanes: &[Lane],
+        ring: impl Fn(usize) -> (Ring, Keep),
+        clock: Clock,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let (rings, keeps): (Vec<_>, Vec<_>) =
+            (0..lanes.len()).map(&ring).map(|(ring, keep)| (Arc::new(Mutex::new(ring)), keep)).unzip();
         let sources: Vec<(Source, u32)> = lanes.iter().map(|lane| (lane.source.clone(), lane.gain)).collect();
         let (opened, ready) = mpsc::sync_channel(1);
         let thread = {
             let rings = rings.clone();
-            std::thread::spawn(move || run(&sources, clock, &rings, &stop, opened))
+            std::thread::spawn(move || run(&sources, clock, &rings, keeps, &stop, opened))
         };
         match ready.recv() {
             Ok(Ok(())) => Ok(Self { rings, thread }),
@@ -327,6 +333,7 @@ fn run(
     sources: &[(Source, u32)],
     clock: Clock,
     rings: &[Arc<Mutex<Ring>>],
+    mut keeps: Vec<Keep>,
     stop: &AtomicBool,
     opened: mpsc::SyncSender<Result<()>>,
 ) -> Result<()> {
@@ -349,19 +356,16 @@ fn run(
             }
             scanned = Instant::now();
         }
-        for (channel, ring) in channels.iter_mut().zip(rings) {
+        for ((channel, ring), keep) in channels.iter_mut().zip(rings).zip(&mut keeps) {
             let (packets, lost) = channel.poll(&clock)?;
             if lost {
                 changed.store(true, Ordering::Relaxed);
             }
-            let mut ring = ring.lock().expect("ring poisoned");
-            packets.into_iter().for_each(|p| ring.push(p));
+            keep.fill(ring, packets);
         }
     }
-    for (channel, ring) in channels.iter_mut().zip(rings) {
-        let packets = channel.aac.finish()?;
-        let mut ring = ring.lock().expect("ring poisoned");
-        packets.into_iter().for_each(|p| ring.push(p));
+    for ((channel, ring), keep) in channels.iter_mut().zip(rings).zip(&mut keeps) {
+        keep.fill(ring, channel.aac.finish()?);
     }
     Ok(())
 }

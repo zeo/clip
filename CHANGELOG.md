@@ -11,6 +11,8 @@ dates are release-tag dates.
 - after a replace or its undo, the editor reads the new file's tracks instead of playing the old ones
 - a second replace inside the undo's 8 seconds no longer lets the first one's timer recycle the newer original
 - two quick switches in the top bar's menu (recording an app, the microphone) both stick instead of the second undoing the first
+- when the long buffer's drive fails, every track goes back to memory together, the top bar says why, and plays stop waiting for a buffer that's gone; before, a failing audio track kept a longer span than the video and the status kept the old length
+- writing the long buffer to disk no longer holds up a save or a rewind
 
 ## [0.1.1] - 2026-11-11
 

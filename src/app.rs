@@ -732,13 +732,13 @@ struct Pending {
 impl Pending {
     fn mark(&mut self, at: i64, now: Instant) {
         self.marks.push(at);
-        self.due = due(self.first, now, Duration::from_secs(self.recording.session.buffer as u64));
+        self.due = due(self.first, now, Duration::from_secs(self.recording.session.buffer() as u64));
     }
 
     /// How much the clip keeps: all of a buffer in memory, or of one on disk from a minute before
     /// the first mark, which spares writing out hours for one moment.
     fn seconds(&self) -> Option<u32> {
-        (self.recording.session.buffer > IN_MEMORY).then(|| self.first.elapsed().as_secs() as u32 + 60)
+        (self.recording.session.buffer() > IN_MEMORY).then(|| self.first.elapsed().as_secs() as u32 + 60)
     }
 }
 
@@ -826,7 +826,10 @@ fn record(
         let settings = settings.lock().expect("settings poisoned");
         focus::focused(&settings.record, &settings.ignore)
     };
+    // the reason the buffer is short that the status last showed, which a failing drive changes
+    let told = RefCell::new(None);
     let report = |recording: &Result<Rc<Recording>, String>| {
+        *told.borrow_mut() = recording.as_ref().ok().and_then(|recording| recording.session.short());
         let hotkeys = bound.borrow().clone();
         let taken = if hotkeys.iter().any(|bound| bound.taken) { ", a hotkey is taken by another app" } else { "" };
         let (mic_muted, taping) = (crate::audio::MIC_MUTED.load(Ordering::Relaxed), taping_since.get());
@@ -845,11 +848,10 @@ fn record(
                 exe: recording.exe.clone(),
                 message: format!(
                     "keeping the last {}{}{taken}",
-                    length(recording.session.buffer),
+                    length(recording.session.buffer()),
                     recording
                         .session
-                        .short
-                        .as_ref()
+                        .short()
                         .map_or(String::new(), |why| format!(", a longer buffer won't fit: {why}"))
                 ),
                 paused: false,
@@ -1059,6 +1061,9 @@ fn record(
             continue;
         }
         if msg.message == WM_TIMER {
+            if current.as_ref().ok().and_then(|recording| recording.session.short()) != *told.borrow() {
+                report(&current);
+            }
             if let Some(mut running) = taping.take() {
                 let gone = running.recording.upgrade().is_none();
                 let left = (running.checked.elapsed() > Duration::from_secs(5)).then(|| {
@@ -1213,7 +1218,7 @@ fn record(
                     Ok(recording) => {
                         let marked = pending.as_ref().filter(|p| Rc::ptr_eq(&p.recording, recording));
                         // a buffer on disk rewinds its last part, the whole one can still be saved
-                        let seconds = (recording.session.buffer > IN_MEMORY).then_some(IN_MEMORY);
+                        let seconds = (recording.session.buffer() > IN_MEMORY).then_some(IN_MEMORY);
                         match keep(recording, marked.map_or(&[], |p| &p.marks), seconds, REWOUND) {
                             Ok((_, out)) => {
                                 show(app);

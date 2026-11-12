@@ -41,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWi
 use capture::Target;
 use encode::{Codec, Format};
 use hdr::Display;
-use ring::{Clock, Ring, Spool, IN_MEMORY, SECOND};
+use ring::{Clock, Keep, Ring, Spool, IN_MEMORY, SECOND};
 
 const USAGE: &str = "\
 clip capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
@@ -228,8 +228,9 @@ pub struct Session {
     /// the encoder is the software one
     pub on_cpu: bool,
     /// seconds the rings keep, and why that's less than asked for
-    pub buffer: u32,
-    pub short: Option<String>,
+    buffer: u32,
+    short: Option<String>,
+    spool: Option<Spool>,
     format: Format,
     mastering: Option<hdr::Mastering>,
     names: Vec<String>,
@@ -254,10 +255,11 @@ impl Session {
         let spool = spool.and_then(std::result::Result::ok);
         let span = buffer as i64 * SECOND;
         let make = |name: &str| match &spool {
-            Some(spool) => Ring::spooled(span, spool.clone(), name),
-            None => Ring::new(span),
+            Some(spool) => (Ring::new(span), Keep::spooled(spool.clone(), name)),
+            None => (Ring::new(span), Keep::memory()),
         };
-        let ring = Arc::new(Mutex::new(make("video")));
+        let (ring, keep) = make("video");
+        let ring = Arc::new(Mutex::new(ring));
         let stop = Arc::new(AtomicBool::new(false));
         let shots = capture::Shots::default();
         let (opened, ready) = std::sync::mpsc::sync_channel(1);
@@ -269,7 +271,7 @@ impl Session {
                     Ok((source, pipeline, encoder, format, mastering, summary, on_cpu)) => {
                         let clock = Clock::start();
                         let _ = opened.send(Ok((format, mastering, summary, on_cpu, clock)));
-                        capture::record(source, pipeline, encoder, format, clock, &ring, &stop, &shots)
+                        capture::record(source, pipeline, encoder, format, clock, &ring, keep, &stop, &shots)
                     }
                     Err(message) => {
                         let _ = opened.send(Err(message));
@@ -299,6 +301,7 @@ impl Session {
             on_cpu,
             buffer,
             short,
+            spool,
             format,
             mastering,
             names: lanes.iter().map(|lane| lane.name.clone()).collect(),
@@ -309,6 +312,20 @@ impl Session {
             video: Some(video),
             sound: Some(sound),
         })
+    }
+
+    /// Seconds the rings keep, which drops to what memory holds once the long buffer's drive fails.
+    pub fn buffer(&self) -> u32 {
+        match self.spool.as_ref().and_then(Spool::failed) {
+            Some(_) => self.buffer.min(IN_MEMORY),
+            None => self.buffer,
+        }
+    }
+
+    /// Why the rings keep less than asked for.
+    pub fn short(&self) -> Option<String> {
+        let failed = self.spool.as_ref().and_then(Spool::failed);
+        self.short.clone().or_else(|| failed.map(|why| format!("its drive failed ({why})")))
     }
 
     /// Writes what the rings hold right now to `out`, or only about the last `seconds` of it, from
@@ -587,7 +604,7 @@ fn self_test() -> Result<()> {
                 // the long buffer's files, so the clip comes back from disk
                 let spool =
                     Spool::open(&dir.join(".buffer"), 0).map_err(|e| windows::core::Error::new(E_SELF_TEST, e))?;
-                let mut ring = Ring::spooled(10 * SECOND, spool, &format!("{case}-{kind}"));
+                let (mut ring, mut keep) = (Ring::new(10 * SECOND), Keep::spooled(spool, &format!("{case}-{kind}")));
                 // halfway through, the display switches hdr on or off
                 let switched = if hdr { SDR_DISPLAY } else { TEST_DISPLAY };
                 for i in 0..frames {
@@ -601,9 +618,9 @@ fn self_test() -> Result<()> {
                         .encode(&frame, format.time(i))
                         .map_err(at("encode"))?
                         .into_iter()
-                        .for_each(|p| ring.push(p));
+                        .for_each(|p| ring.push(keep.hold(p)));
                 }
-                encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
+                encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(keep.hold(p)));
                 let mastering = matches!(codec, Codec::Hdr10).then_some(TEST_PANEL);
                 let lanes: Vec<Vec<ring::Held>> =
                     lanes.iter().map(|lane| lane.iter().cloned().map(ring::Held::from).collect()).collect();
