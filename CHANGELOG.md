@@ -19,6 +19,7 @@ dates are release-tag dates.
 - each crash leaves its own `crash-<time>.dmp` (the last 3 are kept) with the memory the stacks point into, the open handles and thread details, and releases ship `clip.pdb`, so a dump can be read back to source lines
 - every encoder clip opens is shut down when it's done with, so the GPU's encoder sessions and worker threads don't pile up across recordings, exports and switches between games
 - a crash on the audio thread no longer stops clip from recording anything until it's restarted
+- the release build runs without the signing key, which only reaches a separate signing job that runs for `v*` tags and builds the installer tools from a pinned commit
 
 ## [0.1.1] - 2026-11-11
 
