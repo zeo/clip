@@ -147,9 +147,25 @@
     }
   }
 
+  let tested = $state<string[] | null>(null);
+  let testing = $state(false);
+  const failed = $derived(tested?.filter((line) => line.startsWith('FAIL')).length ?? 0);
+
+  async function testEncoders() {
+    testing = true;
+    try {
+      tested = await invoke<string[]>('test_encoders');
+    } catch (e) {
+      say(`Can't test the encoders: ${e}`, true);
+    } finally {
+      testing = false;
+    }
+  }
+
   async function copyInfo() {
     try {
-      await navigator.clipboard.writeText(await invoke<string>('system_info'));
+      const info = await invoke<string>('system_info');
+      await navigator.clipboard.writeText(tested ? `${info}\n\nencoder test\n${tested.join('\n')}` : info);
       say('Copied the system info, paste into a bug report');
     } catch (e) {
       say(`Can't copy the system info: ${e}`, true);
@@ -821,6 +837,19 @@
                 <span class="row-label">System info<small>The version, Windows build, GPU, its encoders and what's being recorded, for a bug report</small></span>
                 <button class="gel" onclick={copyInfo}>Copy system info</button>
               </div>
+              <div class="row">
+                <span class="row-label"
+                  >Encoders<small class:bad={failed > 0}
+                    >{!tested
+                      ? 'Saves, cuts and reads back 2 seconds from each encoder this PC has, while recording carries on'
+                      : failed
+                        ? `${failed} ${failed === 1 ? 'check' : 'checks'} failed, and the system info now carries the results`
+                        : 'Every check passed, and the system info now carries the results'}</small
+                  ></span
+                >
+                <button class="gel" disabled={testing} onclick={testEncoders}>{testing ? 'Testing' : 'Test encoders'}</button>
+              </div>
+              {#if tested}<p class="row notes mono">{tested.join('\n')}</p>{/if}
             </div>
           </section>
         </section>

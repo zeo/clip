@@ -305,6 +305,7 @@ fn serve(restarted: bool) -> Result<(), String> {
             damaged,
             log_folder,
             system_info,
+            test_encoders,
             update_state,
             install_update,
             apply,
@@ -1504,6 +1505,19 @@ async fn system_info(shared: State<'_, Shared>) -> Result<String, String> {
         false => format!("recording {summary}"),
     });
     Ok(lines.join("\n"))
+}
+
+/// The self test's lines: a short synthetic clip through each encoder this machine has, saved, cut and read back.
+#[tauri::command]
+async fn test_encoders() -> Result<Vec<String>, String> {
+    blocking(|| {
+        let mut lines = Vec::new();
+        if let Err(e) = crate::self_test(|line| lines.push(line)) {
+            lines.push(e.message());
+        }
+        Ok(lines)
+    })
+    .await
 }
 
 #[tauri::command]

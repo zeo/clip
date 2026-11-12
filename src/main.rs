@@ -71,10 +71,12 @@ fn main() {
             Some("sync") => sync::run(&args[1..]),
             Some("encoders") => list_encoders().map_err(|e| e.to_string()),
             Some("uninstall") => app::uninstall(),
-            Some("self-test") => self_test().map_err(|e| e.to_string()).and_then(|()| match args.get(1) {
-                Some(live) if live == "--live" => sync::run(&args[2..]),
-                _ => Ok(()),
-            }),
+            Some("self-test") => {
+                self_test(|line| println!("{line}")).map_err(|e| e.to_string()).and_then(|()| match args.get(1) {
+                    Some(live) if live == "--live" => sync::run(&args[2..]),
+                    _ => Ok(()),
+                })
+            }
             _ => Err(USAGE.into()),
         });
     if let Err(message) = result {
@@ -573,8 +575,13 @@ pub fn machine() -> Result<Vec<String>> {
 
 /// Runs synthetic frames through every stage after capture, on each encoder this machine has,
 /// with two synthetic audio lanes, and reads the saved file back. Covers sdr, hdr tonemapped to sdr, and hdr10,
-/// each switching hdr on or off halfway.
-fn self_test() -> Result<()> {
+/// each switching hdr on or off halfway. Each result goes to `say` as a line.
+fn self_test(mut say: impl FnMut(String)) -> Result<()> {
+    macro_rules! say {
+        ($($line:tt)*) => {
+            say(format!($($line)*))
+        };
+    }
     let gpu = capture::gpu()?;
     let dir = std::env::temp_dir().join(format!("clip-self-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
@@ -583,24 +590,24 @@ fn self_test() -> Result<()> {
         windows::core::Interface::cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>(&gpu.device)?
             .GetGPUThreadPriority()?
     } {
-        capture::GPU_PRIORITY => println!("ok   gpu priority: {}", capture::GPU_PRIORITY),
+        capture::GPU_PRIORITY => say!("ok   gpu priority: {}", capture::GPU_PRIORITY),
         other => {
             failures += 1;
-            println!("FAIL gpu priority: {other}, asked for {}", capture::GPU_PRIORITY)
+            say!("FAIL gpu priority: {other}, asked for {}", capture::GPU_PRIORITY)
         }
     }
     match check_transfer(&gpu) {
-        Ok(report) => println!("ok   transfer: {report}"),
+        Ok(report) => say!("ok   transfer: {report}"),
         Err(e) => {
             failures += 1;
-            println!("FAIL transfer: {}", e.message())
+            say!("FAIL transfer: {}", e.message())
         }
     }
     match check_scale(&gpu) {
-        Ok(report) => println!("ok   scale: {report}"),
+        Ok(report) => say!("ok   scale: {report}"),
         Err(e) => {
             failures += 1;
-            println!("FAIL scale: {}", e.message())
+            say!("FAIL scale: {}", e.message())
         }
     }
     let lanes = [tone(440.0).map_err(at("audio lane"))?, tone(660.0).map_err(at("audio lane"))?];
@@ -611,7 +618,7 @@ fn self_test() -> Result<()> {
         let frames = 2 * format.fps as i64;
         let choices = encode::encoders(codec, Some(gpu.adapter))?;
         if choices.is_empty() {
-            println!("skip {case}: no {codec:?} encoder");
+            say!("skip {case}: no {codec:?} encoder");
         }
         for choice in choices {
             let kind = if choice.hardware { "hardware" } else { "software" };
@@ -664,11 +671,11 @@ fn self_test() -> Result<()> {
                         && on_time(onset) =>
                 {
                     let packets: Vec<u32> = sound.iter().map(|s| s.0).collect();
-                    println!("ok   {case} {kind} {}: {count} frames, aac packets {packets:?}", choice.name)
+                    say!("ok   {case} {kind} {}: {count} frames, aac packets {packets:?}", choice.name)
                 }
                 Ok((streams, onset)) => {
                     failures += 1;
-                    println!(
+                    say!(
                         "FAIL {case} {kind} {}: want {frames} frames, {} audio tracks and the tone at 1 s, got {streams:?}, tone at {onset:?}",
                         choice.name,
                         lanes.len()
@@ -676,7 +683,7 @@ fn self_test() -> Result<()> {
                 }
                 Err(e) => {
                     failures += 1;
-                    println!("FAIL {case} {kind} {}: {e}", choice.name)
+                    say!("FAIL {case} {kind} {}: {e}", choice.name)
                 }
             }
         }
@@ -729,28 +736,28 @@ fn self_test() -> Result<()> {
                     && *size <= budget
                     && rest.iter().all(|other| (other - level).abs() < 2.0 / 256.0) =>
             {
-                println!(
+                say!(
                     "ok   trim {case}: 30 frames from 0.5 s, mixed and kept audio, {size} bytes at 960x540, levels kept"
                 )
             }
             other => {
                 failures += 1;
-                println!("FAIL trim {case}: {other:?}")
+                say!("FAIL trim {case}: {other:?}")
             }
         }
     }
     match check_tape(&gpu, &lanes, &dir) {
-        Ok(report) => println!("ok   tape: {report}"),
+        Ok(report) => say!("ok   tape: {report}"),
         Err(e) => {
             failures += 1;
-            println!("FAIL tape: {}", e.message())
+            say!("FAIL tape: {}", e.message())
         }
     }
     match check_png(&dir) {
-        Ok(report) => println!("ok   png: {report}"),
+        Ok(report) => say!("ok   png: {report}"),
         Err(e) => {
             failures += 1;
-            println!("FAIL png: {}", e.message())
+            say!("FAIL png: {}", e.message())
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
