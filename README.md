@@ -25,7 +25,7 @@ The first start walks through the two hotkeys, the microphone and where clips go
 
 Clips stay on your pc. clip goes online only for game art, from Steam's store CDN or, once you paste a key, SteamGridDB, and through the rot installer to check for updates. Auto clips only talk to the game on this pc, over 127.0.0.1. No telemetry, no account.
 
-Errors that happen out of sight go to `clip.log` in clip's cache folder, kept to about 1 MB, with a `crash.dmp` beside it after a crash. Settings > About opens that folder, and Copy system info puts the version, the Windows build, the GPU and its encoders on the clipboard for a bug report. Nothing is sent anywhere.
+Errors that happen out of sight go to `clip.log` in clip's cache folder, kept to about 1 MB, with a `crash-<time>.dmp` beside it after a crash (the last 3 are kept). Settings > About opens that folder, and Copy system info puts the version, the Windows build, the GPU and its encoders on the clipboard for a bug report. Nothing is sent anywhere.
 
 ## using it
 

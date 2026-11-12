@@ -795,7 +795,7 @@
               </div>
               {#if update?.available && update.notes}<p class="row notes">{update.notes}</p>{/if}
               <div class="row">
-                <span class="row-label">Logs<small>clip.log, and crash.dmp after a crash</small></span>
+                <span class="row-label">Logs<small>clip.log, and a crash dump after a crash</small></span>
                 <button class="gel" onclick={() => invoke('log_folder').catch((e) => say(String(e), true))}>Open logs folder</button>
               </div>
               <div class="row">

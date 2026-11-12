@@ -77,4 +77,6 @@ tauri-build = { version = "2.7", features = [] }
 [profile.release]
 codegen-units = 1
 lto = "thin"
-strip = "symbols"
+# the symbols go to clip.pdb beside the exe, attached to each release for reading crash dumps
+debug = "line-tables-only"
+strip = "none"

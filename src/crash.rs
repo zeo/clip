@@ -10,6 +10,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
 };
 use windows::Win32::System::Diagnostics::Debug::{
+    MiniDumpWithHandleData, MiniDumpWithIndirectlyReferencedMemory, MiniDumpWithProcessThreadData,
     MiniDumpWithThreadInfo, MiniDumpWithUnloadedModules, MiniDumpWriteDump, SetUnhandledExceptionFilter,
     EXCEPTION_EXECUTE_HANDLER, EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION,
 };
@@ -27,9 +28,24 @@ static DUMP: OnceLock<HSTRING> = OnceLock::new();
 static RELAUNCH: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
-/// Writes a crash to `dump` and starts clip again in its place.
-pub fn guard(dump: &Path) {
-    let _ = DUMP.set(HSTRING::from(dump));
+/// The crash dumps kept in the cache, this run's included.
+const KEPT: usize = 3;
+
+/// Writes a crash to a dump in `dir` named after when this run started, and starts clip again in its place.
+pub fn guard(dir: &Path) {
+    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let _ = DUMP.set(HSTRING::from(&*dir.join(format!("crash-{started}.dmp"))));
+    let mut dumps: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".dmp"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    dumps.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (_, old) in dumps.iter().skip(KEPT - 1) {
+        let _ = std::fs::remove_file(old);
+    }
     if let Ok(exe) = std::env::current_exe() {
         let line = format!("\"{}\" {RESTARTED} {}", exe.display(), std::process::id());
         *RELAUNCH.lock().expect("relaunch poisoned") = line.encode_utf16().chain([0]).collect();
@@ -60,7 +76,12 @@ unsafe extern "system" fn caught(info: *const EXCEPTION_POINTERS) -> i32 {
                 ClientPointers: false.into(),
             };
             unsafe {
-                let kind = MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules;
+                // the stacks, what they point into and the open handles; full memory would run to gigabytes
+                let kind = MiniDumpWithThreadInfo
+                    | MiniDumpWithUnloadedModules
+                    | MiniDumpWithIndirectlyReferencedMemory
+                    | MiniDumpWithHandleData
+                    | MiniDumpWithProcessThreadData;
                 let _ = MiniDumpWriteDump(
                     GetCurrentProcess(),
                     GetCurrentProcessId(),

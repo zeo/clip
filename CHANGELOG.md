@@ -16,6 +16,8 @@ dates are release-tag dates.
 - a recording whose capture or audio fails partway (a driver reset, an encoder error) starts again by itself, up to 3 times a minute, and the top bar and clip.log say why; before, the top bar kept saying it was recording while the buffer stood still
 - when the encoder lets more than 2 seconds pass without a keyframe, clip asks it for one, so a save never has to reach further back than that
 - an encoder that reports an error mid-stream counts as failed instead of being waited on until it stalls
+- each crash leaves its own `crash-<time>.dmp` (the last 3 are kept) with the memory the stacks point into, the open handles and thread details, and releases ship `clip.pdb`, so a dump can be read back to source lines
+- every encoder clip opens is shut down when it's done with, so the GPU's encoder sessions and worker threads don't pile up across recordings, exports and switches between games
 - a crash on the audio thread no longer stops clip from recording anything until it's restarted
 
 ## [0.1.1] - 2026-11-11

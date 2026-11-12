@@ -139,6 +139,7 @@ fn friendly_name(activate: &IMFActivate) -> String {
 }
 
 pub struct Encoder {
+    activate: IMFActivate,
     transform: IMFTransform,
     events: Option<IMFMediaEventGenerator>,
     credit: u32,
@@ -159,8 +160,19 @@ const STALL: Duration = Duration::from_secs(2);
 #[allow(non_upper_case_globals)] // the event names are the sdk's own constants
 impl Encoder {
     pub fn open(choice: &Choice, device: &ID3D11Device, format: Format, purpose: Purpose) -> Result<Self> {
+        let transform: IMFTransform = unsafe { choice.activate.ActivateObject()? };
+        Self::start(choice, transform.clone(), device, format, purpose)
+            .inspect_err(|_| close(&transform, &choice.activate))
+    }
+
+    fn start(
+        choice: &Choice,
+        transform: IMFTransform,
+        device: &ID3D11Device,
+        format: Format,
+        purpose: Purpose,
+    ) -> Result<Self> {
         unsafe {
-            let transform: IMFTransform = choice.activate.ActivateObject()?;
             let attributes = transform.GetAttributes()?;
             let events = if choice.hardware {
                 attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
@@ -223,6 +235,7 @@ impl Encoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
 
             Ok(Self {
+                activate: choice.activate.clone(),
                 transform,
                 events,
                 credit: 0,
@@ -412,6 +425,24 @@ impl Encoder {
             buffer.SetCurrentLength(size as u32)?;
             Ok(buffer)
         }
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        close(&self.transform, &self.activate);
+    }
+}
+
+/// Lets go of an encoder's worker threads, event queue and gpu session, which a hardware one keeps
+/// until it's shut down, whatever references are left.
+fn close(transform: &IMFTransform, activate: &IMFActivate) {
+    unsafe {
+        let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        if let Ok(shutdown) = transform.cast::<IMFShutdown>() {
+            let _ = shutdown.Shutdown();
+        }
+        let _ = activate.ShutdownObject();
     }
 }
 

@@ -351,7 +351,7 @@ fn serve(restarted: bool) -> Result<(), String> {
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::create_dir_all(&cache);
             crate::log::open(&cache.join("clip.log"));
-            crate::crash::guard(&cache.join("crash.dmp"));
+            crate::crash::guard(&cache);
             // not the whole cache, which holds crash dumps and the log
             for part in ["thumbs", "art", "icons", "app-icons", "audio"] {
                 app.asset_protocol_scope().allow_directory(cache.join(part), true)?;
