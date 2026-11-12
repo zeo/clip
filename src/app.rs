@@ -2306,6 +2306,48 @@ mod tests {
     }
 
     #[test]
+    fn older_settings_keep_the_defaults_for_what_they_miss_and_drop_what_clip_no_longer_knows() {
+        let old = r#"{"buffer": 120, "noticeCorner": "middle", "gone": 1,
+            "hotkeys": [{"action": "save", "mods": 1, "key": 120}, {"action": "teleport", "key": 1}]}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        let default = Settings::default();
+        assert_eq!(settings.buffer, 120);
+        assert_eq!(settings.fps, default.fps);
+        assert!(settings.notice_corner == notice::Corner::TopRight);
+        assert!(settings.hotkeys == [Hotkey { action: Action::Save, mods: 1, key: 120, seconds: 0 }]);
+        assert!(serde_json::from_str::<Settings>("{}").unwrap() == default);
+    }
+
+    #[test]
+    fn a_replace_keeps_the_original_beside_it_with_the_clip_s_date() {
+        let dir = std::env::temp_dir().join(format!("clip-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (clip, trimmed) = (dir.join("a.mp4"), dir.join("a trimmed.mp4"));
+        std::fs::write(&clip, "whole").unwrap();
+        let date = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(&clip).unwrap().set_modified(date).unwrap();
+        std::fs::write(&trimmed, "cut").unwrap();
+        take_place(&clip, &trimmed).unwrap();
+        assert_eq!(std::fs::read_to_string(&clip).unwrap(), "cut");
+        assert_eq!(std::fs::read_to_string(clip.with_extension("mp4.orig")).unwrap(), "whole");
+        assert_eq!(std::fs::metadata(&clip).unwrap().modified().unwrap(), date);
+        assert!(!trimmed.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_replace_that_can_t_land_puts_the_clip_back() {
+        let dir = std::env::temp_dir().join(format!("clip-replace-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("a.mp4");
+        std::fs::write(&clip, "whole").unwrap();
+        assert!(take_place(&clip, &dir.join("missing.mp4")).is_err());
+        assert_eq!(std::fs::read_to_string(&clip).unwrap(), "whole");
+        assert!(!clip.with_extension("mp4.orig").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_saved_sound_scales_and_clips() {
         let wav = |samples: &[i16]| {
             let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();

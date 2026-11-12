@@ -612,6 +612,22 @@ mod tests {
     }
 
     #[test]
+    fn kept_sound_follows_the_spans_and_pads_past_the_end_with_silence() {
+        let second = RATE as usize * BLOCK;
+        let pcm: Vec<u8> = (0..2 * second).map(|i| (i / second + 1) as u8).collect();
+        let kept = heard(&pcm, &[(SECOND, SECOND / 2), (SECOND + SECOND / 2, SECOND)]);
+        assert_eq!(kept.len(), second * 3 / 2);
+        assert!(kept[..second].iter().all(|&b| b == 2));
+        assert!(kept[second..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_mix_adds_the_tracks_and_clamps() {
+        let pcm = |samples: &[i16]| samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        assert_eq!(sum(&[pcm(&[100, 30000, -30000]), pcm(&[-50, 30000])]), pcm(&[50, i16::MAX, -30000]));
+    }
+
+    #[test]
     fn the_portrait_window_is_even_and_stays_on_the_picture() {
         assert_eq!(window((1920, 1080), 0.5), (656, 608));
         assert_eq!(window((1920, 1080), 0.0), (0, 608));
