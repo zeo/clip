@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry};
+use tauri_plugin_dialog::DialogExt;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, WPARAM};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
@@ -267,6 +268,8 @@ struct Shared {
     damaged: Mutex<Vec<String>>,
     /// the last update check and the installer to update with
     update: Arc<Mutex<(Update, Option<update::Owner>)>>,
+    /// folders clip itself showed or found, the only new ones apply takes, since each opens to the window
+    offered: Mutex<Vec<PathBuf>>,
 }
 
 /// Runs clip from the tray, keeping the last stretch of the focused app ready to save.
@@ -341,6 +344,7 @@ fn serve(restarted: bool) -> Result<(), String> {
             test_notification,
             disk,
             other_folders,
+            pick_folder,
             import_folder
         ])
         .setup(move |app| {
@@ -520,6 +524,7 @@ fn serve(restarted: bool) -> Result<(), String> {
                 deaf,
                 damaged: Mutex::new(damaged),
                 update,
+                offered: Mutex::default(),
             });
             app.on_menu_event(|app, event| {
                 let shared = app.state::<Shared>();
@@ -1447,9 +1452,21 @@ fn run_at_login(name: &str, on: bool) -> windows::core::Result<()> {
     result.ok()
 }
 
+/// The settings as the window sees them, without the keys clip keeps to itself.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Shown {
+    #[serde(flatten)]
+    settings: Settings,
+    has_sgdb_key: bool,
+}
+
 #[tauri::command]
-fn settings(shared: State<Shared>) -> Settings {
-    shared.settings.lock().expect("settings poisoned").clone()
+fn settings(shared: State<Shared>) -> Shown {
+    let mut settings = shared.settings.lock().expect("settings poisoned").clone();
+    let has_sgdb_key = !std::mem::take(&mut settings.steamgriddb).is_empty();
+    settings.gsi_token.clear();
+    Shown { settings, has_sgdb_key }
 }
 
 #[tauri::command]
@@ -1542,8 +1559,21 @@ fn windows_build() -> String {
     format!("windows {} build {}.{ubr}", text(w!("DisplayVersion")), text(w!("CurrentBuild")))
 }
 
+/// `sgdb` replaces the steamgriddb key, or clears it when empty; without it the key stays.
 #[tauri::command]
-fn apply(app: AppHandle, shared: State<Shared>, mut settings: Settings) -> Result<(), String> {
+fn apply(app: AppHandle, shared: State<Shared>, mut settings: Settings, sgdb: Option<String>) -> Result<(), String> {
+    let (was, token, key) = {
+        let current = shared.settings.lock().expect("settings poisoned");
+        let offered = shared.offered.lock().expect("offered poisoned");
+        let known = |dir: &PathBuf| *dir == current.folder || current.sources.contains(dir) || offered.contains(dir);
+        if let Some(stranger) = std::iter::once(&settings.folder).chain(&settings.sources).find(|dir| !known(dir)) {
+            return Err(format!("{} wasn't picked in clip", stranger.display()));
+        }
+        (current.auto.clone(), current.gsi_token.clone(), current.steamgriddb.clone())
+    };
+    // the token is clip's own and the key stays out of the window, so neither comes back from it
+    settings.gsi_token = token;
+    settings.steamgriddb = sgdb.map_or(key, |k| k.trim().to_string());
     if settings.folder.as_os_str().is_empty() || !settings.folder.is_absolute() {
         return Err("pick a folder for clips".into());
     }
@@ -1559,12 +1589,6 @@ fn apply(app: AppHandle, shared: State<Shared>, mut settings: Settings) -> Resul
     if !(5..=60).contains(&settings.auto_before) || settings.auto_after > 30 {
         return Err("auto clips keep 5 to 60 seconds before a play and up to 30 after".into());
     }
-    let (was, token) = {
-        let current = shared.settings.lock().expect("settings poisoned");
-        (current.auto.clone(), current.gsi_token.clone())
-    };
-    // the token is clip's own, the window only carries it back
-    settings.gsi_token = token;
     let save = |settings: &Settings| {
         let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
         library::write_json(&shared.file, &json).map_err(|e| format!("can't save settings: {e}"))
@@ -2158,15 +2182,27 @@ fn listed(shared: &Shared, path: &Path) -> Result<(), String> {
 }
 
 fn in_folder(shared: &Shared, path: &Path, kinds: &[&str], sources: bool) -> Result<(), String> {
-    let settings = shared.settings.lock().expect("settings poisoned");
-    let parent = path.parent();
-    let under =
-        |root: &PathBuf| parent == Some(root.as_path()) || parent.and_then(Path::parent) == Some(root.as_path());
+    let (folder, others) = {
+        let settings = shared.settings.lock().expect("settings poisoned");
+        (settings.folder.clone(), settings.sources.clone())
+    };
+    within(&folder, &others, path, kinds, sources)
+}
+
+fn within(folder: &Path, others: &[PathBuf], path: &Path, kinds: &[&str], sources: bool) -> Result<(), String> {
+    // the real paths, so a link or a differently cased root can't stand in for one inside
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let file = real(path);
+    let parent = file.parent();
+    let under = |root: &Path| {
+        let root = real(root);
+        parent == Some(&*root) || parent.and_then(Path::parent) == Some(&*root)
+    };
     let shown = !path.components().any(|part| part == Component::ParentDir)
-        && path.extension().is_some_and(|e| kinds.iter().any(|kind| e.eq_ignore_ascii_case(kind)))
-        && path.is_file();
-    let theirs = settings.sources.iter().any(under);
-    if shown && (under(&settings.folder) || sources && theirs) {
+        && file.extension().is_some_and(|e| kinds.iter().any(|kind| e.eq_ignore_ascii_case(kind)))
+        && file.is_file();
+    let theirs = others.iter().any(|root| under(root));
+    if shown && (under(folder) || sources && theirs) {
         Ok(())
     } else if shown && theirs {
         Err(format!("{} is in another app's folder, clip only reads it", path.display()))
@@ -2191,7 +2227,7 @@ struct Found {
 
 /// The folders other clipping apps save to by default that this pc has.
 #[tauri::command]
-fn other_folders(app: AppHandle) -> Vec<Found> {
+fn other_folders(app: AppHandle, shared: State<Shared>) -> Vec<Found> {
     let paths = app.path();
     let (videos, documents) = (paths.video_dir().unwrap_or_default(), paths.document_dir().unwrap_or_default());
     let medal =
@@ -2205,7 +2241,25 @@ fn other_folders(app: AppHandle) -> Vec<Found> {
     ]
     .into_iter()
     .filter_map(|(name, path)| Some(Found { name, path: path.filter(real)? }))
+    .inspect(|found| shared.offered.lock().expect("offered poisoned").push(found.path.clone()))
     .collect()
+}
+
+/// A folder picked in windows' own dialog, which apply then takes.
+#[tauri::command]
+async fn pick_folder(
+    window: tauri::Window,
+    shared: State<'_, Shared>,
+    from: Option<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    let mut dialog = window.dialog().file().set_parent(&window);
+    if let Some(from) = from {
+        dialog = dialog.set_directory(from);
+    }
+    let Some(picked) = dialog.blocking_pick_folder() else { return Ok(None) };
+    let picked = picked.into_path().map_err(|e| e.to_string())?;
+    shared.offered.lock().expect("offered poisoned").push(picked.clone());
+    Ok(Some(picked))
 }
 
 /// Copies the clips and images of one of the other folders into the clips folder, sending
@@ -2309,6 +2363,30 @@ async fn windowed_apps() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clip_counts_by_where_it_really_is() {
+        let base = std::env::temp_dir().join(format!("clip-within-{}", std::process::id()));
+        let (folder, outside) = (base.join("clips"), base.join("outside"));
+        std::fs::create_dir_all(folder.join("game")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for file in [folder.join("game").join("a.mp4"), folder.join("a.exe"), outside.join("b.mp4")] {
+            std::fs::write(file, "").unwrap();
+        }
+        let made =
+            Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(folder.join("link")).arg(&outside).output();
+        assert!(made.unwrap().status.success());
+        let cased = PathBuf::from(folder.to_string_lossy().to_uppercase());
+        let mp4 = ["mp4"];
+        assert!(within(&cased, &[], &folder.join("game").join("a.mp4"), &mp4, false).is_ok());
+        assert!(within(&folder, &[], &folder.join("a.exe"), &mp4, false).is_err());
+        assert!(within(&folder, &[], &folder.join("link").join("b.mp4"), &mp4, false).is_err());
+        assert!(within(&folder, &[], &folder.join("game").join("..").join("game").join("a.mp4"), &mp4, false).is_err());
+        assert!(within(&folder, std::slice::from_ref(&outside), &outside.join("b.mp4"), &mp4, false).is_err());
+        assert!(within(&folder, std::slice::from_ref(&outside), &outside.join("b.mp4"), &mp4, true).is_ok());
+        std::fs::remove_dir(folder.join("link")).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn unescape_reads_what_encode_uri_component_writes() {

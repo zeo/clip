@@ -3,7 +3,6 @@
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getVersion } from '@tauri-apps/api/app';
-  import { open } from '@tauri-apps/plugin-dialog';
   import Bind from './Bind.svelte';
   import { ACTIONS, PRESETS, at, chord, does, length, bufferCost, quality, resolution, sentence, size, type Corner, type AutoGame, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
   import { radios, reduced, say, view, zooms } from './view.svelte';
@@ -89,7 +88,9 @@
   let body = $state<HTMLElement>();
   const choices = (open: string[], on: string[] = []) => [...new Set([...open, ...on])].sort();
   const before = $derived<Settings | null>(saved ? JSON.parse(saved) : null);
-  const changed = $derived(draft !== null && JSON.stringify(draft) !== saved);
+  // a new steamgriddb key, '' to clear the saved one, null to leave it
+  let key = $state<string | null>(null);
+  const changed = $derived(draft !== null && (JSON.stringify(draft) !== saved || key !== null));
   const restarts = $derived(!!draft && !!before && restarting.some((k) => JSON.stringify(draft![k]) !== JSON.stringify(before[k])));
   const searching = $derived(search.trim() !== '');
   const shownPages = $derived(searching ? pages.filter((p) => found[p.id]) : pages.filter((p) => p.id === page));
@@ -239,8 +240,8 @@
 
   async function addSource() {
     if (!draft) return;
-    const picked = await open({ directory: true });
-    if (typeof picked !== 'string') return;
+    const picked = await invoke<string | null>('pick_folder');
+    if (!picked) return;
     if (inside(picked)) say(`${known(picked)} is in the clips folder, so it's listed already`, true);
     else if (draft.sources.includes(picked)) say(`${known(picked)} is listed already`, true);
     else draft.sources.push(picked);
@@ -263,12 +264,13 @@
 
   async function pickFolder() {
     if (!draft) return;
-    const picked = await open({ directory: true, defaultPath: draft.folder });
-    if (typeof picked === 'string') draft.folder = picked;
+    const picked = await invoke<string | null>('pick_folder', { from: draft.folder });
+    if (picked) draft.folder = picked;
   }
 
   function revert() {
     draft = JSON.parse(saved);
+    key = null;
     error = '';
   }
 
@@ -279,8 +281,11 @@
     busy = true;
     error = '';
     try {
-      await invoke('apply', { settings: draft });
+      const sgdb = key?.trim() ?? null;
+      await invoke('apply', { settings: draft, sgdb });
       say(restarts ? 'Settings applied, a new buffer started' : 'Settings applied');
+      if (sgdb !== null) draft.hasSgdbKey = sgdb !== '';
+      key = null;
       saved = JSON.stringify(draft);
       onapplied();
       // the apply bar and its focused button go, so focus lands on the page instead of the body
@@ -767,8 +772,22 @@
             <div class="rows">
               <label class="row">
                 <span class="row-label">SteamGridDB key</span>
-                <input class="field" type="password" spellcheck="false" autocomplete="off" placeholder="None" bind:value={draft.steamgriddb} />
+                <input
+                  class="field"
+                  type="password"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder={key === '' || !draft.hasSgdbKey ? 'None' : 'Saved, type a new one to replace it'}
+                  value={key ?? ''}
+                  oninput={(e) => (key = e.currentTarget.value || null)}
+                />
               </label>
+              {#if draft.hasSgdbKey && key !== ''}
+                <div class="row">
+                  <span class="row-label">Saved key</span>
+                  <button class="gel" onclick={() => (key = '')}>Clear</button>
+                </div>
+              {/if}
             </div>
           </section>
         </section>

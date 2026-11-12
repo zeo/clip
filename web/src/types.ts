@@ -13,7 +13,7 @@ export type Settings = {
   sources: string[];
   startWithWindows: boolean;
   cap: number;
-  steamgriddb: string;
+  hasSgdbKey: boolean;
   hotkeys: Hotkey[];
   volumes: Record<string, number>;
   micDevice: string;
@@ -30,7 +30,6 @@ export type Settings = {
   auto: string[];
   autoBefore: number;
   autoAfter: number;
-  gsiToken: string;
 };
 
 export type AutoGame = { id: string; name: string; plays: string; missing: string | null };
