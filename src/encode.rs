@@ -431,8 +431,23 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         close(&self.transform, &self.activate);
+        // nvidia's async mfts can still be running a queued work item that takes the encoder's lock after
+        // shutdown, and freeing the encoder under it crashes clip, so the last reference goes a little later
+        let kept = Kept { _transform: self.transform.clone(), _activate: self.activate.clone() };
+        let _ = std::thread::Builder::new().name("encoder release".into()).spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            drop(kept);
+        });
     }
 }
+
+struct Kept {
+    _transform: IMFTransform,
+    _activate: IMFActivate,
+}
+
+// a media foundation transform and its activate can be released from any thread
+unsafe impl Send for Kept {}
 
 /// Lets go of an encoder's worker threads, event queue and gpu session, which a hardware one keeps
 /// until it's shut down, whatever references are left.
@@ -545,5 +560,32 @@ mod tests {
     #[test]
     fn empty_without_parameter_sets() {
         assert!(parameter_sets(Codec::H264, &[0, 0, 1, 0x41, 7, 7]).is_empty());
+    }
+
+    // nvidia's hevc encoder used to crash the process a moment after a drop, once every few hundred drops
+    #[test]
+    #[ignore]
+    fn a_hardware_encoder_survives_being_opened_and_dropped_over_and_over() {
+        use super::{encoders, Encoder, Format, MFStartup, Purpose, MFSTARTUP_FULL, MF_VERSION};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.unwrap();
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.unwrap();
+        let gpu = crate::capture::gpu().unwrap();
+        let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec: Codec::Hdr10 };
+        let choice = encoders(Codec::Hdr10, Some(gpu.adapter)).unwrap().into_iter().find(|c| c.hardware).unwrap();
+        let mut pipeline =
+            crate::capture::Pipeline::new(&gpu, crate::TEST_DISPLAY, format, crate::hdr::Filter::Area).unwrap();
+        let source = crate::pattern(&gpu.device, 800, 600, 0, true).unwrap();
+        for round in 0..300 {
+            let mut encoder = Encoder::open(&choice, &gpu.device, format, Purpose::Capture)
+                .unwrap_or_else(|e| panic!("open in round {round}: {e}"));
+            for i in 0..10 {
+                let frame = pipeline.convert(&source, (800, 600), format.fps).unwrap();
+                encoder.encode(&frame, format.time(i)).unwrap();
+            }
+            encoder.finish().unwrap();
+        }
+        // the last encoders are let go a second after they're dropped, and a crash then still has to fail the test
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
 }

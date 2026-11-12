@@ -18,6 +18,7 @@ dates are release-tag dates.
 - an encoder that reports an error mid-stream counts as failed instead of being waited on until it stalls
 - each crash leaves its own `crash-<time>.dmp` (the last 3 are kept) with the memory the stacks point into, the open handles and thread details, and releases ship `clip.pdb`, so a dump can be read back to source lines
 - every encoder clip opens is shut down when it's done with, so the GPU's encoder sessions and worker threads don't pile up across recordings, exports and switches between games
+- clip no longer crashes a moment after it closes an NVIDIA encoder (seen after hours of recording and when testing encoders over and over): the driver could still be running one last task inside the encoder after clip freed it, so clip now lets go of it a second later
 - a crash on the audio thread no longer stops clip from recording anything until it's restarted
 - the editor streams a clip's tracks instead of decoding them whole, and draws their waveforms from peaks clip works out as it reads them, so opening an hour-long recording no longer takes gigabytes of memory or a long wait
 - a second shift click redraws the range from where the first started, so it can shrink as well as grow, and shift with the arrows starts from the clip in focus
