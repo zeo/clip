@@ -55,28 +55,38 @@ pub fn check() -> Result<(Update, Owner), String> {
     if candidates.is_empty() {
         return Err("the rot installer isn't on this pc".into());
     }
-    // an older shared installer may not know clip while a per-user one owns the install
-    let owner = candidates.into_iter().find_map(|exe| {
-        let status = run(&exe, &["status", APP, "--json"]).ok().filter(|out| out.status.success())?;
-        let receipts: Value = serde_json::from_slice(&status.stdout).ok()?;
-        let root = PathBuf::from(receipts.get(0)?.get("install_root")?.as_str()?);
-        Some(Owner { exe, root })
-    });
-    let owner = owner.ok_or("this copy of clip wasn't installed by the rot installer")?;
-    let release = run(&owner.exe, &["check", APP, "--json"])?;
+    // a shared installer can read the per-user install's receipt and still fail to look clip up, so
+    // the next one gets asked
+    let mut failure = "this copy of clip wasn't installed by the rot installer".to_string();
+    for exe in candidates {
+        let root = run(&exe, &["status", APP, "--json"]).ok().filter(|out| out.status.success()).and_then(|status| {
+            let receipts: Value = serde_json::from_slice(&status.stdout).ok()?;
+            Some(PathBuf::from(receipts.get(0)?.get("install_root")?.as_str()?))
+        });
+        if let Some(root) = root {
+            match newest(&exe) {
+                Ok(update) => return Ok((update, Owner { exe, root })),
+                Err(error) => failure = error,
+            }
+        }
+    }
+    Err(failure)
+}
+
+fn newest(installer: &Path) -> Result<Update, String> {
+    let release = run(installer, &["check", APP, "--json"])?;
     if !release.status.success() {
         let stderr = String::from_utf8_lossy(&release.stderr);
         return Err(stderr.trim().lines().last().unwrap_or("the update check failed").to_string());
     }
     let release: Value = serde_json::from_slice(&release.stdout).map_err(|e| e.to_string())?;
     let version = release.get("version").and_then(Value::as_str).ok_or("the installer named no version")?;
-    let update = Update {
+    Ok(Update {
         available: newer(version, env!("CARGO_PKG_VERSION")),
         version: version.to_string(),
         notes: release.get("notes").and_then(Value::as_str).unwrap_or_default().to_string(),
         error: String::new(),
-    };
-    Ok((update, owner))
+    })
 }
 
 fn newer(candidate: &str, current: &str) -> bool {
