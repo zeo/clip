@@ -283,9 +283,11 @@ pub fn run(restarted: bool) {
 fn serve(restarted: bool) -> Result<(), String> {
     // below normal, not background mode, which would also let windows page out the buffer
     let _ = unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) };
-    // a profile runs a separate clip beside the usual one, with its own settings and single instance
-    let suffix = match std::env::var("CLIP_PROFILE") {
-        Ok(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!("-{p}"),
+    // a profile runs a separate clip beside the usual one, with its own settings, single instance and clips
+    // folder; a debug build is dev unless told otherwise, and an empty profile is the usual clip
+    let profile = std::env::var("CLIP_PROFILE").ok().or_else(|| cfg!(debug_assertions).then(|| "dev".to_string()));
+    let suffix = match profile {
+        Some(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!("-{p}"),
         _ => String::new(),
     };
     // sfmg, once called clip, holds Clip for its install and library folders, run value and lt.rot.clip, and windows ignores case
@@ -375,7 +377,7 @@ fn serve(restarted: bool) -> Result<(), String> {
             let first = stored.is_none() && damaged.is_empty();
             let had = stored.is_some();
             let mut settings = stored.unwrap_or_default();
-            let default_folder = app.path().video_dir()?.join("clip-recorder");
+            let default_folder = app.path().video_dir()?.join(&name);
             if settings.folder.as_os_str().is_empty() {
                 settings.folder = default_folder.clone();
             }

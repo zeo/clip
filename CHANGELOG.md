@@ -24,6 +24,7 @@ dates are release-tag dates.
 - a clip whose preview never loads stops holding up the previews after it
 - the library can no longer fall back to an older list when two refreshes cross
 - the window never gets the SteamGridDB key or the game state token back (the key field offers replace and clear), a folder joins the library only once picked in Windows' folder dialog or found by clip, and a link in the clips folder that leads elsewhere no longer counts as inside it
+- a debug build runs as the `dev` profile unless `CLIP_PROFILE` says otherwise (empty for none), and each profile's clips folder defaults to its own name, so a build from source leaves the installed clip's settings, single instance and clips alone
 - the release build runs without the signing key, which only reaches a separate signing job that runs for `v*` tags and builds the installer tools from a pinned commit
 
 ## [0.1.1] - 2026-11-11
