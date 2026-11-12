@@ -56,6 +56,10 @@
   let others = $state<[number, number][]>([]);
   let lanes = $state<Lane[]>([]);
   let loading = $state(true);
+  // how many tracks the clip has, null until they're listed or when they can't be
+  let listed = $state<number | null>(null);
+  let loads = 0;
+  let dropping: ReturnType<typeof setTimeout> | undefined;
   let mix = $state(true);
   let busy = $state('');
   let error = $state('');
@@ -95,6 +99,9 @@
   const long = $derived(animated && end - start > LONGEST);
   const soloed = $derived(lanes.some((lane) => lane.solo));
   const audible = $derived(lanes.flatMap((lane, i) => ((soloed ? lane.solo : !lane.muted) ? [i] : [])));
+  // the export reads the sound from the file again, so tracks that can't play here still go in whole
+  const chosen = $derived(lanes.length ? audible : Array.from({ length: listed ?? 0 }, (_, i) => i));
+  const unready = $derived(!animated && (loading || listed === null));
   const pct = (t: number) => `${(100 * t) / (duration || 1)}%`;
 
   const context = new AudioContext();
@@ -128,19 +135,25 @@
   });
 
   async function load() {
+    const ticket = ++loads;
+    silence();
+    [lanes, listed, audioError, loading] = [[], null, '', true];
     try {
       const tracks = await invoke<Track[]>('track_audio', { path: clip.path });
-      lanes = await Promise.all(
+      if (ticket !== loads) return;
+      listed = tracks.length;
+      const read = await Promise.all(
         tracks.map(async (track) => {
-          const data = await (await fetch(convertFileSrc(track.path))).arrayBuffer();
+          const data = await (await fetch(`${convertFileSrc(track.path)}?v=${ticket}`)).arrayBuffer();
           const buffer = await context.decodeAudioData(data);
           return { name: track.name, buffer, peaks: peaks(buffer), muted: false, solo: false };
         })
       );
+      if (ticket === loads) lanes = read;
     } catch (e) {
-      audioError = String(e);
+      if (ticket === loads) audioError = String(e);
     } finally {
-      loading = false;
+      if (ticket === loads) loading = false;
     }
   }
 
@@ -354,7 +367,7 @@
     const heard = animated ? () => {} : await listen<number>('export-progress', (e) => (progress = e.payload));
     const out = await act('export', async () => {
       if (!animated) {
-        const args = { path, ranges: parts, tracks: audible, mix: mix && audible.length > 1, fit: fit || null, portrait: portrait ? middle : null, replace };
+        const args = { path, ranges: parts, tracks: chosen, mix: mix && chosen.length > 1, fit: fit || null, portrait: portrait ? middle : null, replace };
         return invoke<string>('export', args);
       }
       const cut = { start, end, middle: portrait ? middle : null, fit };
@@ -383,14 +396,17 @@
     [start, end] = [0, kept];
     others = [];
     version++;
-    // the original waits beside the clip until the undo runs out
-    const timer = setTimeout(() => invoke('drop_original', { path }).catch((e) => say(String(e), true)), 8000);
+    load();
+    // the original waits beside the clip until the undo runs out, a second replace recycles the first's
+    clearTimeout(dropping);
+    dropping = setTimeout(() => invoke('drop_original', { path }).catch((e) => say(String(e), true)), 8000);
     say(`Replaced ${title(clip)} with the cut${pasted}`, false, async () => {
-      clearTimeout(timer);
+      clearTimeout(dropping);
       try {
         await invoke('restore_original', { path });
         await invoke('set_marks', { path, at: before });
         version++;
+        load();
         say(`Put back ${title(clip)}`);
       } catch (e) {
         say(String(e), true);
@@ -710,7 +726,7 @@
         <div><dt>Length</dt><dd>{clock(duration, true)}</dd></div>
         <div><dt>Size</dt><dd>{size(clip.bytes)}</dd></div>
         <div><dt>Frame rate</dt><dd>{clip.fps ? `${Math.round(clip.fps)} fps` : 'unknown'}</dd></div>
-        <div><dt>Tracks</dt><dd>{loading ? '...' : lanes.length}</dd></div>
+        <div><dt>Tracks</dt><dd>{loading ? '...' : (listed ?? '?')}</dd></div>
       </dl>
       <div class="gel-row">
         <button class="gel" onclick={() => invoke('open', { path: clip.path }).catch((e) => say(String(e), true))}>Open</button>
@@ -804,7 +820,7 @@
         {#if animated}
           GIFs have no sound and play up to {LONGEST} s{fit > 0 ? ', at 10 frames a second to fit the size' : ''}.
         {:else}
-          {audible.length} of {lanes.length} tracks go in{fit > 0 && audible.length > 1 ? ', mixed to one since most sites play only the first' : ''}.
+          {#if listed === null}{loading ? 'The tracks are still being read.' : "The clip's tracks can't be listed, so it can't export."}{:else}{chosen.length} of {listed} tracks go in{lanes.length < listed ? ", all of them since they can't play here" : ''}{fit > 0 && chosen.length > 1 ? ', mixed to one since most sites play only the first' : ''}.{/if}
         {/if}
         {#if portrait}Drag the frame on the picture to choose what shows.{/if}
         {#if replace && !animated}The original goes to the recycle bin, with an undo.{/if}
@@ -819,7 +835,7 @@
           <button class="gel" onclick={() => (animated ? (halted = true) : invoke('cancel_export'))}>Cancel</button>
         </div>
       {/if}
-      <button class="gel default wide" disabled={busy !== '' || long} onclick={exportCut}>
+      <button class="gel default wide" disabled={busy !== '' || long || unready} onclick={exportCut}>
         {busy === 'export' ? `Exporting ${progress ?? 0}%` : animated ? 'Export GIF' : replace ? 'Replace with the cut' : rewind ? 'Save this part' : 'Export'}
       </button>
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}

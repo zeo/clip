@@ -6,6 +6,10 @@ dates are release-tag dates.
 
 ### fixes
 - clip's unfinished writes end in `.clip-part`, and a start clears only those, so another app's `.part` download in the clips folder is left alone
+- the editor's export waits for the clip's tracks to be read, so an export started too soon no longer comes out silent and then recycles the original or discards the rest of a rewind
+- a clip whose tracks can't play in the editor exports with all of them instead of none
+- after a replace or its undo, the editor reads the new file's tracks instead of playing the old ones
+- a second replace inside the undo's 8 seconds no longer lets the first one's timer recycle the newer original
 
 ## [0.1.1] - 2026-11-11
 
