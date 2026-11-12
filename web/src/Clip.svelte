@@ -6,7 +6,7 @@
   import { CANCELLED, LONGEST, gif } from './gif';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
-  import { discard, radios, say, view } from './view.svelte';
+  import { discard, radios, say, star, view } from './view.svelte';
 
   let {
     clip,
@@ -548,7 +548,7 @@
     <button class="gel" disabled={busy !== ''} title="Keep all of it as a clip" onclick={keepAll}>Keep all</button>
     <button class="gel danger" disabled={busy !== ''} onclick={remove}>Delete</button>
   {:else}
-  <button class="gel" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred }).catch((e) => say(String(e), true))}>
+  <button class="gel" aria-pressed={clip.starred} onclick={() => star([clip.path], !clip.starred)}>
     {clip.starred ? 'Starred' : 'Star'}
   </button>
   {#if clip.source}

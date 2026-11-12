@@ -23,6 +23,7 @@ dates are release-tag dates.
 - a second shift click redraws the range from where the first started, so it can shrink as well as grow, and shift with the arrows starts from the clip in focus
 - a clip whose preview never loads stops holding up the previews after it
 - the library can no longer fall back to an older list when two refreshes cross
+- a star shows the moment it's pressed, so pressing S or Star twice in quick succession turns it back off; before, the second press could land before the library was read again and star the clip a second time
 - the window never gets the SteamGridDB key or the game state token back (the key field offers replace and clear), a folder joins the library only once picked in Windows' folder dialog or found by clip, and a link in the clips folder that leads elsewhere no longer counts as inside it
 - a debug build runs as the `dev` profile unless `CLIP_PROFILE` says otherwise (empty for none), and each profile's clips folder defaults to its own name, so a build from source leaves the installed clip's settings, single instance and clips alone
 - Settings > About has a Test encoders button that runs the same encode, mix and save checks as `clip self-test` and adds their lines to Copy system info

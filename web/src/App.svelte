@@ -15,7 +15,7 @@
   import Preferences from './Preferences.svelte';
   import Tour from './Tour.svelte';
   import { ACTIONS, choose, chord, does, games, GB, length, quality, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
-  import { cards, gone, radios, say, toasts, view, zooms } from './view.svelte';
+  import { cards, gone, radios, say, stars, toasts, view, zooms } from './view.svelte';
 
   type Area = 'home' | 'library' | 'settings';
   type Shelf = Query['show'] | 'games';
@@ -46,7 +46,11 @@
   // an empty library only says so once the clips have been read
   let loaded = $state(false);
   let refreshes = 0;
-  const clips = $derived(found.filter((clip) => !gone.has(clip.path)));
+  const clips = $derived(
+    found
+      .filter((clip) => !gone.has(clip.path))
+      .map((clip) => (stars.has(clip.path) && stars.get(clip.path) !== clip.starred ? { ...clip, starred: stars.get(clip.path)! } : clip))
+  );
   let disk = $state<Disk | null>(null);
   let mics = $state<Mic[]>([]);
   let first = $state(false);
@@ -199,6 +203,7 @@
     }
     // a clip in the recycle bin stops being listed, so it no longer needs hiding
     for (const path of gone) if (!found.some((clip) => clip.path === path)) gone.delete(path);
+    for (const [path, on] of stars) if ((found.find((clip) => clip.path === path)?.starred ?? on) === on) stars.delete(path);
     invoke<Disk>('disk', { folder: settings.folder }).then((d) => (disk = d), () => (disk = null));
   }
 

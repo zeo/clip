@@ -2,7 +2,7 @@
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import Icon from './Icon.svelte';
   import { at, day, size, title, type Clip } from './types';
-  import { discard, say } from './view.svelte';
+  import { discard, say, star } from './view.svelte';
 
   let { clip, prev, next, onopen, onclose }: { clip: Clip; prev?: Clip; next?: Clip; onopen: (clip: Clip) => void; onclose: () => void } = $props();
   let picture = $state<{ width: number; height: number } | null>(null);
@@ -16,7 +16,6 @@
   }
 
   const copy = () => run('copy_files', { paths: [clip.path] }, `Copied ${title(clip)}, paste into a chat or folder`);
-  const star = () => run('star', { paths: [clip.path], on: !clip.starred });
 
   function remove() {
     discard([clip.path], title(clip));
@@ -35,7 +34,7 @@
     const keys: Record<string, () => void> = {
       ArrowLeft: () => prev && onopen(prev),
       ArrowRight: () => next && onopen(next),
-      s: star,
+      s: () => star([clip.path], !clip.starred),
       Delete: () => !clip.source && remove(),
       Escape: onclose
     };
@@ -63,7 +62,7 @@
   </div>
   <h1 class="toolbar-title">{title(clip)}</h1>
   <span class="grow"></span>
-  <button class="gel" aria-pressed={clip.starred} title="Star (S)" onclick={star}>{clip.starred ? 'Starred' : 'Star'}</button>
+  <button class="gel" aria-pressed={clip.starred} title="Star (S)" onclick={() => star([clip.path], !clip.starred)}>{clip.starred ? 'Starred' : 'Star'}</button>
   <button
     class="gel danger"
     disabled={!!clip.source}

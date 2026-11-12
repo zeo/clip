@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { MediaQuery, SvelteSet } from 'svelte/reactivity';
+import { MediaQuery, SvelteMap, SvelteSet } from 'svelte/reactivity';
 import type { Query } from './types';
 
 export const zooms = [90, 100, 110, 125, 150];
@@ -75,6 +75,20 @@ export function discard(paths: string[], what: string) {
     clearTimeout(timer);
     for (const path of paths) gone.delete(path);
   });
+}
+
+// a star shows at once, so a second press before the clips are read again turns it back off
+export const stars = new SvelteMap<string, boolean>();
+let starring: Promise<unknown> = Promise.resolve();
+
+export function star(paths: string[], on: boolean) {
+  for (const path of paths) stars.set(path, on);
+  starring = starring.then(() =>
+    invoke('star', { paths, on }).catch((e) => {
+      for (const path of paths) if (stars.get(path) === on) stars.delete(path);
+      say(String(e), true);
+    })
+  );
 }
 
 // arrow keys move the choice along a radiogroup, and only the chosen radio takes a tab stop
