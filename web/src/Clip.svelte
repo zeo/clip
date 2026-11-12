@@ -4,7 +4,7 @@
   import { CANCELLED, LONGEST, gif } from './gif';
   import Icon from './Icon.svelte';
   import { at, clock, day, size, title, type Clip, type Track } from './types';
-  import { discard, radios, say, view } from './view.svelte';
+  import { discard, radios, say, star, view } from './view.svelte';
 
   let {
     clip,
@@ -24,9 +24,10 @@
     onmoved: (path: string) => void;
   } = $props();
 
-  type Lane = { name: string; buffer: AudioBuffer; peaks: string; muted: boolean; solo: boolean };
+  type Lane = { name: string; audio: HTMLAudioElement; peaks: string; muted: boolean; solo: boolean };
+  // as many as track_audio sends
   const PEAKS = 800;
-  // past this the tracks are restarted where the video is
+  // past this a track is moved back to where the video is
   const DRIFT = 0.04;
   const RATES = [0.25, 0.5, 1, 1.5, 2];
   // the upload limits people meet most, in the bytes the sites count
@@ -54,6 +55,10 @@
   let others = $state<[number, number][]>([]);
   let lanes = $state<Lane[]>([]);
   let loading = $state(true);
+  // how many tracks the clip has, null until they're listed or when they can't be
+  let listed = $state<number | null>(null);
+  let loads = 0;
+  let dropping: ReturnType<typeof setTimeout> | undefined;
   let mix = $state(true);
   let busy = $state('');
   let error = $state('');
@@ -93,19 +98,15 @@
   const long = $derived(animated && end - start > LONGEST);
   const soloed = $derived(lanes.some((lane) => lane.solo));
   const audible = $derived(lanes.flatMap((lane, i) => ((soloed ? lane.solo : !lane.muted) ? [i] : [])));
+  // the export reads the sound from the file again, so tracks that can't play here still go in whole
+  const chosen = $derived(lanes.length ? audible : Array.from({ length: listed ?? 0 }, (_, i) => i));
+  const unready = $derived(!animated && (loading || listed === null));
   const pct = (t: number) => `${(100 * t) / (duration || 1)}%`;
 
-  const context = new AudioContext();
-  const master = context.createGain();
-  master.connect(context.destination);
-  let playing: AudioBufferSourceNode[] = [];
-  // where the video was and what the audio clock read when the tracks last started
-  let from = 0;
-  let started = 0;
   let frame = 0;
 
   $effect(() => {
-    master.gain.value = view.volume;
+    for (const lane of lanes) lane.audio.volume = view.volume;
   });
 
   $effect(() => {
@@ -118,67 +119,68 @@
     load();
     return () => {
       cancelAnimationFrame(frame);
-      silence();
-      context.close();
+      release(lanes.map((lane) => lane.audio));
       // stepping to the next clip keeps the screen filled, anything else gives the window back
       if (full) setTimeout(() => document.querySelector('.theater.full') || appWindow.setFullscreen(false));
     };
   });
 
   async function load() {
+    const ticket = ++loads;
+    // the cached wavs are about to be written again, so nothing may hold them open
+    release(lanes.map((lane) => lane.audio));
+    [lanes, listed, audioError, loading] = [[], null, '', true];
     try {
       const tracks = await invoke<Track[]>('track_audio', { path: clip.path });
-      lanes = await Promise.all(
-        tracks.map(async (track) => {
-          const data = await (await fetch(fileSrc(track.path))).arrayBuffer();
-          const buffer = await context.decodeAudioData(data);
-          return { name: track.name, buffer, peaks: peaks(buffer), muted: false, solo: false };
-        })
-      );
+      if (ticket !== loads) return;
+      listed = tracks.length;
+      // streamed from the cache, since a long clip's tracks decoded whole run to gigabytes
+      const made = tracks.map((track) => Object.assign(new Audio(), { preload: 'auto', src: `${fileSrc(track.path)}?v=${ticket}` }));
+      try {
+        await Promise.all(made.map(ready));
+      } catch (e) {
+        release(made);
+        throw e;
+      }
+      if (ticket !== loads) return release(made);
+      lanes = tracks.map((track, i) => ({ name: track.name, audio: made[i], peaks: outline(track.peaks), muted: false, solo: false }));
     } catch (e) {
-      audioError = String(e);
+      if (ticket === loads) audioError = String(e);
     } finally {
-      loading = false;
+      if (ticket === loads) loading = false;
     }
   }
 
-  function peaks(buffer: AudioBuffer): string {
-    const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c));
-    const per = Math.max(1, Math.floor(buffer.length / PEAKS));
-    let path = '';
-    for (let i = 0; i < PEAKS; i++) {
-      let peak = 0;
-      for (const data of channels) {
-        for (let n = i * per, last = Math.min(n + per, data.length); n < last; n++) peak = Math.max(peak, Math.abs(data[n]));
-      }
-      const h = Math.max(0.5, Math.sqrt(peak) * 48);
-      path += `M${i} ${50 - h}V${50 + h}`;
+  const ready = (audio: HTMLAudioElement) =>
+    new Promise((resolve, reject) => {
+      audio.onloadedmetadata = resolve;
+      audio.onerror = () => reject(audio.error?.message || "the webview can't play it");
+    });
+
+  const outline = (peaks: number[]) =>
+    peaks.map((peak, i) => ((h) => `M${i} ${50 - h}V${50 + h}`)(Math.max(0.5, Math.sqrt(peak) * 48))).join('');
+
+  function release(tracks: HTMLAudioElement[]) {
+    for (const audio of tracks) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
     }
-    return path;
   }
 
   function silence() {
-    for (const source of playing) {
-      source.stop();
-      source.disconnect();
-    }
-    playing = [];
+    for (const lane of lanes) lane.audio.pause();
   }
 
   function sound() {
     silence();
     if (!video || video.paused) return;
-    from = video.currentTime;
-    started = context.currentTime;
     for (const i of audible) {
-      const buffer = lanes[i].buffer;
-      if (from >= buffer.duration) continue;
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.playbackRate.value = rate;
-      source.connect(master);
-      source.start(0, from);
-      playing.push(source);
+      const audio = lanes[i].audio;
+      if (video.currentTime >= audio.duration) continue;
+      audio.currentTime = video.currentTime;
+      audio.playbackRate = rate;
+      audio.play().catch((e) => e.name === 'AbortError' || say(`Can't play the sound: ${e.message ?? e}`, true));
     }
   }
 
@@ -187,13 +189,18 @@
     now = video.currentTime;
     const [a, b] = ahead(now);
     if (loop && (now < a || now >= b)) seek(a);
-    else if (playing.length > 0 && Math.abs(from + (context.currentTime - started) * rate - now) > DRIFT) sound();
+    else {
+      for (const i of audible) {
+        const audio = lanes[i].audio;
+        if (!audio.paused && !audio.seeking && Math.abs(audio.currentTime - now) > DRIFT) audio.currentTime = now;
+      }
+    }
     if (!video.paused) frame = requestAnimationFrame(follow);
   }
 
   function played() {
     paused = false;
-    context.resume().then(sound, (e) => say(`Can't play the sound: ${e}`, true));
+    sound();
     frame = requestAnimationFrame(follow);
   }
 
@@ -352,7 +359,7 @@
     const heard = animated ? () => {} : await listen<number>('export-progress', (e) => (progress = e.payload));
     const out = await act('export', async () => {
       if (!animated) {
-        const args = { path, ranges: parts, tracks: audible, mix: mix && audible.length > 1, fit: fit || null, portrait: portrait ? middle : null, replace };
+        const args = { path, ranges: parts, tracks: chosen, mix: mix && chosen.length > 1, fit: fit || null, portrait: portrait ? middle : null, replace };
         return invoke<string>('export', args);
       }
       const cut = { start, end, middle: portrait ? middle : null, fit };
@@ -381,14 +388,17 @@
     [start, end] = [0, kept];
     others = [];
     version++;
-    // the original waits beside the clip until the undo runs out
-    const timer = setTimeout(() => invoke('drop_original', { path }).catch((e) => say(String(e), true)), 8000);
+    load();
+    // the original waits beside the clip until the undo runs out, a second replace recycles the first's
+    clearTimeout(dropping);
+    dropping = setTimeout(() => invoke('drop_original', { path }).catch((e) => say(String(e), true)), 8000);
     say(`Replaced ${title(clip)} with the cut${pasted}`, false, async () => {
-      clearTimeout(timer);
+      clearTimeout(dropping);
       try {
         await invoke('restore_original', { path });
         await invoke('set_marks', { path, at: before });
         version++;
+        load();
         say(`Put back ${title(clip)}`);
       } catch (e) {
         say(String(e), true);
@@ -536,7 +546,7 @@
     <button class="gel" disabled={busy !== ''} title="Keep all of it as a clip" onclick={keepAll}>Keep all</button>
     <button class="gel danger" disabled={busy !== ''} onclick={remove}>Delete</button>
   {:else}
-  <button class="gel" aria-pressed={clip.starred} onclick={() => invoke('star', { paths: [clip.path], on: !clip.starred }).catch((e) => say(String(e), true))}>
+  <button class="gel" aria-pressed={clip.starred} onclick={() => star([clip.path], !clip.starred)}>
     {clip.starred ? 'Starred' : 'Star'}
   </button>
   {#if clip.source}
@@ -708,7 +718,7 @@
         <div><dt>Length</dt><dd>{clock(duration, true)}</dd></div>
         <div><dt>Size</dt><dd>{size(clip.bytes)}</dd></div>
         <div><dt>Frame rate</dt><dd>{clip.fps ? `${Math.round(clip.fps)} fps` : 'unknown'}</dd></div>
-        <div><dt>Tracks</dt><dd>{loading ? '...' : lanes.length}</dd></div>
+        <div><dt>Tracks</dt><dd>{loading ? '...' : (listed ?? '?')}</dd></div>
       </dl>
       <div class="gel-row">
         <button class="gel" onclick={() => invoke('open', { path: clip.path }).catch((e) => say(String(e), true))}>Open</button>
@@ -802,7 +812,7 @@
         {#if animated}
           GIFs have no sound and play up to {LONGEST} s{fit > 0 ? ', at 10 frames a second to fit the size' : ''}.
         {:else}
-          {audible.length} of {lanes.length} tracks go in{fit > 0 && audible.length > 1 ? ', mixed to one since most sites play only the first' : ''}.
+          {#if listed === null}{loading ? 'The tracks are still being read.' : "The clip's tracks can't be listed, so it can't export."}{:else}{chosen.length} of {listed} tracks go in{lanes.length < listed ? ", all of them since they can't play here" : ''}{fit > 0 && chosen.length > 1 ? ', mixed to one since most sites play only the first' : ''}.{/if}
         {/if}
         {#if portrait}Drag the frame on the picture to choose what shows.{/if}
         {#if replace && !animated}The original goes to the recycle bin, with an undo.{/if}
@@ -817,7 +827,7 @@
           <button class="gel" onclick={() => (animated ? (halted = true) : invoke('cancel_export'))}>Cancel</button>
         </div>
       {/if}
-      <button class="gel default wide" disabled={busy !== '' || long} onclick={exportCut}>
+      <button class="gel default wide" disabled={busy !== '' || long || unready} onclick={exportCut}>
         {busy === 'export' ? `Exporting ${progress ?? 0}%` : animated ? 'Export GIF' : replace ? 'Replace with the cut' : rewind ? 'Save this part' : 'Export'}
       </button>
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}

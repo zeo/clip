@@ -12,7 +12,7 @@
   import Preferences from './Preferences.svelte';
   import Tour from './Tour.svelte';
   import { ACTIONS, choose, chord, does, games, GB, length, quality, sentence, size, type Clip, type Disk, type Hotkey, type Mic, type Query, type Settings, type Status } from './types';
-  import { cards, gone, radios, say, toasts, view, zooms } from './view.svelte';
+  import { cards, gone, radios, say, stars, toasts, view, zooms } from './view.svelte';
 
   type Area = 'home' | 'library' | 'settings';
   type Shelf = Query['show'] | 'games';
@@ -42,7 +42,12 @@
   let found = $state<Clip[]>([]);
   // an empty library only says so once the clips have been read
   let loaded = $state(false);
-  const clips = $derived(found.filter((clip) => !gone.has(clip.path)));
+  let refreshes = 0;
+  const clips = $derived(
+    found
+      .filter((clip) => !gone.has(clip.path))
+      .map((clip) => (stars.has(clip.path) && stars.get(clip.path) !== clip.starred ? { ...clip, starred: stars.get(clip.path)! } : clip))
+  );
   let disk = $state<Disk | null>(null);
   let mics = $state<Mic[]>([]);
   let first = $state(false);
@@ -181,16 +186,21 @@
   });
 
   async function refresh() {
+    const ticket = ++refreshes;
     try {
-      [settings, found] = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+      const read = await Promise.all([invoke<Settings>('settings'), invoke<Clip[]>('clips')]);
+      // a refresh that started later may have finished first, and its list is the newer one
+      if (ticket !== refreshes) return;
+      [settings, found] = read;
     } catch (e) {
-      say(`Can't read the clips: ${e}`, true);
+      if (ticket === refreshes) say(`Can't read the clips: ${e}`, true);
       return;
     } finally {
       loaded = true;
     }
     // a clip in the recycle bin stops being listed, so it no longer needs hiding
     for (const path of gone) if (!found.some((clip) => clip.path === path)) gone.delete(path);
+    for (const [path, on] of stars) if ((found.find((clip) => clip.path === path)?.starred ?? on) === on) stars.delete(path);
     invoke<Disk>('disk', { folder: settings.folder }).then((d) => (disk = d), () => (disk = null));
   }
 
@@ -245,21 +255,26 @@
     if (was) document.querySelector<HTMLElement>(`.view [data-path="${CSS.escape(was)}"]`)?.focus();
   }
 
-  // a switch that failed to apply goes back to what's in effect
-  async function change(patch: Partial<Settings>, undo: () => void) {
-    if (!settings) return;
-    try {
-      await invoke('apply', { settings: { ...settings, ...patch } });
-    } catch (e) {
-      say(String(e), true);
-      undo();
-    }
-    await refresh();
+  let changing = Promise.resolve();
+
+  // switches apply one after another, each onto what the one before left, and one that failed to
+  // apply goes back to what's in effect
+  function change(patch: (now: Settings) => Partial<Settings>, undo: () => void) {
+    changing = changing.then(async () => {
+      if (!settings) return;
+      try {
+        await invoke('apply', { settings: { ...settings, ...patch(settings) } });
+      } catch (e) {
+        say(String(e), true);
+        undo();
+      }
+      await refresh();
+    });
   }
 
   function record(exe: string, box: HTMLInputElement) {
     const on = box.checked;
-    if (settings) change({ ignore: on ? settings.ignore.filter((e) => e !== exe) : [...settings.ignore, exe] }, () => (box.checked = !on));
+    change((now) => ({ ignore: on ? now.ignore.filter((e) => e !== exe) : [...now.ignore.filter((e) => e !== exe), exe] }), () => (box.checked = !on));
   }
 
   async function openQuick() {
@@ -394,7 +409,7 @@
                 const box = e.currentTarget;
                 const v = box.value;
                 const was = settings!.mic ? settings!.micDevice || 'default' : 'off';
-                change({ mic: v !== 'off', micDevice: v === 'off' ? settings!.micDevice : v === 'default' ? '' : v }, () => (box.value = was));
+                change((now) => ({ mic: v !== 'off', micDevice: v === 'off' ? now.micDevice : v === 'default' ? '' : v }), () => (box.value = was));
               }}
             >
               <option value="off">Off</option>

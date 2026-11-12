@@ -368,21 +368,37 @@ pub fn recycle(paths: &[PathBuf]) -> Result<(), String> {
     }
 }
 
+/// What clip's own unfinished writes end in, so a start clears only those and never another app's
+/// `.part` download beside them.
+pub const PART: &str = ".clip-part";
+
 /// Settles every replace that was waiting out its undo when clip last stopped: the trimmed clip
 /// stays and its original goes to the recycle bin, or the original comes back if the trimmed one
-/// never landed.
-pub fn settle(folder: &Path) {
+/// never landed. A long recording cut off by a crash is rebuilt into a playable clip up to its last
+/// fragment; those are returned.
+pub fn settle(folder: &Path) -> Vec<PathBuf> {
     let dirs = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path());
     let dirs = std::iter::once(folder.to_path_buf()).chain(dirs.filter(|dir| dir.is_dir()));
     let originals =
         dirs.flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()));
     let lower = |path: &Path| path.to_string_lossy().to_ascii_lowercase();
-    let part = |path: &Path| [".mp4.part", ".png.part", ".gif.part"].iter().any(|tail| lower(path).ends_with(tail));
+    let part = |path: &Path| lower(path).ends_with(PART);
     let (parts, originals): (Vec<PathBuf>, Vec<PathBuf>) =
         originals.filter(|path| part(path) || lower(path).ends_with(".mp4.orig")).partition(|path| part(path));
-    // a write cut off by a crash or power loss can't be played, its index is only written at the end
+    // any other write cut off by a crash or power loss can't be played, its index is only written at the end
+    let mut recovered = Vec::new();
     for part in parts {
-        let _ = std::fs::remove_file(part);
+        let out = part.with_extension("");
+        let rebuilt = lower(&part).ends_with(&format!(".mp4{PART}"))
+            && !out.exists()
+            && crate::save::recover(&part).is_ok()
+            && std::fs::rename(&part, &out).is_ok();
+        match rebuilt {
+            true => recovered.push(out),
+            false => {
+                let _ = std::fs::remove_file(part);
+            }
+        }
     }
     let (kept, lost): (Vec<PathBuf>, Vec<PathBuf>) =
         originals.into_iter().partition(|path| path.with_extension("").exists());
@@ -390,6 +406,7 @@ pub fn settle(folder: &Path) {
         let _ = std::fs::rename(&path, path.with_extension(""));
     }
     let _ = recycle(&kept);
+    recovered
 }
 
 /// Deletes the oldest unstarred clips clip wrote, never the newest, until they take at most `cap`
@@ -441,7 +458,7 @@ pub fn import(source: &Path, folder: &Path, progress: impl Fn(usize, usize)) -> 
             continue;
         }
         let mut part = to.clone().into_os_string();
-        part.push(".part");
+        part.push(PART);
         // a copy cut off half way is left as a part, which the next start clears
         std::fs::create_dir_all(&dir)
             .and_then(|()| std::fs::copy(entry.path(), &part))
@@ -461,6 +478,25 @@ mod tests {
     use super::*;
 
     const MIN: u64 = 60 * 1000;
+
+    #[test]
+    fn a_start_clears_clip_s_own_unfinished_writes_and_brings_back_a_lost_original() {
+        let dir = std::env::temp_dir().join(format!("clip-settle-{}", std::process::id()));
+        let game = dir.join("Fortnite");
+        std::fs::create_dir_all(&game).unwrap();
+        let file = |path: PathBuf| {
+            std::fs::write(&path, "x").unwrap();
+            path
+        };
+        let (ours, deeper) = (file(dir.join(format!("a.mp4{PART}"))), file(game.join(format!("b.png{PART}"))));
+        let download = file(dir.join("movie.mp4.part"));
+        let original = file(game.join("c.mp4.orig"));
+        assert!(settle(&dir).is_empty(), "a cut off plain write isn't rebuilt");
+        assert!(!ours.exists() && !deeper.exists());
+        assert!(download.exists(), "another app's download stays");
+        assert!(!original.exists() && game.join("c.mp4").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn sessions_split_on_a_long_gap_and_per_app() {

@@ -186,7 +186,7 @@ unsafe fn write_png(
     to: &Path,
 ) -> windows::core::Result<()> {
     let mut part = to.as_os_str().to_owned();
-    part.push(".part");
+    part.push(crate::library::PART);
     let part = PathBuf::from(part);
     let written = (|| {
         let stream = factory.CreateStream()?;

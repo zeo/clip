@@ -119,6 +119,12 @@ pub fn encoders(codec: Codec, adapter: Option<LUID>) -> Result<Vec<Choice>> {
     Ok(found)
 }
 
+/// The error an async encoder reported, which ends its stream.
+fn failed(event: &IMFMediaEvent) -> windows::core::Error {
+    let code = unsafe { event.GetStatus() }.unwrap_or(E_FAIL);
+    windows::core::Error::new(if code.is_ok() { E_FAIL } else { code }, "the encoder failed")
+}
+
 fn friendly_name(activate: &IMFActivate) -> String {
     let mut text = windows::core::PWSTR::null();
     let mut len = 0;
@@ -133,6 +139,7 @@ fn friendly_name(activate: &IMFActivate) -> String {
 }
 
 pub struct Encoder {
+    activate: IMFActivate,
     transform: IMFTransform,
     events: Option<IMFMediaEventGenerator>,
     credit: u32,
@@ -143,6 +150,8 @@ pub struct Encoder {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     format: Format,
+    /// for capture, the knob that forces a keyframe and the pts of the last one
+    keys: Option<(ICodecAPI, Option<i64>)>,
 }
 
 // hardware encoders answer within a frame or two, this only trips on a wedged driver
@@ -151,8 +160,19 @@ const STALL: Duration = Duration::from_secs(2);
 #[allow(non_upper_case_globals)] // the event names are the sdk's own constants
 impl Encoder {
     pub fn open(choice: &Choice, device: &ID3D11Device, format: Format, purpose: Purpose) -> Result<Self> {
+        let transform: IMFTransform = unsafe { choice.activate.ActivateObject()? };
+        Self::start(choice, transform.clone(), device, format, purpose)
+            .inspect_err(|_| close(&transform, &choice.activate))
+    }
+
+    fn start(
+        choice: &Choice,
+        transform: IMFTransform,
+        device: &ID3D11Device,
+        format: Format,
+        purpose: Purpose,
+    ) -> Result<Self> {
         unsafe {
-            let transform: IMFTransform = choice.activate.ActivateObject()?;
             let attributes = transform.GetAttributes()?;
             let events = if choice.hardware {
                 attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
@@ -173,7 +193,8 @@ impl Encoder {
             let _ = attributes.SetUINT32(&MF_LOW_LATENCY, capture as u32);
 
             // vendors support different subsets, so each knob is best effort
-            if let Ok(codec) = transform.cast::<ICodecAPI>() {
+            let api = transform.cast::<ICodecAPI>().ok();
+            if let Some(codec) = &api {
                 let set = |api: GUID, value: VARIANT| {
                     let _ = codec.SetValue(&api, &value);
                 };
@@ -214,6 +235,7 @@ impl Encoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
 
             Ok(Self {
+                activate: choice.activate.clone(),
                 transform,
                 events,
                 credit: 0,
@@ -224,6 +246,7 @@ impl Encoder {
                 device: device.clone(),
                 context: device.GetImmediateContext()?,
                 format,
+                keys: api.filter(|_| capture).map(|api| (api, None)),
             })
         }
     }
@@ -233,6 +256,13 @@ impl Encoder {
         unsafe {
             sample.SetSampleTime(pts)?;
             sample.SetSampleDuration(self.format.frame())?;
+        }
+        // a clip can only start on a keyframe, so one that's two seconds late is asked for
+        if let Some((api, keyed)) = &mut self.keys {
+            if pts - *keyed.get_or_insert(pts) >= 2 * SECOND {
+                let _ = unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)) };
+                *keyed = Some(pts);
+            }
         }
         let mut out = Vec::new();
         if self.events.is_some() {
@@ -257,6 +287,9 @@ impl Encoder {
                 out.push(packet);
             }
         }
+        if let (Some((_, Some(keyed))), Some(key)) = (&mut self.keys, out.iter().rfind(|p| p.key)) {
+            *keyed = (*keyed).max(key.pts);
+        }
         Ok(out)
     }
 
@@ -278,6 +311,7 @@ impl Encoder {
                 Ok(event) => match MF_EVENT_TYPE(unsafe { event.GetType()? } as i32) {
                     METransformHaveOutput => out.extend(self.pull()?),
                     METransformDrainComplete => break,
+                    MEError => return Err(failed(&event)),
                     _ => {}
                 },
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => std::thread::sleep(Duration::from_millis(1)),
@@ -298,6 +332,7 @@ impl Encoder {
         match MF_EVENT_TYPE(unsafe { event.GetType()? } as i32) {
             METransformNeedInput => self.credit += 1,
             METransformHaveOutput => out.extend(self.pull()?),
+            MEError => return Err(failed(&event)),
             _ => {}
         }
         Ok(true)
@@ -393,6 +428,39 @@ impl Encoder {
     }
 }
 
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        close(&self.transform, &self.activate);
+        // nvidia's async mfts can still be running a queued work item that takes the encoder's lock after
+        // shutdown, and freeing the encoder under it crashes clip, so the last reference goes a little later
+        let kept = Kept { _transform: self.transform.clone(), _activate: self.activate.clone() };
+        let _ = std::thread::Builder::new().name("encoder release".into()).spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            drop(kept);
+        });
+    }
+}
+
+struct Kept {
+    _transform: IMFTransform,
+    _activate: IMFActivate,
+}
+
+// a media foundation transform and its activate can be released from any thread
+unsafe impl Send for Kept {}
+
+/// Lets go of an encoder's worker threads, event queue and gpu session, which a hardware one keeps
+/// until it's shut down, whatever references are left.
+fn close(transform: &IMFTransform, activate: &IMFActivate) {
+    unsafe {
+        let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        if let Ok(shutdown) = transform.cast::<IMFShutdown>() {
+            let _ = shutdown.Shutdown();
+        }
+        let _ = activate.ShutdownObject();
+    }
+}
+
 /// Size, rate and color signalling shared by the encoder types and the saved file.
 pub fn describe(media: &IMFMediaType, format: Format) -> Result<()> {
     let (primaries, transfer, matrix) = match format.codec {
@@ -432,6 +500,15 @@ pub fn packet(sample: &IMFSample, frame: i64) -> Result<Packet> {
 /// Parameter set NAL units (h.264 sps and pps, hevc vps sps and pps), start codes included,
 /// from an Annex B access unit.
 pub fn parameter_sets(codec: Codec, access_unit: &[u8]) -> Vec<u8> {
+    let wanted = |unit: &&[u8]| match codec {
+        Codec::H264 => matches!(unit[0] & 0x1f, 7 | 8),
+        Codec::Hdr10 => is_hevc_parameter_set(unit),
+    };
+    nal_units(access_unit).into_iter().filter(wanted).flat_map(|unit| [&[0, 0, 0, 1][..], unit].concat()).collect()
+}
+
+/// The NAL units of an Annex B access unit, without their start codes.
+pub fn nal_units(access_unit: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 <= access_unit.len() {
@@ -442,23 +519,22 @@ pub fn parameter_sets(codec: Codec, access_unit: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
-    let mut out = Vec::new();
+    let mut units = Vec::new();
     for (n, &start) in starts.iter().enumerate() {
         let mut end = starts.get(n + 1).map_or(access_unit.len(), |&next| next - 3);
         while n + 1 < starts.len() && end > start && access_unit[end - 1] == 0 {
             end -= 1;
         }
-        let header = access_unit.get(start).copied().unwrap_or(0);
-        let wanted = match codec {
-            Codec::H264 => matches!(header & 0x1f, 7 | 8),
-            Codec::Hdr10 => matches!((header >> 1) & 0x3f, 32..=34),
-        };
-        if start < end && wanted {
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&access_unit[start..end]);
+        if start < end {
+            units.push(&access_unit[start..end]);
         }
     }
-    out
+    units
+}
+
+/// A vps, sps or pps.
+pub fn is_hevc_parameter_set(unit: &[u8]) -> bool {
+    matches!((unit[0] >> 1) & 0x3f, 32..=34)
 }
 
 #[cfg(test)]
@@ -492,5 +568,32 @@ mod tests {
     #[test]
     fn empty_without_parameter_sets() {
         assert!(parameter_sets(Codec::H264, &[0, 0, 1, 0x41, 7, 7]).is_empty());
+    }
+
+    // nvidia's hevc encoder used to crash the process a moment after a drop, once every few hundred drops
+    #[test]
+    #[ignore]
+    fn a_hardware_encoder_survives_being_opened_and_dropped_over_and_over() {
+        use super::{encoders, Encoder, Format, MFStartup, Purpose, MFSTARTUP_FULL, MF_VERSION};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.unwrap();
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.unwrap();
+        let gpu = crate::capture::gpu().unwrap();
+        let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec: Codec::Hdr10 };
+        let choice = encoders(Codec::Hdr10, Some(gpu.adapter)).unwrap().into_iter().find(|c| c.hardware).unwrap();
+        let mut pipeline =
+            crate::capture::Pipeline::new(&gpu, crate::TEST_DISPLAY, format, crate::hdr::Filter::Area).unwrap();
+        let source = crate::pattern(&gpu.device, 800, 600, 0, true).unwrap();
+        for round in 0..300 {
+            let mut encoder = Encoder::open(&choice, &gpu.device, format, Purpose::Capture)
+                .unwrap_or_else(|e| panic!("open in round {round}: {e}"));
+            for i in 0..10 {
+                let frame = pipeline.convert(&source, (800, 600), format.fps).unwrap();
+                encoder.encode(&frame, format.time(i)).unwrap();
+            }
+            encoder.finish().unwrap();
+        }
+        // the last encoders are let go a second after they're dropped, and a crash then still has to fail the test
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
 }

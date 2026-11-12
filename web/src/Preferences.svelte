@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { appVersion, dialog, fileSrc, invoke, listen } from './host';
+  import { appVersion, fileSrc, invoke, listen } from './host';
   import Bind from './Bind.svelte';
   import { ACTIONS, PRESETS, at, chord, does, length, bufferCost, quality, resolution, sentence, size, type Corner, type AutoGame, type Disk, type Hotkey, type Mic, type Settings, type Status } from './types';
   import { radios, reduced, say, view, zooms } from './view.svelte';
@@ -86,7 +86,9 @@
   let body = $state<HTMLElement>();
   const choices = (open: string[], on: string[] = []) => [...new Set([...open, ...on])].sort();
   const before = $derived<Settings | null>(saved ? JSON.parse(saved) : null);
-  const changed = $derived(draft !== null && JSON.stringify(draft) !== saved);
+  // a new steamgriddb key, '' to clear the saved one, null to leave it
+  let key = $state<string | null>(null);
+  const changed = $derived(draft !== null && (JSON.stringify(draft) !== saved || key !== null));
   const restarts = $derived(!!draft && !!before && restarting.some((k) => JSON.stringify(draft![k]) !== JSON.stringify(before[k])));
   const searching = $derived(search.trim() !== '');
   const shownPages = $derived(searching ? pages.filter((p) => found[p.id]) : pages.filter((p) => p.id === page));
@@ -143,9 +145,25 @@
     }
   }
 
+  let tested = $state<string[] | null>(null);
+  let testing = $state(false);
+  const failed = $derived(tested?.filter((line) => line.startsWith('FAIL')).length ?? 0);
+
+  async function testEncoders() {
+    testing = true;
+    try {
+      tested = await invoke<string[]>('test_encoders');
+    } catch (e) {
+      say(`Can't test the encoders: ${e}`, true);
+    } finally {
+      testing = false;
+    }
+  }
+
   async function copyInfo() {
     try {
-      await navigator.clipboard.writeText(await invoke<string>('system_info'));
+      const info = await invoke<string>('system_info');
+      await navigator.clipboard.writeText(tested ? `${info}\n\nencoder test\n${tested.join('\n')}` : info);
       say('Copied the system info, paste into a bug report');
     } catch (e) {
       say(`Can't copy the system info: ${e}`, true);
@@ -236,8 +254,8 @@
 
   async function addSource() {
     if (!draft) return;
-    const picked = await dialog.open({ directory: true });
-    if (typeof picked !== 'string') return;
+    const picked = await invoke<string | null>('pick_folder');
+    if (!picked) return;
     if (inside(picked)) say(`${known(picked)} is in the clips folder, so it's listed already`, true);
     else if (draft.sources.includes(picked)) say(`${known(picked)} is listed already`, true);
     else draft.sources.push(picked);
@@ -260,12 +278,13 @@
 
   async function pickFolder() {
     if (!draft) return;
-    const picked = await dialog.open({ directory: true, defaultPath: draft.folder });
-    if (typeof picked === 'string') draft.folder = picked;
+    const picked = await invoke<string | null>('pick_folder', { from: draft.folder });
+    if (picked) draft.folder = picked;
   }
 
   function revert() {
     draft = JSON.parse(saved);
+    key = null;
     error = '';
   }
 
@@ -276,8 +295,11 @@
     busy = true;
     error = '';
     try {
-      await invoke('apply', { settings: draft });
+      const sgdb = key?.trim() ?? null;
+      await invoke('apply', { settings: draft, sgdb });
       say(restarts ? 'Settings applied, a new buffer started' : 'Settings applied');
+      if (sgdb !== null) draft.hasSgdbKey = sgdb !== '';
+      key = null;
       saved = JSON.stringify(draft);
       onapplied();
       // the apply bar and its focused button go, so focus lands on the page instead of the body
@@ -764,8 +786,22 @@
             <div class="rows">
               <label class="row">
                 <span class="row-label">SteamGridDB key</span>
-                <input class="field" type="password" spellcheck="false" autocomplete="off" placeholder="None" bind:value={draft.steamgriddb} />
+                <input
+                  class="field"
+                  type="password"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder={key === '' || !draft.hasSgdbKey ? 'None' : 'Saved, type a new one to replace it'}
+                  value={key ?? ''}
+                  oninput={(e) => (key = e.currentTarget.value || null)}
+                />
               </label>
+              {#if draft.hasSgdbKey && key !== ''}
+                <div class="row">
+                  <span class="row-label">Saved key</span>
+                  <button class="gel" onclick={() => (key = '')}>Clear</button>
+                </div>
+              {/if}
             </div>
           </section>
         </section>
@@ -792,13 +828,26 @@
               </div>
               {#if update?.available && update.notes}<p class="row notes">{update.notes}</p>{/if}
               <div class="row">
-                <span class="row-label">Logs<small>clip.log, and crash.dmp after a crash</small></span>
+                <span class="row-label">Logs<small>clip.log, and a crash dump after a crash</small></span>
                 <button class="gel" onclick={() => invoke('log_folder').catch((e) => say(String(e), true))}>Open logs folder</button>
               </div>
               <div class="row">
                 <span class="row-label">System info<small>The version, Windows build, GPU, its encoders and what's being recorded, for a bug report</small></span>
                 <button class="gel" onclick={copyInfo}>Copy system info</button>
               </div>
+              <div class="row">
+                <span class="row-label"
+                  >Encoders<small class:bad={failed > 0}
+                    >{!tested
+                      ? 'Saves, cuts and reads back 2 seconds from each encoder this PC has, while recording carries on'
+                      : failed
+                        ? `${failed} ${failed === 1 ? 'check' : 'checks'} failed, and the system info now carries the results`
+                        : 'Every check passed, and the system info now carries the results'}</small
+                  ></span
+                >
+                <button class="gel" disabled={testing} onclick={testEncoders}>{testing ? 'Testing' : 'Test encoders'}</button>
+              </div>
+              {#if tested}<p class="row notes mono">{tested.join('\n')}</p>{/if}
             </div>
           </section>
         </section>

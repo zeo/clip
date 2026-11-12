@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use windows::core::HSTRING;
@@ -84,6 +84,12 @@ impl From<Arc<Packet>> for Held {
     }
 }
 
+impl From<Packet> for Held {
+    fn from(packet: Packet) -> Self {
+        Arc::new(packet).into()
+    }
+}
+
 impl Held {
     pub fn load(&self) -> std::io::Result<Arc<Packet>> {
         let (file, at) = match &self.body {
@@ -112,6 +118,8 @@ pub fn load(held: &[Held]) -> std::io::Result<Vec<Arc<Packet>>> {
 pub struct Spool {
     dir: PathBuf,
     session: String,
+    /// why the drive stopped taking packets, for every ring of the session at once
+    failed: Arc<OnceLock<String>>,
 }
 
 impl Spool {
@@ -127,7 +135,11 @@ impl Spool {
         std::fs::create_dir_all(dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
         let _ = unsafe { SetFileAttributesW(&HSTRING::from(dir), FILE_ATTRIBUTE_HIDDEN) };
         let session = format!("{}.{}", std::process::id(), SESSIONS.fetch_add(1, Ordering::Relaxed));
-        Ok(Self { dir: dir.into(), session })
+        Ok(Self { dir: dir.into(), session, failed: Arc::default() })
+    }
+
+    pub fn failed(&self) -> Option<&str> {
+        self.failed.get().map(String::as_str)
     }
 
     /// Deletes what a power cut left behind, while no session of this run has files there.
@@ -187,39 +199,71 @@ impl Disk {
     }
 }
 
+/// Where one stream's packets go before its ring holds them: memory, or files in a spool. Written
+/// by the stream's own thread, so the ring's lock is never held through disk writes.
+pub struct Keep {
+    disk: Option<Disk>,
+    /// the spool failed since the ring was last filled
+    fell: bool,
+}
+
+impl Keep {
+    pub fn memory() -> Self {
+        Self { disk: None, fell: false }
+    }
+
+    /// Keeps packets in files in `spool` named after `name`.
+    pub fn spooled(spool: Spool, name: &str) -> Self {
+        Self { disk: Some(Disk { spool, name: name.into(), files: 0, open: None }), fell: false }
+    }
+
+    // a drive that fills up or goes away keeps what it holds, and memory takes the rest
+    pub fn hold(&mut self, packet: Packet) -> Held {
+        if let Some(disk) = &mut self.disk {
+            if disk.spool.failed().is_none() {
+                match disk.write(&packet) {
+                    Ok(held) => return held,
+                    Err(e) => {
+                        crate::log::write(format_args!("the long buffer's drive failed ({e}), keeping it in memory"));
+                        let _ = disk.spool.failed.set(e.to_string());
+                    }
+                }
+            }
+            self.disk = None;
+            self.fell = true;
+        }
+        packet.into()
+    }
+
+    /// Writes `packets` out, then hands them to `ring`.
+    pub fn fill(&mut self, ring: &Mutex<Ring>, packets: Vec<Packet>) {
+        let held: Vec<Held> = packets.into_iter().map(|packet| self.hold(packet)).collect();
+        let mut ring = ring.lock().expect("ring poisoned");
+        if std::mem::take(&mut self.fell) {
+            ring.span = ring.span.min(IN_MEMORY as i64 * SECOND);
+        }
+        held.into_iter().for_each(|held| ring.push(held));
+    }
+}
+
 /// Encoded packets covering at least `span` of the most recent stream, always starting on a keyframe.
 /// Whole GOPs are evicted from the front so any snapshot decodes on its own.
 pub struct Ring {
     packets: VecDeque<Held>,
     keys: VecDeque<i64>,
     span: i64,
-    disk: Option<Disk>,
 }
 
 impl Ring {
     pub fn new(span: i64) -> Self {
-        Self { packets: VecDeque::new(), keys: VecDeque::new(), span, disk: None }
+        Self { packets: VecDeque::new(), keys: VecDeque::new(), span }
     }
 
-    /// A ring that keeps its packets in files in `spool` named after `name`.
-    pub fn spooled(span: i64, spool: Spool, name: &str) -> Self {
-        Self { disk: Some(Disk { spool, name: name.into(), files: 0, open: None }), ..Self::new(span) }
-    }
-
-    pub fn push(&mut self, packet: Packet) {
-        if self.packets.is_empty() && !packet.key {
+    pub fn push(&mut self, packet: impl Into<Held>) {
+        let held = packet.into();
+        if self.packets.is_empty() && !held.key {
             return;
         }
-        let held = match self.disk.as_mut().map(|disk| disk.write(&packet)) {
-            Some(Ok(held)) => held,
-            None => Held::from(Arc::new(packet)),
-            // a drive that fills up or goes away keeps what it holds, and memory takes the rest
-            Some(Err(_)) => {
-                self.disk = None;
-                self.span = self.span.min(IN_MEMORY as i64 * SECOND);
-                Held::from(Arc::new(packet))
-            }
-        };
         if held.key {
             self.keys.push_back(held.pts);
         }
@@ -282,13 +326,13 @@ mod tests {
     #[test]
     fn a_spooled_ring_reads_back_what_memory_holds_and_lets_old_files_go() {
         let dir = std::env::temp_dir().join(format!("clip-spool-{}", std::process::id()));
-        let (mut memory, mut disk) =
-            (Ring::new(150 * SECOND), Ring::spooled(150 * SECOND, Spool::open(&dir, 0).unwrap(), "video"));
+        let (mut memory, mut disk) = (Ring::new(150 * SECOND), Ring::new(150 * SECOND));
+        let mut keep = Keep::spooled(Spool::open(&dir, 0).unwrap(), "video");
         for i in 0..3000 {
             let packet =
                 || Packet { pts: i * FRAME, duration: FRAME, key: i % 10 == 0, data: i.to_le_bytes().repeat(9) };
             memory.push(packet());
-            disk.push(packet());
+            disk.push(keep.hold(packet()));
         }
         let (kept, read) = (load(&memory.since(i64::MIN)).unwrap(), load(&disk.since(i64::MIN)).unwrap());
         assert_eq!(kept.len(), read.len());
@@ -297,10 +341,37 @@ mod tests {
         // 150 s back from 300 s reaches into the file started at 120 s
         assert_eq!(files(), 3);
         let snapshot = disk.since(i64::MIN);
-        drop(disk);
+        drop((disk, keep));
         assert_eq!(files(), 3, "a snapshot keeps its files");
         drop(snapshot);
         assert_eq!(files(), 0);
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn when_one_stream_s_drive_fails_every_ring_of_the_session_goes_back_to_memory() {
+        let dir = std::env::temp_dir().join(format!("clip-spool-fail-{}", std::process::id()));
+        let spool = Spool::open(&dir, 0).unwrap();
+        let rings = [Mutex::new(Ring::new(2000 * SECOND)), Mutex::new(Ring::new(2000 * SECOND))];
+        let mut keeps = [Keep::spooled(spool.clone(), "video"), Keep::spooled(spool.clone(), "lane0")];
+        let packet = |i: i64| Packet { pts: i * FRAME, duration: FRAME, key: true, data: vec![7; 10] };
+        keeps[0].fill(&rings[0], vec![packet(0)]);
+        keeps[1].fill(&rings[1], vec![packet(0)]);
+        // the video stream's file stops taking writes
+        let stuck = dir.join("stuck");
+        std::fs::write(&stuck, b"").unwrap();
+        keeps[0].disk.as_mut().unwrap().open = Some((Arc::new(File::open(&stuck).unwrap()), 0, 0));
+        keeps[0].fill(&rings[0], vec![packet(1)]);
+        assert!(spool.failed().is_some());
+        keeps[1].fill(&rings[1], vec![packet(1)]);
+        for (keep, ring) in keeps.iter().zip(&rings) {
+            assert!(keep.disk.is_none());
+            let ring = ring.lock().unwrap();
+            assert_eq!(ring.span, IN_MEMORY as i64 * SECOND);
+            assert_eq!(load(&ring.since(i64::MIN)).unwrap().len(), 2, "nothing is lost on the way");
+        }
+        drop((rings, keeps));
+        std::fs::remove_file(&stuck).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
 

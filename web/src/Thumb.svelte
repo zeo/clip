@@ -11,10 +11,14 @@
     return next;
   }
 
+  // a file the player never answers for would hold up every still after it
+  const PATIENCE = 15_000;
+
   function once(video: HTMLVideoElement, event: string): Promise<void> {
     return new Promise((done, fail) => {
-      video.addEventListener(event, () => done(), { once: true });
-      video.addEventListener('error', () => fail(new Error(`can't read ${video.src}`)), { once: true });
+      const late = setTimeout(() => fail(new Error(`${video.src} gave no ${event} in ${PATIENCE / 1000} s`)), PATIENCE);
+      video.addEventListener(event, () => (clearTimeout(late), done()), { once: true });
+      video.addEventListener('error', () => (clearTimeout(late), fail(new Error(`can't read ${video.src}`))), { once: true });
     });
   }
 

@@ -13,7 +13,7 @@ export type Settings = {
   sources: string[];
   startWithWindows: boolean;
   cap: number;
-  steamgriddb: string;
+  hasSgdbKey: boolean;
   hotkeys: Hotkey[];
   volumes: Record<string, number>;
   micDevice: string;
@@ -30,7 +30,6 @@ export type Settings = {
   auto: string[];
   autoBefore: number;
   autoAfter: number;
-  gsiToken: string;
 };
 
 export type AutoGame = { id: string; name: string; plays: string; missing: string | null };
@@ -156,7 +155,7 @@ export type Clip = {
 
 export type Game = { app: string; icon: string | null; clips: Clip[]; bytes: number };
 
-export type Track = { name: string; path: string };
+export type Track = { name: string; path: string; peaks: number[] };
 
 // a longer buffer goes to a hidden folder in the clips folder instead of memory
 export const IN_MEMORY = 600;

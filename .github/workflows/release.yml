@@ -10,22 +10,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  windows:
+  build:
     if: github.actor == 'zeo'
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          persist-credentials: false
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: ${{ vars.ROT_INSTALLER_REPOSITORY }}
-          ref: ${{ vars.ROT_INSTALLER_REF }}
-          path: .rot-installer
-          ssh-key: ${{ secrets.ROT_INSTALLER_DEPLOY_KEY }}
           persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -46,6 +38,57 @@ jobs:
           if ($cargo -ne $version) { throw "tag $version does not match Cargo.toml $cargo" }
           if (-not (Select-String -Path CHANGELOG.md -Pattern "^## \[$([regex]::Escape($version))\]" -Quiet)) { throw "CHANGELOG.md has no $version entry" }
 
+      - name: Build clip
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "web build failed" }
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: clip
+          path: |
+            target/release/clip.exe
+            target/release/clip.pdb
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    needs: build
+    if: github.actor == 'zeo'
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Check the installer ref is a commit
+        shell: pwsh
+        env:
+          REF: ${{ vars.ROT_INSTALLER_REF }}
+        run: |
+          if ($env:REF -cnotmatch '^[0-9a-f]{40}$') { throw "ROT_INSTALLER_REF must be a full commit sha, not '$env:REF'" }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ vars.ROT_INSTALLER_REPOSITORY }}
+          ref: ${{ vars.ROT_INSTALLER_REF }}
+          path: .rot-installer
+          ssh-key: ${{ secrets.ROT_INSTALLER_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: stable
+
       - name: Extract release notes
         shell: pwsh
         run: |
@@ -63,15 +106,10 @@ jobs:
           cargo build --release --locked --manifest-path .rot-installer\Cargo.toml --bin rot-installer --bin rot-pack
           if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
 
-      - name: Build clip
-        shell: pwsh
-        run: |
-          npm ci
-          if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
-          npm run build
-          if ($LASTEXITCODE -ne 0) { throw "web build failed" }
-          cargo build --release --locked
-          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: clip
+          path: built
 
       - name: Package for the rot installer
         shell: pwsh
@@ -84,7 +122,8 @@ jobs:
           $installer = '.rot-installer\target\release\rot-installer.exe'
           function Invoke-Pack { & $pack @args; if ($LASTEXITCODE -ne 0) { throw "rot-pack $($args[0]) failed" } }
           New-Item -ItemType Directory -Force dist\clip, release | Out-Null
-          Copy-Item target\release\clip.exe dist\clip\
+          Copy-Item built\clip.exe dist\clip\
+          Copy-Item built\clip.pdb "release\clip-$version.pdb"
           $package = "release\clip-$version-windows-x86_64.rpack"
           Invoke-Pack pack dist\clip $package --app clip --version $version
           Invoke-Pack sign $package "$package.minisig"

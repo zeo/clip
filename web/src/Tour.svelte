@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { dialog, invoke } from './host';
+  import { invoke } from './host';
   import Bind from './Bind.svelte';
   import { ACTIONS, bufferCost, does, length, type Mic, type Settings } from './types';
 
@@ -30,8 +30,8 @@
   });
 
   async function pickFolder() {
-    const picked = await dialog.open({ directory: true, defaultPath: draft!.folder });
-    if (typeof picked === 'string') draft!.folder = picked;
+    const picked = await invoke<string | null>('pick_folder', { from: draft!.folder });
+    if (picked) draft!.folder = picked;
   }
 
   // skipping applies what clip started with, which writes the settings file so the tour stays away next time

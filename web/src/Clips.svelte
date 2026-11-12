@@ -3,7 +3,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import Thumb from './Thumb.svelte';
   import { at, clock, day, size, title, type Clip, type Query } from './types';
-  import { cards, discard, reduced, say, view } from './view.svelte';
+  import { cards, discard, reduced, say, star, view } from './view.svelte';
 
   let {
     clips: listed,
@@ -17,8 +17,9 @@
   // the one clip in the tab order, the first until another takes focus
   let focused = $state<string | null>(null);
   const selected = new SvelteSet<string>();
-  // where a shift click's range starts
+  // where a shift click's range starts, and what the last range from there added
   let anchor: string | null = null;
+  let ranged: string[] = [];
   const columns: [string, Query['sort'] | null][] = [
     ['Name', 'name'],
     ['Game', 'game'],
@@ -51,25 +52,23 @@
   // clips are stamped when saved, so they began their length earlier
   const start = (clip: Clip) => clip.modified - (clip.kind === 'clip' ? clip.seconds * 1000 : 0);
 
-  async function act(command: string, args: Record<string, unknown>) {
-    try {
-      await invoke(command, args);
-    } catch (e) {
-      say(String(e), true);
-    }
-  }
-
   function pick(clip: Clip, range: boolean) {
     const from = anchor === null ? -1 : clips.findIndex((c) => c.path === anchor);
     const to = clips.indexOf(clip);
     if (range && from >= 0) {
-      for (const c of clips.slice(Math.min(from, to), Math.max(from, to) + 1)) selected.add(c.path);
-    } else if (selected.has(clip.path)) {
-      selected.delete(clip.path);
-    } else {
-      selected.add(clip.path);
+      // a range redrawn from the same start gives back what the last one took, as explorer does
+      for (const path of ranged) selected.delete(path);
+      ranged = clips
+        .slice(Math.min(from, to), Math.max(from, to) + 1)
+        .map((c) => c.path)
+        .filter((path) => !selected.has(path));
+      for (const path of ranged) selected.add(path);
+      return;
     }
+    if (selected.has(clip.path)) selected.delete(clip.path);
+    else selected.add(clip.path);
     anchor = clip.path;
+    ranged = [];
   }
 
   function copy(files: Clip[]) {
@@ -150,7 +149,10 @@
       const path = to();
       if (!path) return;
       move(path);
-      if (!e.shiftKey) return;
+      if (!e.shiftKey) {
+        [anchor, ranged] = [path, []];
+        return;
+      }
       anchor ??= clip.path;
       pick(clips.find((c) => c.path === path)!, true);
       return;
@@ -167,7 +169,7 @@
       e.preventDefault();
       pick(clip, e.shiftKey);
     } else if (e.key.toLowerCase() === 's' && !mod && !e.altKey) {
-      act('star', { paths: [clip.path], on: !clip.starred });
+      star([clip.path], !clip.starred);
     } else if (e.key === 'Delete' && !mod) {
       remove(picked.length > 0 ? picked : [clip]);
     }
@@ -314,7 +316,7 @@
               aria-hidden="true"
               onclick={(e) => {
                 e.stopPropagation();
-                act('star', { paths: [clip.path], on: !clip.starred });
+                star([clip.path], !clip.starred);
               }}
             >
               <svg viewBox="0 0 16 16"><path d="M8 1.6l1.9 4 4.3.5-3.2 3 .9 4.3L8 11.2l-3.9 2.2.9-4.3-3.2-3 4.3-.5z" /></svg>
@@ -330,7 +332,7 @@
     <span class="mono">{picked.length} selected, {size(picked.reduce((total, clip) => total + clip.bytes, 0))}</span>
     <span class="grow"></span>
     {#if picked.length < clips.length}<button class="gel" onclick={() => clips.forEach((clip) => selected.add(clip.path))}>Select all <kbd>Ctrl+A</kbd></button>{/if}
-    <button class="gel" onclick={() => act('star', { paths: picked.map((clip) => clip.path), on: !allStarred })}>
+    <button class="gel" onclick={() => star(picked.map((clip) => clip.path), !allStarred)}>
       {allStarred ? 'Unstar' : 'Star'}
     </button>
     <button class="gel" onclick={() => copy(picked)}>Copy <kbd>Ctrl+C</kbd></button>

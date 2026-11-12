@@ -267,6 +267,8 @@ struct Shared {
     damaged: Mutex<Vec<String>>,
     /// the last update check and the installer to update with
     update: Arc<Mutex<(Update, Option<update::Owner>)>>,
+    /// folders clip itself showed or found, the only new ones apply takes, since each opens to the window
+    offered: Mutex<Vec<PathBuf>>,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -291,9 +293,11 @@ pub fn run(restarted: bool) {
 fn serve(restarted: bool) -> Result<(), String> {
     // below normal, not background mode, which would also let windows page out the buffer
     let _ = unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) };
-    // a profile runs a separate clip beside the usual one, with its own settings and single instance
-    let suffix = match std::env::var("CLIP_PROFILE") {
-        Ok(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!("-{p}"),
+    // a profile runs a separate clip beside the usual one, with its own settings, single instance and clips
+    // folder; a debug build is dev unless told otherwise, and an empty profile is the usual clip
+    let profile = std::env::var("CLIP_PROFILE").ok().or_else(|| cfg!(debug_assertions).then(|| "dev".to_string()));
+    let suffix = match profile {
+        Some(p) if !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!("-{p}"),
         _ => String::new(),
     };
     // sfmg, once called clip, holds Clip for its install and library folders, run value and lt.rot.clip, and windows ignores case
@@ -395,7 +399,7 @@ fn start_up(app: &AppHandle, name: &str, identifier: &str, restarted: bool) -> R
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::create_dir_all(&cache);
     crate::log::open(&cache.join("clip.log"));
-    crate::crash::guard(&cache.join("crash.dmp"));
+    crate::crash::guard(&cache);
     // not the whole cache, which holds crash dumps and the log
     for part in ["thumbs", "art", "icons", "app-icons", "audio"] {
         app.files().allow(cache.join(part))?;
@@ -415,7 +419,7 @@ fn start_up(app: &AppHandle, name: &str, identifier: &str, restarted: bool) -> R
     let first = stored.is_none() && damaged.is_empty();
     let had = stored.is_some();
     let mut settings = stored.unwrap_or_default();
-    let default_folder = ceri::dirs::videos().ok_or("there's no videos folder")?.join("clip-recorder");
+    let default_folder = ceri::dirs::videos().ok_or("there's no videos folder")?.join(name);
     if settings.folder.as_os_str().is_empty() {
         settings.folder = default_folder.clone();
     }
@@ -529,6 +533,7 @@ fn start_up(app: &AppHandle, name: &str, identifier: &str, restarted: bool) -> R
         deaf,
         damaged: Mutex::new(damaged),
         update,
+        offered: Mutex::default(),
     });
     if !restarted && (first || open_on_start) {
         show(app);
@@ -660,9 +665,10 @@ fn commands(app: ceri::App) -> ceri::App {
         .blocking_json_command("damaged", ceri::command!(|| damaged(shared()?)))
         .blocking_json_command("log_folder", ceri::command!(|| log_folder(shared()?)))
         .blocking_json_command("system_info", ceri::command!(|| system_info(shared()?)))
+        .blocking_json_command("test_encoders", ceri::command!(|| test_encoders()))
         .blocking_json_command("update_state", ceri::command!(|| update_state(shared()?)))
         .blocking_json_command("install_update", ceri::command!(|| install_update(handle(), shared()?)))
-        .blocking_json_command("apply", ceri::command!(|settings: Settings| apply(handle(), shared()?, settings)))
+        .blocking_json_command("apply", ceri::command!(|settings: Settings, sgdb: Option<String>| apply(handle(), shared()?, settings, sgdb)))
         .blocking_json_command("clips", ceri::command!(|| clips(shared()?)))
         .blocking_json_command("save_clip", ceri::command!(|| save_clip(shared()?)))
         .blocking_json_command("mark_clip", ceri::command!(|| mark_clip(shared()?)))
@@ -740,7 +746,11 @@ fn commands(app: ceri::App) -> ceri::App {
         .blocking_json_command("mic_level", ceri::command!(|device: String| mic_level(device)))
         .blocking_json_command("test_notification", ceri::command!(|| test_notification(shared()?)))
         .blocking_json_command("disk", ceri::command!(|folder: PathBuf| disk(folder)))
-        .blocking_json_command("other_folders", ceri::command!(|| other_folders()))
+        .blocking_json_command("other_folders", ceri::command!(|| other_folders(shared()?)))
+        .blocking_json_command(
+            "pick_folder",
+            ceri::command!(|call, from: Option<PathBuf>| pick_folder(&call.window, shared()?, from)),
+        )
         .blocking_json_command(
             "import_folder",
             ceri::command!(|source: PathBuf| import_folder(handle(), shared()?, source)),
@@ -799,13 +809,13 @@ struct Pending {
 impl Pending {
     fn mark(&mut self, at: i64, now: Instant) {
         self.marks.push(at);
-        self.due = due(self.first, now, Duration::from_secs(self.recording.session.buffer as u64));
+        self.due = due(self.first, now, Duration::from_secs(self.recording.session.buffer() as u64));
     }
 
     /// How much the clip keeps: all of a buffer in memory, or of one on disk from a minute before
     /// the first mark, which spares writing out hours for one moment.
     fn seconds(&self) -> Option<u32> {
-        (self.recording.session.buffer > IN_MEMORY).then(|| self.first.elapsed().as_secs() as u32 + 60)
+        (self.recording.session.buffer() > IN_MEMORY).then(|| self.first.elapsed().as_secs() as u32 + 60)
     }
 }
 
@@ -893,7 +903,10 @@ fn record(
         let settings = settings.lock().expect("settings poisoned");
         focus::focused(&settings.record, &settings.ignore)
     };
+    // the reason the buffer is short that the status last showed, which a failing drive changes
+    let told = RefCell::new(None);
     let report = |recording: &Result<Rc<Recording>, String>| {
+        *told.borrow_mut() = recording.as_ref().ok().and_then(|recording| recording.session.short());
         let hotkeys = bound.borrow().clone();
         let taken = if hotkeys.iter().any(|bound| bound.taken) { ", a hotkey is taken by another app" } else { "" };
         let (mic_muted, taping) = (crate::audio::MIC_MUTED.load(Ordering::Relaxed), taping_since.get());
@@ -912,11 +925,10 @@ fn record(
                 exe: recording.exe.clone(),
                 message: format!(
                     "keeping the last {}{}{taken}",
-                    length(recording.session.buffer),
+                    length(recording.session.buffer()),
                     recording
                         .session
-                        .short
-                        .as_ref()
+                        .short()
                         .map_or(String::new(), |why| format!(", a longer buffer won't fit: {why}"))
                 ),
                 paused: false,
@@ -1040,7 +1052,10 @@ fn record(
             let settings = settings.lock().expect("settings poisoned");
             (settings.folder.clone(), settings.cap, settings.keep_days)
         };
-        library::settle(&folder);
+        for path in library::settle(&folder) {
+            crate::log::write(format!("rebuilt {} after clip stopped mid-recording", path.display()));
+            wrote(marks, marks_file, &path);
+        }
         Spool::clear(&spool(&folder));
         trim(&folder, &mut marks.lock().expect("marks poisoned"), marks_file, thumbs, cap, keep_days);
     }
@@ -1098,6 +1113,8 @@ fn record(
     let mut follow = Follow::default();
     let mut refused = None;
     let mut restart = true;
+    // when sessions that ended on their own were started again, at most three a minute
+    let mut revived: Vec<Instant> = Vec::new();
     loop {
         if restart {
             restart = false;
@@ -1126,6 +1143,19 @@ fn record(
             continue;
         }
         if msg.message == WM_TIMER {
+            if let Some((why, window)) = current.as_ref().ok().and_then(|r| Some((r.session.dead()?, r.window))) {
+                crate::log::write(format_args!("recording ended on its own: {why}"));
+                if revive(&mut revived, Instant::now()) {
+                    restart = true;
+                } else {
+                    current = Err(format!("{why}, recording stopped after starting again 3 times in a minute"));
+                    refused = Some(window);
+                    report(&current);
+                }
+            }
+            if current.as_ref().ok().and_then(|recording| recording.session.short()) != *told.borrow() {
+                report(&current);
+            }
             if let Some(mut running) = taping.take() {
                 let gone = running.recording.upgrade().is_none();
                 let left = (running.checked.elapsed() > Duration::from_secs(5)).then(|| {
@@ -1280,7 +1310,7 @@ fn record(
                     Ok(recording) => {
                         let marked = pending.as_ref().filter(|p| Rc::ptr_eq(&p.recording, recording));
                         // a buffer on disk rewinds its last part, the whole one can still be saved
-                        let seconds = (recording.session.buffer > IN_MEMORY).then_some(IN_MEMORY);
+                        let seconds = (recording.session.buffer() > IN_MEMORY).then_some(IN_MEMORY);
                         match keep(recording, marked.map_or(&[], |p| &p.marks), seconds, REWOUND) {
                             Ok((_, out)) => {
                                 show(app);
@@ -1353,6 +1383,16 @@ fn record(
             report(&current);
         }
     }
+}
+
+/// Whether a session that ended on its own starts again, which it does three times a minute at most.
+fn revive(revived: &mut Vec<Instant>, now: Instant) -> bool {
+    revived.retain(|&at| now.duration_since(at) < Duration::from_secs(60));
+    let again = revived.len() < 3;
+    if again {
+        revived.push(now);
+    }
+    again
 }
 
 /// Moves recording to `window`, leaving the app it was on recording for a while in case focus
@@ -1487,8 +1527,20 @@ fn run_at_login(name: &str, on: bool) -> windows::core::Result<()> {
     result.ok()
 }
 
-fn settings(shared: &Shared) -> Settings {
-    shared.settings.lock().expect("settings poisoned").clone()
+/// The settings as the window sees them, without the keys clip keeps to itself.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Shown {
+    #[serde(flatten)]
+    settings: Settings,
+    has_sgdb_key: bool,
+}
+
+fn settings(shared: &Shared) -> Shown {
+    let mut settings = shared.settings.lock().expect("settings poisoned").clone();
+    let has_sgdb_key = !std::mem::take(&mut settings.steamgriddb).is_empty();
+    settings.gsi_token.clear();
+    Shown { settings, has_sgdb_key }
 }
 
 fn status(shared: &Shared) -> Status {
@@ -1519,6 +1571,17 @@ fn system_info(shared: &Shared) -> Result<String, String> {
         false => format!("recording {summary}"),
     });
     Ok(lines.join("\n"))
+}
+
+/// The self test's lines: a short synthetic clip through each encoder this machine has, saved, cut and read back.
+fn test_encoders() -> Result<Vec<String>, String> {
+    blocking(|| {
+        let mut lines = Vec::new();
+        if let Err(e) = crate::self_test(|line| lines.push(line)) {
+            lines.push(e.message());
+        }
+        Ok(lines)
+    })
 }
 
 fn update_state(shared: &Shared) -> Update {
@@ -1574,7 +1637,20 @@ fn windows_build() -> String {
     format!("windows {} build {}.{ubr}", text(w!("DisplayVersion")), text(w!("CurrentBuild")))
 }
 
-fn apply(app: &AppHandle, shared: &Shared, mut settings: Settings) -> Result<(), String> {
+/// `sgdb` replaces the steamgriddb key, or clears it when empty; without it the key stays.
+fn apply(app: &AppHandle, shared: &Shared, mut settings: Settings, sgdb: Option<String>) -> Result<(), String> {
+    let (was, token, key) = {
+        let current = shared.settings.lock().expect("settings poisoned");
+        let offered = shared.offered.lock().expect("offered poisoned");
+        let known = |dir: &PathBuf| *dir == current.folder || current.sources.contains(dir) || offered.contains(dir);
+        if let Some(stranger) = std::iter::once(&settings.folder).chain(&settings.sources).find(|dir| !known(dir)) {
+            return Err(format!("{} wasn't picked in clip", stranger.display()));
+        }
+        (current.auto.clone(), current.gsi_token.clone(), current.steamgriddb.clone())
+    };
+    // the token is clip's own and the key stays out of the window, so neither comes back from it
+    settings.gsi_token = token;
+    settings.steamgriddb = sgdb.map_or(key, |k| k.trim().to_string());
     if settings.folder.as_os_str().is_empty() || !settings.folder.is_absolute() {
         return Err("pick a folder for clips".into());
     }
@@ -1590,12 +1666,6 @@ fn apply(app: &AppHandle, shared: &Shared, mut settings: Settings) -> Result<(),
     if !(5..=60).contains(&settings.auto_before) || settings.auto_after > 30 {
         return Err("auto clips keep 5 to 60 seconds before a play and up to 30 after".into());
     }
-    let (was, token) = {
-        let current = shared.settings.lock().expect("settings poisoned");
-        (current.auto.clone(), current.gsi_token.clone())
-    };
-    // the token is clip's own, the window only carries it back
-    settings.gsi_token = token;
     let save = |settings: &Settings| {
         let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
         library::write_json(&shared.file, &json).map_err(|e| format!("can't save settings: {e}"))
@@ -1816,27 +1886,30 @@ struct Track {
     name: String,
     /// a wav file in the cache
     path: PathBuf,
+    /// the loudest sample of each of `PEAKS` equal stretches, from 0 to 1
+    peaks: Vec<f32>,
 }
+
+/// How many bars the editor draws a track's sound in.
+const PEAKS: usize = 800;
 
 /// Decodes every audio track of a clip to its own wav, since the webview only plays the first.
 fn track_audio(shared: &Shared, path: PathBuf) -> Result<Vec<Track>, String> {
     listed(shared, &path)?;
     let audio = shared.cache.join("audio");
     blocking(move || {
-        let tracks = crate::export::tracks(&path)?;
         // only the clip open now keeps its decoded audio
         let _ = std::fs::remove_dir_all(&audio);
         std::fs::create_dir_all(&audio).map_err(|e| e.to_string())?;
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-        tracks
-            .into_iter()
-            .enumerate()
-            .map(|(i, (name, pcm))| {
-                let wav = audio.join(format!("{stem} {i}.wav"));
-                crate::export::write_wav(&wav, &pcm).map_err(|e| e.to_string())?;
-                Ok(Track { name, path: wav })
-            })
-            .collect()
+        let mut tracks = Vec::new();
+        crate::export::each_track(&path, |name, pcm| {
+            let wav = audio.join(format!("{stem} {}.wav", tracks.len()));
+            crate::export::write_wav(&wav, &pcm).map_err(|e| e.to_string())?;
+            tracks.push(Track { name, path: wav, peaks: crate::export::peaks(&pcm, PEAKS) });
+            Ok(())
+        })?;
+        Ok(tracks)
     })
 }
 
@@ -2152,15 +2225,27 @@ fn listed(shared: &Shared, path: &Path) -> Result<(), String> {
 }
 
 fn in_folder(shared: &Shared, path: &Path, kinds: &[&str], sources: bool) -> Result<(), String> {
-    let settings = shared.settings.lock().expect("settings poisoned");
-    let parent = path.parent();
-    let under =
-        |root: &PathBuf| parent == Some(root.as_path()) || parent.and_then(Path::parent) == Some(root.as_path());
+    let (folder, others) = {
+        let settings = shared.settings.lock().expect("settings poisoned");
+        (settings.folder.clone(), settings.sources.clone())
+    };
+    within(&folder, &others, path, kinds, sources)
+}
+
+fn within(folder: &Path, others: &[PathBuf], path: &Path, kinds: &[&str], sources: bool) -> Result<(), String> {
+    // the real paths, so a link or a differently cased root can't stand in for one inside
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let file = real(path);
+    let parent = file.parent();
+    let under = |root: &Path| {
+        let root = real(root);
+        parent == Some(&*root) || parent.and_then(Path::parent) == Some(&*root)
+    };
     let shown = !path.components().any(|part| part == Component::ParentDir)
-        && path.extension().is_some_and(|e| kinds.iter().any(|kind| e.eq_ignore_ascii_case(kind)))
-        && path.is_file();
-    let theirs = settings.sources.iter().any(under);
-    if shown && (under(&settings.folder) || sources && theirs) {
+        && file.extension().is_some_and(|e| kinds.iter().any(|kind| e.eq_ignore_ascii_case(kind)))
+        && file.is_file();
+    let theirs = others.iter().any(|root| under(root));
+    if shown && (under(folder) || sources && theirs) {
         Ok(())
     } else if shown && theirs {
         Err(format!("{} is in another app's folder, clip only reads it", path.display()))
@@ -2184,7 +2269,7 @@ struct Found {
 }
 
 /// The folders other clipping apps save to by default that this pc has.
-fn other_folders() -> Vec<Found> {
+fn other_folders(shared: &Shared) -> Vec<Found> {
     let (videos, documents) = (ceri::dirs::videos().unwrap_or_default(), ceri::dirs::documents().unwrap_or_default());
     let medal =
         [PathBuf::from(r"C:\Medal\Clips"), PathBuf::from(r"C:\Medal"), videos.join("Medal"), documents.join("Medal")];
@@ -2197,7 +2282,17 @@ fn other_folders() -> Vec<Found> {
     ]
     .into_iter()
     .filter_map(|(name, path)| Some(Found { name, path: path.filter(real)? }))
+    .inspect(|found| shared.offered.lock().expect("offered poisoned").push(found.path.clone()))
     .collect()
+}
+
+/// A folder picked in windows' own dialog, which apply then takes.
+fn pick_folder(window: &str, shared: &Shared, from: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    let owner = handle().windows().and_then(|windows| windows.state(window)).and_then(|state| state.handle);
+    let dialog = ceri::FileDialog { default_path: from, owner, ..ceri::FileDialog::default() };
+    let Some(picked) = dialog.open_folders()?.and_then(|mut picked| picked.pop()) else { return Ok(None) };
+    shared.offered.lock().expect("offered poisoned").push(picked.clone());
+    Ok(Some(picked))
 }
 
 /// Copies the clips and images of one of the other folders into the clips folder, sending
@@ -2293,6 +2388,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_clip_counts_by_where_it_really_is() {
+        let base = std::env::temp_dir().join(format!("clip-within-{}", std::process::id()));
+        let (folder, outside) = (base.join("clips"), base.join("outside"));
+        std::fs::create_dir_all(folder.join("game")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for file in [folder.join("game").join("a.mp4"), folder.join("a.exe"), outside.join("b.mp4")] {
+            std::fs::write(file, "").unwrap();
+        }
+        let made =
+            Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(folder.join("link")).arg(&outside).output();
+        assert!(made.unwrap().status.success());
+        let cased = PathBuf::from(folder.to_string_lossy().to_uppercase());
+        let mp4 = ["mp4"];
+        assert!(within(&cased, &[], &folder.join("game").join("a.mp4"), &mp4, false).is_ok());
+        assert!(within(&folder, &[], &folder.join("a.exe"), &mp4, false).is_err());
+        assert!(within(&folder, &[], &folder.join("link").join("b.mp4"), &mp4, false).is_err());
+        assert!(within(&folder, &[], &folder.join("game").join("..").join("game").join("a.mp4"), &mp4, false).is_err());
+        assert!(within(&folder, std::slice::from_ref(&outside), &outside.join("b.mp4"), &mp4, false).is_err());
+        assert!(within(&folder, std::slice::from_ref(&outside), &outside.join("b.mp4"), &mp4, true).is_ok());
+        std::fs::remove_dir(folder.join("link")).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn unescape_reads_what_encode_uri_component_writes() {
         assert_eq!(unescape("D%3A%5Cclips%5Cpython%20%C3%A9.mp4").as_deref(), Some(r"D:\clips\python é.mp4"));
         assert_eq!(unescape("50%"), None);
@@ -2315,6 +2434,58 @@ mod tests {
         assert_eq!(due(first, first + 20 * s, buffer), first + 28 * s);
         assert_eq!(due(first, first + 29 * s, buffer), first + 29 * s);
         assert_eq!(due(first, first, 10 * s), first + 5 * s);
+    }
+
+    #[test]
+    fn a_recording_that_keeps_dying_starts_again_three_times_a_minute() {
+        let (start, s) = (Instant::now(), Duration::from_secs(1));
+        let mut revived = Vec::new();
+        assert!([0, 10, 20].iter().all(|&at| revive(&mut revived, start + at * s)));
+        assert!(!revive(&mut revived, start + 30 * s));
+        assert!(revive(&mut revived, start + 61 * s), "the first one is a minute old");
+        assert!(!revive(&mut revived, start + 62 * s));
+    }
+
+    #[test]
+    fn older_settings_keep_the_defaults_for_what_they_miss_and_drop_what_clip_no_longer_knows() {
+        let old = r#"{"buffer": 120, "noticeCorner": "middle", "gone": 1,
+            "hotkeys": [{"action": "save", "mods": 1, "key": 120}, {"action": "teleport", "key": 1}]}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        let default = Settings::default();
+        assert_eq!(settings.buffer, 120);
+        assert_eq!(settings.fps, default.fps);
+        assert!(settings.notice_corner == notice::Corner::TopRight);
+        assert!(settings.hotkeys == [Hotkey { action: Action::Save, mods: 1, key: 120, seconds: 0 }]);
+        assert!(serde_json::from_str::<Settings>("{}").unwrap() == default);
+    }
+
+    #[test]
+    fn a_replace_keeps_the_original_beside_it_with_the_clip_s_date() {
+        let dir = std::env::temp_dir().join(format!("clip-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (clip, trimmed) = (dir.join("a.mp4"), dir.join("a trimmed.mp4"));
+        std::fs::write(&clip, "whole").unwrap();
+        let date = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(&clip).unwrap().set_modified(date).unwrap();
+        std::fs::write(&trimmed, "cut").unwrap();
+        take_place(&clip, &trimmed).unwrap();
+        assert_eq!(std::fs::read_to_string(&clip).unwrap(), "cut");
+        assert_eq!(std::fs::read_to_string(clip.with_extension("mp4.orig")).unwrap(), "whole");
+        assert_eq!(std::fs::metadata(&clip).unwrap().modified().unwrap(), date);
+        assert!(!trimmed.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_replace_that_can_t_land_puts_the_clip_back() {
+        let dir = std::env::temp_dir().join(format!("clip-replace-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("a.mp4");
+        std::fs::write(&clip, "whole").unwrap();
+        assert!(take_place(&clip, &dir.join("missing.mp4")).is_err());
+        assert_eq!(std::fs::read_to_string(&clip).unwrap(), "whole");
+        assert!(!clip.with_extension("mp4.orig").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

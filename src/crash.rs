@@ -10,6 +10,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
 };
 use windows::Win32::System::Diagnostics::Debug::{
+    MiniDumpWithHandleData, MiniDumpWithIndirectlyReferencedMemory, MiniDumpWithProcessThreadData,
     MiniDumpWithThreadInfo, MiniDumpWithUnloadedModules, MiniDumpWriteDump, SetUnhandledExceptionFilter,
     EXCEPTION_EXECUTE_HANDLER, EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION,
 };
@@ -27,15 +28,35 @@ static DUMP: OnceLock<HSTRING> = OnceLock::new();
 static RELAUNCH: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
-/// Writes a crash to `dump` and starts clip again in its place.
-pub fn guard(dump: &Path) {
-    let _ = DUMP.set(HSTRING::from(dump));
+/// The crash dumps kept in the cache, this run's included.
+const KEPT: usize = 3;
+
+/// Writes a crash to a dump in `dir` named after when this run started, and starts clip again in its place.
+pub fn guard(dir: &Path) {
+    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let _ = DUMP.set(HSTRING::from(&*dir.join(format!("crash-{started}.dmp"))));
+    prune(dir, KEPT - 1);
     if let Ok(exe) = std::env::current_exe() {
         let line = format!("\"{}\" {RESTARTED} {}", exe.display(), std::process::id());
         *RELAUNCH.lock().expect("relaunch poisoned") = line.encode_utf16().chain([0]).collect();
     }
     STARTED.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
     unsafe { SetUnhandledExceptionFilter(Some(caught)) };
+}
+
+/// Deletes all but the newest `keep` dumps in `dir`.
+fn prune(dir: &Path, keep: usize) {
+    let mut dumps: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".dmp"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    dumps.sort_unstable_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, old) in dumps.iter().skip(keep) {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 /// Waits for the clip that crashed to be gone, since it still holds the single instance.
@@ -60,7 +81,12 @@ unsafe extern "system" fn caught(info: *const EXCEPTION_POINTERS) -> i32 {
                 ClientPointers: false.into(),
             };
             unsafe {
-                let kind = MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules;
+                // the stacks, what they point into and the open handles; full memory would run to gigabytes
+                let kind = MiniDumpWithThreadInfo
+                    | MiniDumpWithUnloadedModules
+                    | MiniDumpWithIndirectlyReferencedMemory
+                    | MiniDumpWithHandleData
+                    | MiniDumpWithProcessThreadData;
                 let _ = MiniDumpWriteDump(
                     GetCurrentProcess(),
                     GetCurrentProcessId(),
@@ -105,4 +131,27 @@ unsafe extern "system" fn caught(info: *const EXCEPTION_POINTERS) -> i32 {
         }
     }
     EXCEPTION_EXECUTE_HANDLER
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_keeps_the_newest_dumps_and_leaves_the_log() {
+        let dir = std::env::temp_dir().join(format!("clip-dumps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = ["crash.dmp", "crash-1.dmp", "crash-2.dmp", "crash-3.dmp"];
+        for name in names {
+            std::fs::write(dir.join(name), name).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::fs::write(dir.join("clip.log"), "").unwrap();
+        prune(&dir, 2);
+        let mut left: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["clip.log", "crash-2.dmp", "crash-3.dmp"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

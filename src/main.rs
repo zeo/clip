@@ -23,7 +23,7 @@ mod update;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::core::{Interface, Result, BOOL, HSTRING};
@@ -41,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWi
 use capture::Target;
 use encode::{Codec, Format};
 use hdr::Display;
-use ring::{Clock, Ring, Spool, IN_MEMORY, SECOND};
+use ring::{Clock, Keep, Ring, Spool, IN_MEMORY, SECOND};
 
 const USAGE: &str = "\
 clip capture [--monitor N | --window TEXT] [--buffer SECONDS] [--for SECONDS]
@@ -71,10 +71,12 @@ fn main() {
             Some("sync") => sync::run(&args[1..]),
             Some("encoders") => list_encoders().map_err(|e| e.to_string()),
             Some("uninstall") => app::uninstall(),
-            Some("self-test") => self_test().map_err(|e| e.to_string()).and_then(|()| match args.get(1) {
-                Some(live) if live == "--live" => sync::run(&args[2..]),
-                _ => Ok(()),
-            }),
+            Some("self-test") => {
+                self_test(|line| println!("{line}")).map_err(|e| e.to_string()).and_then(|()| match args.get(1) {
+                    Some(live) if live == "--live" => sync::run(&args[2..]),
+                    _ => Ok(()),
+                })
+            }
             _ => Err(USAGE.into()),
         });
     if let Err(message) = result {
@@ -228,8 +230,9 @@ pub struct Session {
     /// the encoder is the software one
     pub on_cpu: bool,
     /// seconds the rings keep, and why that's less than asked for
-    pub buffer: u32,
-    pub short: Option<String>,
+    buffer: u32,
+    short: Option<String>,
+    spool: Option<Spool>,
     format: Format,
     mastering: Option<hdr::Mastering>,
     names: Vec<String>,
@@ -238,6 +241,8 @@ pub struct Session {
     stop: Arc<AtomicBool>,
     shots: capture::Shots,
     video: Option<std::thread::JoinHandle<Result<()>>>,
+    /// why capture ended, when it ended on an error
+    died: Arc<OnceLock<String>>,
     sound: Option<audio::Recording>,
 }
 
@@ -254,28 +259,35 @@ impl Session {
         let spool = spool.and_then(std::result::Result::ok);
         let span = buffer as i64 * SECOND;
         let make = |name: &str| match &spool {
-            Some(spool) => Ring::spooled(span, spool.clone(), name),
-            None => Ring::new(span),
+            Some(spool) => (Ring::new(span), Keep::spooled(spool.clone(), name)),
+            None => (Ring::new(span), Keep::memory()),
         };
-        let ring = Arc::new(Mutex::new(make("video")));
+        let (ring, keep) = make("video");
+        let ring = Arc::new(Mutex::new(ring));
         let stop = Arc::new(AtomicBool::new(false));
         let shots = capture::Shots::default();
         let (opened, ready) = std::sync::mpsc::sync_channel(1);
+        let died = Arc::new(OnceLock::new());
         let video = {
-            let (options, ring, stop, shots) = (options.clone(), ring.clone(), stop.clone(), shots.clone());
+            let (options, ring, stop, shots, died) =
+                (options.clone(), ring.clone(), stop.clone(), shots.clone(), died.clone());
             std::thread::spawn(move || -> Result<()> {
                 unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
-                match prepare(&options, target) {
+                let recorded = match prepare(&options, target) {
                     Ok((source, pipeline, encoder, format, mastering, summary, on_cpu)) => {
                         let clock = Clock::start();
                         let _ = opened.send(Ok((format, mastering, summary, on_cpu, clock)));
-                        capture::record(source, pipeline, encoder, format, clock, &ring, &stop, &shots)
+                        capture::record(source, pipeline, encoder, format, clock, &ring, keep, &stop, &shots)
                     }
                     Err(message) => {
                         let _ = opened.send(Err(message));
                         Ok(())
                     }
+                };
+                if let Err(e) = &recorded {
+                    let _ = died.set(e.to_string());
                 }
+                recorded
             })
         };
         let (format, mastering, summary, on_cpu, clock) = match ready.recv() {
@@ -299,6 +311,7 @@ impl Session {
             on_cpu,
             buffer,
             short,
+            spool,
             format,
             mastering,
             names: lanes.iter().map(|lane| lane.name.clone()).collect(),
@@ -307,8 +320,35 @@ impl Session {
             stop,
             shots,
             video: Some(video),
+            died,
             sound: Some(sound),
         })
+    }
+
+    /// Seconds the rings keep, which drops to what memory holds once the long buffer's drive fails.
+    pub fn buffer(&self) -> u32 {
+        match self.spool.as_ref().and_then(Spool::failed) {
+            Some(_) => self.buffer.min(IN_MEMORY),
+            None => self.buffer,
+        }
+    }
+
+    /// Why recording stopped on its own, once the capture or the audio thread ended without being asked to.
+    pub fn dead(&self) -> Option<String> {
+        if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let video = self.video.as_ref().is_some_and(std::thread::JoinHandle::is_finished).then(|| {
+            let why = self.died.get().map_or("the capture thread panicked", String::as_str);
+            format!("recording failed: {why}")
+        });
+        video.or_else(|| self.sound.as_ref()?.dead().map(|why| format!("audio failed: {why}")))
+    }
+
+    /// Why the rings keep less than asked for.
+    pub fn short(&self) -> Option<String> {
+        let failed = self.spool.as_ref().and_then(Spool::failed);
+        self.short.clone().or_else(|| failed.map(|why| format!("its drive failed ({why})")))
     }
 
     /// Writes what the rings hold right now to `out`, or only about the last `seconds` of it, from
@@ -350,8 +390,9 @@ impl Session {
                 .ok_or("nothing is recorded yet")?
         };
         let first = first.load().map_err(|e| format!("can't read the buffer back: {e}"))?;
-        let writer = save::Writer::open(out, &first, self.format, self.rings.len())
+        let writer = save::Writer::open(out, &first, self.format, self.rings.len(), true)
             .map_err(|e| format!("can't start the recording: {e}"))?;
+        writer.keep(&self.names, self.mastering);
         Ok(Tape {
             writer,
             ring: self.ring.clone(),
@@ -535,8 +576,13 @@ pub fn machine() -> Result<Vec<String>> {
 
 /// Runs synthetic frames through every stage after capture, on each encoder this machine has,
 /// with two synthetic audio lanes, and reads the saved file back. Covers sdr, hdr tonemapped to sdr, and hdr10,
-/// each switching hdr on or off halfway.
-fn self_test() -> Result<()> {
+/// each switching hdr on or off halfway. Each result goes to `say` as a line.
+fn self_test(mut say: impl FnMut(String)) -> Result<()> {
+    macro_rules! say {
+        ($($line:tt)*) => {
+            say(format!($($line)*))
+        };
+    }
     let gpu = capture::gpu()?;
     let dir = std::env::temp_dir().join(format!("clip-self-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
@@ -545,24 +591,24 @@ fn self_test() -> Result<()> {
         windows::core::Interface::cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>(&gpu.device)?
             .GetGPUThreadPriority()?
     } {
-        capture::GPU_PRIORITY => println!("ok   gpu priority: {}", capture::GPU_PRIORITY),
+        capture::GPU_PRIORITY => say!("ok   gpu priority: {}", capture::GPU_PRIORITY),
         other => {
             failures += 1;
-            println!("FAIL gpu priority: {other}, asked for {}", capture::GPU_PRIORITY)
+            say!("FAIL gpu priority: {other}, asked for {}", capture::GPU_PRIORITY)
         }
     }
     match check_transfer(&gpu) {
-        Ok(report) => println!("ok   transfer: {report}"),
+        Ok(report) => say!("ok   transfer: {report}"),
         Err(e) => {
             failures += 1;
-            println!("FAIL transfer: {}", e.message())
+            say!("FAIL transfer: {}", e.message())
         }
     }
     match check_scale(&gpu) {
-        Ok(report) => println!("ok   scale: {report}"),
+        Ok(report) => say!("ok   scale: {report}"),
         Err(e) => {
             failures += 1;
-            println!("FAIL scale: {}", e.message())
+            say!("FAIL scale: {}", e.message())
         }
     }
     let lanes = [tone(440.0).map_err(at("audio lane"))?, tone(660.0).map_err(at("audio lane"))?];
@@ -573,7 +619,7 @@ fn self_test() -> Result<()> {
         let frames = 2 * format.fps as i64;
         let choices = encode::encoders(codec, Some(gpu.adapter))?;
         if choices.is_empty() {
-            println!("skip {case}: no {codec:?} encoder");
+            say!("skip {case}: no {codec:?} encoder");
         }
         for choice in choices {
             let kind = if choice.hardware { "hardware" } else { "software" };
@@ -587,7 +633,7 @@ fn self_test() -> Result<()> {
                 // the long buffer's files, so the clip comes back from disk
                 let spool =
                     Spool::open(&dir.join(".buffer"), 0).map_err(|e| windows::core::Error::new(E_SELF_TEST, e))?;
-                let mut ring = Ring::spooled(10 * SECOND, spool, &format!("{case}-{kind}"));
+                let (mut ring, mut keep) = (Ring::new(10 * SECOND), Keep::spooled(spool, &format!("{case}-{kind}")));
                 // halfway through, the display switches hdr on or off
                 let switched = if hdr { SDR_DISPLAY } else { TEST_DISPLAY };
                 for i in 0..frames {
@@ -601,9 +647,9 @@ fn self_test() -> Result<()> {
                         .encode(&frame, format.time(i))
                         .map_err(at("encode"))?
                         .into_iter()
-                        .for_each(|p| ring.push(p));
+                        .for_each(|p| ring.push(keep.hold(p)));
                 }
-                encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(p));
+                encoder.finish().map_err(at("drain"))?.into_iter().for_each(|p| ring.push(keep.hold(p)));
                 let mastering = matches!(codec, Codec::Hdr10).then_some(TEST_PANEL);
                 let lanes: Vec<Vec<ring::Held>> =
                     lanes.iter().map(|lane| lane.iter().cloned().map(ring::Held::from).collect()).collect();
@@ -626,11 +672,11 @@ fn self_test() -> Result<()> {
                         && on_time(onset) =>
                 {
                     let packets: Vec<u32> = sound.iter().map(|s| s.0).collect();
-                    println!("ok   {case} {kind} {}: {count} frames, aac packets {packets:?}", choice.name)
+                    say!("ok   {case} {kind} {}: {count} frames, aac packets {packets:?}", choice.name)
                 }
                 Ok((streams, onset)) => {
                     failures += 1;
-                    println!(
+                    say!(
                         "FAIL {case} {kind} {}: want {frames} frames, {} audio tracks and the tone at 1 s, got {streams:?}, tone at {onset:?}",
                         choice.name,
                         lanes.len()
@@ -638,7 +684,7 @@ fn self_test() -> Result<()> {
                 }
                 Err(e) => {
                     failures += 1;
-                    println!("FAIL {case} {kind} {}: {e}", choice.name)
+                    say!("FAIL {case} {kind} {}: {e}", choice.name)
                 }
             }
         }
@@ -691,28 +737,30 @@ fn self_test() -> Result<()> {
                     && *size <= budget
                     && rest.iter().all(|other| (other - level).abs() < 2.0 / 256.0) =>
             {
-                println!(
+                say!(
                     "ok   trim {case}: 30 frames from 0.5 s, mixed and kept audio, {size} bytes at 960x540, levels kept"
                 )
             }
             other => {
                 failures += 1;
-                println!("FAIL trim {case}: {other:?}")
+                say!("FAIL trim {case}: {other:?}")
             }
         }
     }
-    match check_tape(&gpu, &lanes, &dir) {
-        Ok(report) => println!("ok   tape: {report}"),
-        Err(e) => {
-            failures += 1;
-            println!("FAIL tape: {}", e.message())
+    for codec in [Codec::H264, Codec::Hdr10] {
+        match check_tape(&gpu, &lanes, &dir, codec) {
+            Ok(report) => say!("ok   tape {codec:?}: {report}"),
+            Err(e) => {
+                failures += 1;
+                say!("FAIL tape {codec:?}: {}", e.message())
+            }
         }
     }
     match check_png(&dir) {
-        Ok(report) => println!("ok   png: {report}"),
+        Ok(report) => say!("ok   png: {report}"),
         Err(e) => {
             failures += 1;
-            println!("FAIL png: {}", e.message())
+            say!("FAIL png: {}", e.message())
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -724,20 +772,27 @@ fn self_test() -> Result<()> {
 
 /// Feeds rings a few frames at a time while a tape pulls from them, the way a long recording runs,
 /// and checks the file holds every packet once.
-fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::path::Path) -> Result<String> {
+fn check_tape(
+    gpu: &capture::Gpu,
+    lanes: &[Vec<Arc<ring::Packet>>],
+    dir: &std::path::Path,
+    codec: Codec,
+) -> Result<String> {
     let fail = |what: String| windows::core::Error::new(E_SELF_TEST, what);
-    let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec: Codec::H264 };
-    let choice = encode::encoders(Codec::H264, Some(gpu.adapter))?
+    let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec };
+    let choice = encode::encoders(codec, Some(gpu.adapter))?
         .into_iter()
         .next()
-        .ok_or_else(|| fail("no h.264 encoder".into()))?;
-    let mut pipeline = capture::Pipeline::new(gpu, SDR_DISPLAY, format, hdr::Filter::Area).map_err(at("pipeline"))?;
+        .ok_or_else(|| fail(format!("no {codec:?} encoder")))?;
+    let hdr = codec == Codec::Hdr10;
+    let display = if hdr { TEST_DISPLAY } else { SDR_DISPLAY };
+    let mut pipeline = capture::Pipeline::new(gpu, display, format, hdr::Filter::Area).map_err(at("pipeline"))?;
     let mut encoder =
         encode::Encoder::open(&choice, &gpu.device, format, encode::Purpose::Capture).map_err(at("open"))?;
     let mut video = Vec::new();
     let frames = 3 * format.fps as i64;
     for i in 0..frames {
-        let source = pattern(&gpu.device, 800, 600, i as u32, false).map_err(at("pattern"))?;
+        let source = pattern(&gpu.device, 800, 600, i as u32, hdr).map_err(at("pattern"))?;
         let frame = pipeline.convert(&source, (800, 600), format.fps).map_err(at("convert"))?;
         video.extend(encoder.encode(&frame, format.time(i)).map_err(at("encode"))?);
     }
@@ -745,7 +800,7 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     // a short ring, so the tape has to keep up for nothing to fall out of it
     let ring = Arc::new(Mutex::new(Ring::new(SECOND)));
     let rings: Vec<_> = lanes.iter().map(|_| Arc::new(Mutex::new(Ring::new(SECOND)))).collect();
-    let path = dir.join("tape.mp4");
+    let path = dir.join(format!("tape-{codec:?}.mp4"));
     let mut sent = vec![0; lanes.len()];
     let mut feed = |upto: usize| {
         let mut ring = ring.lock().expect("ring poisoned");
@@ -767,12 +822,16 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     let first = ring.lock().expect("ring poisoned").since(i64::MIN)[0]
         .load()
         .map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
+    let names: Vec<String> = vec!["tone 440".into(), "tone 660".into()];
+    let mastering = hdr.then_some(TEST_PANEL);
+    let writer = save::Writer::open(&path, &first, format, rings.len(), true).map_err(at("open tape"))?;
+    writer.keep(&names, mastering);
     let mut tape = Tape {
-        writer: save::Writer::open(&path, &first, format, rings.len()).map_err(at("open tape"))?,
+        writer,
         ring: ring.clone(),
         rings: rings.clone(),
-        names: vec!["tone 440".into(), "tone 660".into()],
-        mastering: None,
+        names: names.clone(),
+        mastering,
         video: first.pts - 1,
         audio: vec![first.pts - 1; rings.len()],
         start: first.pts,
@@ -786,7 +845,31 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     while feed(8) {
         tape.pull().map_err(fail)?;
     }
+    // what a crash right now would leave, rebuilt the way the next start does
+    let crashed = dir.join(format!("crashed-{codec:?}.mp4"));
+    let mut partial = path.clone().into_os_string();
+    partial.push(library::PART);
+    // windows' writer reaches the disk a little behind, so the first fragments can still be on their way
+    let late = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        std::fs::copy(&partial, &crashed).map_err(|e| fail(format!("copy the unfinished tape: {e}")))?;
+        match save::recover(&crashed) {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < late => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(fail(format!("rebuild the unfinished tape: {e}"))),
+        }
+    }
+    let kept = read_back(&crashed).map_err(at("read back the unfinished tape"))?;
+    let probe = |path: &std::path::Path| save::probe(path).map_err(|e| fail(format!("probe {}: {e}", path.display())));
+    let recovered = probe(&crashed)?;
+    let named = recovered.tracks;
     let saved = tape.finish().map_err(fail)?;
+    // the screen an hdr10 recording was mastered on, after a crash and after a finish
+    let screens = [recovered.mastering, probe(&path)?.mastering];
+    let same = |m: Option<hdr::Mastering>| match (m, mastering) {
+        (Some(m), Some(want)) => (m.max - want.max).abs() < 0.01 && (m.average - want.average).abs() < 0.5,
+        (m, want) => m.is_none() && want.is_none(),
+    };
     let streams = read_back(&path).map_err(at("read back"))?;
     let end = format.time(frames - 1);
     let sound: Vec<usize> = lanes.iter().map(|lane| lane.iter().filter(|p| p.pts <= end).count()).collect();
@@ -795,11 +878,20 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
             if *count as i64 == frames
                 && saved.frames as i64 == frames
                 && *last == end
-                && heard.iter().map(|s| s.0 as usize).eq(sound.iter().copied()) =>
+                && heard.iter().map(|s| s.0 as usize).eq(sound.iter().copied())
+                && kept.len() == streams.len()
+                && kept.iter().all(|s| s.0 > 0)
+                && named == names
+                && screens.into_iter().all(same) =>
         {
-            Ok(format!("{count} frames and aac packets {sound:?} written in pulls, none twice or missing"))
+            let kept: Vec<u32> = kept.iter().map(|s| s.0).collect();
+            Ok(format!(
+                "{count} frames and aac packets {sound:?} written in pulls, none twice or missing; cut off before the end it keeps {kept:?} named {named:?}"
+            ))
         }
-        other => Err(fail(format!("want {frames} frames to {end} and aac packets {sound:?}, got {other:?}"))),
+        other => Err(fail(format!(
+            "want {frames} frames to {end} and aac packets {sound:?}, got {other:?}, and {kept:?} named {named:?} cut off before the end, screens {screens:?}"
+        ))),
     }
 }
 

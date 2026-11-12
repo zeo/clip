@@ -1,6 +1,6 @@
 [package]
 name = "clip"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.93"
 publish = false
@@ -75,4 +75,6 @@ ceri-build = { path = "../../hAugust/ceri/build" }
 [profile.release]
 codegen-units = 1
 lto = "thin"
-strip = "symbols"
+# the symbols go to clip.pdb beside the exe, attached to each release for reading crash dumps
+debug = "line-tables-only"
+strip = "none"
