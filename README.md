@@ -155,7 +155,7 @@ Needs Rust 1.93 or newer and Node 24. The exe lands in `target\release\clip.exe`
 - Auto clips are untested in a live match. The parsers are tested on saved posts shaped after Valve's game state integration and Riot's live client data documentation, not captured from the games.
 - The notice, screenshot key, mic mute and long recordings are untested with a real game, since that needs live capture. The notice is kept out of captures with `WDA_EXCLUDEFROMCAPTURE`, which needs Windows 10 2004 or later.
 - A screenshot waits up to 1.5 seconds for the game to draw a new frame. A game showing a still screen may draw none, and the notice says so.
-- A long recording's MP4 index is written when it stops, so a crash loses it.
+- A long recording in H.264 is written as fragments of about a quarter second, and the next start rebuilds a crashed one into a playable clip up to its last whole fragment, without its track names. An HDR10 long recording's index is still written only when it stops, so a crash loses it: Windows' fragmented MP4 writer refuses HEVC.
 - Other apps' folders are read one level deep: a folder inside one is a game, and folders below that are skipped. The Medal and NVIDIA App folders offered are their usual defaults, found by name only.
 - The NVIDIA App preset uses the keys guides most often give, and guides disagree.
 - Mastering values in HDR10 files are whatever the display driver reports.

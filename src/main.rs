@@ -390,7 +390,7 @@ impl Session {
                 .ok_or("nothing is recorded yet")?
         };
         let first = first.load().map_err(|e| format!("can't read the buffer back: {e}"))?;
-        let writer = save::Writer::open(out, &first, self.format, self.rings.len())
+        let writer = save::Writer::open(out, &first, self.format, self.rings.len(), true)
             .map_err(|e| format!("can't start the recording: {e}"))?;
         Ok(Tape {
             writer,
@@ -813,7 +813,7 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
         .load()
         .map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
     let mut tape = Tape {
-        writer: save::Writer::open(&path, &first, format, rings.len()).map_err(at("open tape"))?,
+        writer: save::Writer::open(&path, &first, format, rings.len(), true).map_err(at("open tape"))?,
         ring: ring.clone(),
         rings: rings.clone(),
         names: vec!["tone 440".into(), "tone 660".into()],
@@ -831,6 +831,13 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     while feed(8) {
         tape.pull().map_err(fail)?;
     }
+    // what a crash right now would leave, rebuilt the way the next start does
+    let crashed = dir.join("crashed.mp4");
+    let mut partial = path.clone().into_os_string();
+    partial.push(library::PART);
+    std::fs::copy(&partial, &crashed).map_err(|e| fail(format!("copy the unfinished tape: {e}")))?;
+    save::defragment(&crashed).map_err(|e| fail(format!("rebuild the unfinished tape: {e}")))?;
+    let kept = read_back(&crashed).map_err(at("read back the unfinished tape"))?;
     let saved = tape.finish().map_err(fail)?;
     let streams = read_back(&path).map_err(at("read back"))?;
     let end = format.time(frames - 1);
@@ -840,11 +847,18 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
             if *count as i64 == frames
                 && saved.frames as i64 == frames
                 && *last == end
-                && heard.iter().map(|s| s.0 as usize).eq(sound.iter().copied()) =>
+                && heard.iter().map(|s| s.0 as usize).eq(sound.iter().copied())
+                && kept.len() == streams.len()
+                && kept.iter().all(|s| s.0 > 0) =>
         {
-            Ok(format!("{count} frames and aac packets {sound:?} written in pulls, none twice or missing"))
+            let kept: Vec<u32> = kept.iter().map(|s| s.0).collect();
+            Ok(format!(
+                "{count} frames and aac packets {sound:?} written in pulls, none twice or missing; cut off before the end it keeps {kept:?}"
+            ))
         }
-        other => Err(fail(format!("want {frames} frames to {end} and aac packets {sound:?}, got {other:?}"))),
+        other => Err(fail(format!(
+            "want {frames} frames to {end} and aac packets {sound:?}, got {other:?}, and {kept:?} cut off before the end"
+        ))),
     }
 }
 

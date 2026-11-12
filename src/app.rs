@@ -983,7 +983,10 @@ fn record(
             let settings = settings.lock().expect("settings poisoned");
             (settings.folder.clone(), settings.cap, settings.keep_days)
         };
-        library::settle(&folder);
+        for path in library::settle(&folder) {
+            crate::log::write(format!("rebuilt {} after clip stopped mid-recording", path.display()));
+            wrote(marks, marks_file, &path);
+        }
         Spool::clear(&spool(&folder));
         trim(&folder, &mut marks.lock().expect("marks poisoned"), marks_file, thumbs, cap, keep_days);
     }

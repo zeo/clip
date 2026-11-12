@@ -27,6 +27,7 @@ dates are release-tag dates.
 - a debug build runs as the `dev` profile unless `CLIP_PROFILE` says otherwise (empty for none), and each profile's clips folder defaults to its own name, so a build from source leaves the installed clip's settings, single instance and clips alone
 - Settings > About has a Test encoders button that runs the same encode, mix and save checks as `clip self-test` and adds their lines to Copy system info
 - the release build runs without the signing key, which only reaches a separate signing job that runs for `v*` tags and builds the installer tools from a pinned commit
+- a long recording in H.264 survives a crash or power loss: it's written in fragments of about a quarter second, and the next start turns what was written whole into a playable clip (without its track names); HDR10 long recordings are still lost, since Windows' fragmented mp4 writer refuses HEVC
 
 ## [0.1.1] - 2026-11-11
 
