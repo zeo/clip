@@ -2,7 +2,7 @@
 
 dates are release-tag dates.
 
-## [Unreleased]
+## [0.1.3] - 2026-11-12
 
 ### fixes
 - HDR10 long recordings survive a crash too: clip writes their fragments itself, since Windows' fragmented mp4 writer refuses HEVC, and the next start turns them into a playable clip with its track names and HDR10 screen
