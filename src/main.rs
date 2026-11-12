@@ -835,8 +835,16 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     let crashed = dir.join("crashed.mp4");
     let mut partial = path.clone().into_os_string();
     partial.push(library::PART);
-    std::fs::copy(&partial, &crashed).map_err(|e| fail(format!("copy the unfinished tape: {e}")))?;
-    save::defragment(&crashed).map_err(|e| fail(format!("rebuild the unfinished tape: {e}")))?;
+    // windows' writer reaches the disk a little behind, so the first fragments can still be on their way
+    let late = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        std::fs::copy(&partial, &crashed).map_err(|e| fail(format!("copy the unfinished tape: {e}")))?;
+        match save::defragment(&crashed) {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < late => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(fail(format!("rebuild the unfinished tape: {e}"))),
+        }
+    }
     let kept = read_back(&crashed).map_err(at("read back the unfinished tape"))?;
     let saved = tape.finish().map_err(fail)?;
     let streams = read_back(&path).map_err(at("read back"))?;
