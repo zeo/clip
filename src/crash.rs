@@ -35,6 +35,17 @@ const KEPT: usize = 3;
 pub fn guard(dir: &Path) {
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let _ = DUMP.set(HSTRING::from(&*dir.join(format!("crash-{started}.dmp"))));
+    prune(dir, KEPT - 1);
+    if let Ok(exe) = std::env::current_exe() {
+        let line = format!("\"{}\" {RESTARTED} {}", exe.display(), std::process::id());
+        *RELAUNCH.lock().expect("relaunch poisoned") = line.encode_utf16().chain([0]).collect();
+    }
+    STARTED.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+    unsafe { SetUnhandledExceptionFilter(Some(caught)) };
+}
+
+/// Deletes all but the newest `keep` dumps in `dir`.
+fn prune(dir: &Path, keep: usize) {
     let mut dumps: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -42,16 +53,10 @@ pub fn guard(dir: &Path) {
         .filter(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".dmp"))
         .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
         .collect();
-    dumps.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    for (_, old) in dumps.iter().skip(KEPT - 1) {
+    dumps.sort_unstable_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, old) in dumps.iter().skip(keep) {
         let _ = std::fs::remove_file(old);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let line = format!("\"{}\" {RESTARTED} {}", exe.display(), std::process::id());
-        *RELAUNCH.lock().expect("relaunch poisoned") = line.encode_utf16().chain([0]).collect();
-    }
-    STARTED.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
-    unsafe { SetUnhandledExceptionFilter(Some(caught)) };
 }
 
 /// Waits for the clip that crashed to be gone, since it still holds the single instance.
@@ -126,4 +131,27 @@ unsafe extern "system" fn caught(info: *const EXCEPTION_POINTERS) -> i32 {
         }
     }
     EXCEPTION_EXECUTE_HANDLER
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_keeps_the_newest_dumps_and_leaves_the_log() {
+        let dir = std::env::temp_dir().join(format!("clip-dumps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = ["crash.dmp", "crash-1.dmp", "crash-2.dmp", "crash-3.dmp"];
+        for name in names {
+            std::fs::write(dir.join(name), name).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::fs::write(dir.join("clip.log"), "").unwrap();
+        prune(&dir, 2);
+        let mut left: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["clip.log", "crash-2.dmp", "crash-3.dmp"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
