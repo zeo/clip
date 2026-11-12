@@ -248,21 +248,26 @@
     if (was) document.querySelector<HTMLElement>(`.view [data-path="${CSS.escape(was)}"]`)?.focus();
   }
 
-  // a switch that failed to apply goes back to what's in effect
-  async function change(patch: Partial<Settings>, undo: () => void) {
-    if (!settings) return;
-    try {
-      await invoke('apply', { settings: { ...settings, ...patch } });
-    } catch (e) {
-      say(String(e), true);
-      undo();
-    }
-    await refresh();
+  let changing = Promise.resolve();
+
+  // switches apply one after another, each onto what the one before left, and one that failed to
+  // apply goes back to what's in effect
+  function change(patch: (now: Settings) => Partial<Settings>, undo: () => void) {
+    changing = changing.then(async () => {
+      if (!settings) return;
+      try {
+        await invoke('apply', { settings: { ...settings, ...patch(settings) } });
+      } catch (e) {
+        say(String(e), true);
+        undo();
+      }
+      await refresh();
+    });
   }
 
   function record(exe: string, box: HTMLInputElement) {
     const on = box.checked;
-    if (settings) change({ ignore: on ? settings.ignore.filter((e) => e !== exe) : [...settings.ignore, exe] }, () => (box.checked = !on));
+    change((now) => ({ ignore: on ? now.ignore.filter((e) => e !== exe) : [...now.ignore.filter((e) => e !== exe), exe] }), () => (box.checked = !on));
   }
 
   async function openQuick() {
@@ -397,7 +402,7 @@
                 const box = e.currentTarget;
                 const v = box.value;
                 const was = settings!.mic ? settings!.micDevice || 'default' : 'off';
-                change({ mic: v !== 'off', micDevice: v === 'off' ? settings!.micDevice : v === 'default' ? '' : v }, () => (box.value = was));
+                change((now) => ({ mic: v !== 'off', micDevice: v === 'off' ? now.micDevice : v === 'default' ? '' : v }), () => (box.value = was));
               }}
             >
               <option value="off">Off</option>

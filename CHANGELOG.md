@@ -10,6 +10,7 @@ dates are release-tag dates.
 - a clip whose tracks can't play in the editor exports with all of them instead of none
 - after a replace or its undo, the editor reads the new file's tracks instead of playing the old ones
 - a second replace inside the undo's 8 seconds no longer lets the first one's timer recycle the newer original
+- two quick switches in the top bar's menu (recording an app, the microphone) both stick instead of the second undoing the first
 
 ## [0.1.1] - 2026-11-11
 
