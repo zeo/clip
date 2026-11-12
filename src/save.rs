@@ -4,11 +4,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use windows::core::{Result, HSTRING};
+use windows::core::{Error, Result, GUID, HSTRING};
 use windows::Win32::Media::MediaFoundation::*;
 
 use crate::audio::Aac;
-use crate::encode::{describe, parameter_sets, Codec, Format};
+use crate::encode::{describe, is_hevc_parameter_set, nal_units, parameter_sets, Codec, Format};
 use crate::hdr::Mastering;
 use crate::ring::{load, Held, Packet};
 
@@ -49,7 +49,7 @@ pub fn write_held(
         .iter()
         .map(|lane| &lane[lane.partition_point(|p| p.pts < first.pts)..lane.partition_point(|p| p.pts < end)])
         .collect();
-    let writer = Writer::open(path, &*first.load().map_err(io)?, format, lanes.len(), false)?;
+    let mut writer = Writer::open(path, &*first.load().map_err(io)?, format, lanes.len(), false)?;
     let mut stretches = packets.chunks(STRETCH).peekable();
     while let Some(stretch) = stretches.next() {
         // sound only up to the stretch's newest frame, the rest goes with the next one
@@ -76,121 +76,332 @@ const STRETCH: usize = 600;
 const E_RENAME: windows::core::HRESULT = windows::core::HRESULT(0x8007_0050_u32 as i32);
 const E_LABEL: windows::core::HRESULT = windows::core::HRESULT(0x8007_000D_u32 as i32);
 const E_READ: windows::core::HRESULT = windows::core::HRESULT(0x8007_001E_u32 as i32);
+const E_WRITE: windows::core::HRESULT = windows::core::HRESULT(0x8007_001D_u32 as i32);
 
 /// An MP4 written a stretch at a time under a .part name, which a writer dropped unfinished deletes.
 pub struct Writer {
-    sink: Option<IMFSinkWriter>,
+    sink: Option<Sink>,
     fragments: bool,
-    video: u32,
-    lanes: Vec<u32>,
     base: i64,
     path: PathBuf,
     partial: PathBuf,
 }
 
+enum Sink {
+    Media { sink: IMFSinkWriter, video: u32, lanes: Vec<u32> },
+    Own(Fragments),
+}
+
 impl Writer {
     /// Opens a file for video starting on the keyframe `first`, with `lanes` audio tracks. With
-    /// `fragments`, h.264 goes down in fragments that a crash leaves playable, see [`defragment`];
-    /// media foundation's fragmented sink refuses hevc, so hdr10 is written plain either way.
+    /// `fragments` it goes down in fragments that a crash leaves playable, see [`recover`]. Media
+    /// foundation's fragmented sink refuses hevc, so clip writes those fragments itself.
     pub fn open(path: &Path, first: &Packet, format: Format, lanes: usize, fragments: bool) -> Result<Self> {
-        let fragments = fragments && format.codec == Codec::H264;
-        let mut partial = path.as_os_str().to_owned();
-        partial.push(crate::library::PART);
-        let partial = PathBuf::from(partial);
-        unsafe {
-            let mut attributes = None;
-            MFCreateAttributes(&mut attributes, 2)?;
-            let attributes = attributes.expect("created");
-            // the container comes from this attribute, so the part extension is fine
-            let container = if fragments { MFTranscodeContainerType_FMPEG4 } else { MFTranscodeContainerType_MPEG4 };
-            attributes.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &container)?;
-            attributes.SetUINT32(&MF_READWRITE_DISABLE_CONVERTERS, 1)?;
-            let sink = MFCreateSinkWriterFromURL(&HSTRING::from(partial.as_os_str()), None, &attributes)?;
-            let mut writer = Self {
-                sink: Some(sink),
-                fragments,
-                video: 0,
-                lanes: Vec::new(),
-                base: first.pts,
-                path: path.into(),
-                partial,
-            };
-            let sink = writer.sink.as_ref().expect("just opened");
-
-            let video = MFCreateMediaType()?;
-            video.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            video.SetGUID(&MF_MT_SUBTYPE, &format.codec.subtype())?;
-            video.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate)?;
-            describe(&video, format)?;
-            let headers = parameter_sets(format.codec, &first.data);
-            if !headers.is_empty() {
-                video.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &headers)?;
+        let named = |end: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(end);
+            PathBuf::from(name)
+        };
+        let partial = named(crate::library::PART);
+        let container = match fragments {
+            true => MFTranscodeContainerType_FMPEG4,
+            false => MFTranscodeContainerType_MPEG4,
+        };
+        let sink = match (fragments, format.codec) {
+            (true, Codec::Hdr10) => {
+                let head = named(&format!(".head{}", crate::library::PART));
+                Sink::Own(Fragments::open(&partial, &head, first, format, lanes)?)
             }
-            writer.video = sink.AddStream(&video)?;
-            sink.SetInputMediaType(writer.video, &video, None)?;
-            if lanes > 0 {
-                let aac = Aac::new()?.output_type()?;
-                for _ in 0..lanes {
-                    let lane = sink.AddStream(&aac)?;
-                    sink.SetInputMediaType(lane, &aac, None)?;
-                    writer.lanes.push(lane);
-                }
+            _ => {
+                let (sink, video, lanes) = media(&partial, first, format, lanes, container)?;
+                Sink::Media { sink, video, lanes }
             }
-            sink.BeginWriting()?;
-            Ok(writer)
-        }
+        };
+        Ok(Self { sink: Some(sink), fragments, base: first.pts, path: path.into(), partial })
     }
 
     /// Writes video packets in decode order with each lane's sound, interleaved by time so players
     /// never wait on one track to reach another.
-    pub fn write(&self, packets: &[Arc<Packet>], audio: &[Vec<Arc<Packet>>]) -> Result<()> {
-        let sink = self.sink.as_ref().expect("open until finished");
+    pub fn write(&mut self, packets: &[Arc<Packet>], audio: &[Vec<Arc<Packet>>]) -> Result<()> {
+        let base = self.base;
+        let (sink, video, lanes) = match self.sink.as_mut().expect("open until finished") {
+            Sink::Media { sink, video, lanes } => (sink, *video, lanes),
+            Sink::Own(own) => return own.write(packets, audio, base).map_err(|e| Error::new(E_WRITE, e.to_string())),
+        };
         let mut sound: Vec<(u32, &Packet)> = Vec::new();
-        for (&lane, packets) in self.lanes.iter().zip(audio) {
-            sound.extend(packets.iter().filter(|p| p.pts >= self.base).map(|p| (lane, &**p)));
+        for (&lane, packets) in lanes.iter().zip(audio) {
+            sound.extend(packets.iter().filter(|p| p.pts >= base).map(|p| (lane, &**p)));
         }
         sound.sort_by_key(|(_, p)| p.pts);
         let mut sound = sound.into_iter().peekable();
         for packet in packets {
             while let Some((lane, p)) = sound.next_if(|(_, p)| p.pts <= packet.pts) {
-                unsafe { write_sample(sink, lane, p, self.base)? };
+                unsafe { write_sample(sink, lane, p, base)? };
             }
-            unsafe { write_sample(sink, self.video, packet, self.base)? };
+            unsafe { write_sample(sink, video, packet, base)? };
         }
-        sound.try_for_each(|(lane, p)| unsafe { write_sample(sink, lane, p, self.base) })
+        sound.try_for_each(|(lane, p)| unsafe { write_sample(sink, lane, p, base) })
     }
 
-    /// Leaves the track names beside a fragmented file, where [`recover`] finds them after a crash.
-    pub fn keep_names(&self, names: &[String]) {
+    /// Leaves the track names and the hdr10 screen beside a fragmented file, where [`recover`]
+    /// finds them after a crash.
+    pub fn keep(&self, names: &[String], mastering: Option<Mastering>) {
         if self.fragments {
-            // drives without alternate streams, like exfat ones, recover recordings without names
-            let _ = std::fs::write(names_beside(&self.partial), names.join("\n"));
+            // drives without alternate streams, like exfat ones, recover recordings without them
+            let _ = std::fs::write(beside(&self.partial, NAMES), names.join("\n"));
+            if let Some(m) = mastering {
+                let _ = std::fs::write(beside(&self.partial, SCREEN), [mdcv(m), clli(m)].concat());
+            }
         }
     }
 
     /// Closes the file, names its tracks, and moves it to its final name.
     pub fn finish(mut self, names: &[&str], mastering: Option<Mastering>) -> Result<()> {
-        let sink = self.sink.take().expect("open until finished");
-        let finalized = unsafe { sink.Finalize() };
-        drop(sink);
-        let done = finalized
+        let closed = match self.sink.take().expect("open until finished") {
+            Sink::Media { sink, .. } => unsafe { sink.Finalize() },
+            Sink::Own(mut own) => own.flush().map_err(|e| Error::new(E_WRITE, e.to_string())),
+        };
+        let done = closed
             .and_then(|()| match self.fragments {
-                true => defragment(&self.partial).map_err(|e| windows::core::Error::new(E_LABEL, e.to_string())),
+                true => defragment(&self.partial).map_err(|e| Error::new(E_LABEL, e.to_string())),
                 false => Ok(()),
             })
+            .and_then(|()| label(&self.partial, names, mastering).map_err(|e| Error::new(E_LABEL, e.to_string())))
             .and_then(|()| {
-                label(&self.partial, names, mastering).map_err(|e| windows::core::Error::new(E_LABEL, e.to_string()))
-            })
-            .and_then(|()| {
-                let _ = std::fs::remove_file(names_beside(&self.partial));
-                std::fs::rename(&self.partial, &self.path)
-                    .map_err(|e| windows::core::Error::new(E_RENAME, e.to_string()))
+                for kept in [NAMES, SCREEN] {
+                    let _ = std::fs::remove_file(beside(&self.partial, kept));
+                }
+                std::fs::rename(&self.partial, &self.path).map_err(|e| Error::new(E_RENAME, e.to_string()))
             });
         if done.is_err() {
             let _ = std::fs::remove_file(&self.partial);
         }
         done
     }
+}
+
+/// Media foundation's sink writer on `partial`, with the video and `lanes` aac streams set up.
+fn media(
+    partial: &Path,
+    first: &Packet,
+    format: Format,
+    lanes: usize,
+    container: GUID,
+) -> Result<(IMFSinkWriter, u32, Vec<u32>)> {
+    unsafe {
+        let mut attributes = None;
+        MFCreateAttributes(&mut attributes, 2)?;
+        let attributes = attributes.expect("created");
+        // the container comes from this attribute, so the part extension is fine
+        attributes.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &container)?;
+        attributes.SetUINT32(&MF_READWRITE_DISABLE_CONVERTERS, 1)?;
+        let sink = MFCreateSinkWriterFromURL(&HSTRING::from(partial.as_os_str()), None, &attributes)?;
+        let video = MFCreateMediaType()?;
+        video.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        video.SetGUID(&MF_MT_SUBTYPE, &format.codec.subtype())?;
+        video.SetUINT32(&MF_MT_AVG_BITRATE, format.bitrate)?;
+        describe(&video, format)?;
+        let headers = parameter_sets(format.codec, &first.data);
+        if !headers.is_empty() {
+            video.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &headers)?;
+        }
+        let stream = sink.AddStream(&video)?;
+        sink.SetInputMediaType(stream, &video, None)?;
+        let mut streams = Vec::new();
+        if lanes > 0 {
+            let aac = Aac::new()?.output_type()?;
+            for _ in 0..lanes {
+                let lane = sink.AddStream(&aac)?;
+                sink.SetInputMediaType(lane, &aac, None)?;
+                streams.push(lane);
+            }
+        }
+        sink.BeginWriting()?;
+        Ok((sink, stream, streams))
+    }
+}
+
+/// A fragmented mp4 clip writes itself: a moov with no samples, then a moof and mdat per write
+/// holding every track's new samples, laid out the way [`plain`] reads them back.
+struct Fragments {
+    file: std::fs::File,
+    sequence: u32,
+    /// the video, then the lanes
+    tracks: Vec<Track>,
+}
+
+struct Track {
+    id: u32,
+    /// media time units per second, from the track's mdhd
+    scale: u64,
+    /// media time of the next sample
+    decoded: u64,
+    /// the newest sample, written once the next one tells its duration
+    held: Option<Pending>,
+}
+
+struct Pending {
+    pts: i64,
+    duration: i64,
+    key: bool,
+    data: Vec<u8>,
+}
+
+impl Fragments {
+    /// Media foundation writes a plain mp4 of just `first` to `head`, and its moov, emptied of
+    /// samples, starts the fragmented file. That way its sample descriptions, hvcC and esds
+    /// included, are the ones every clip it saves whole carries.
+    fn open(partial: &Path, head: &Path, first: &Packet, format: Format, lanes: usize) -> Result<Self> {
+        let skeleton = (|| {
+            let (sink, video, _) = media(head, first, format, lanes, MFTranscodeContainerType_MPEG4)?;
+            unsafe {
+                write_sample(&sink, video, first, first.pts)?;
+                sink.Finalize()?;
+            }
+            drop(sink);
+            std::fs::read(head).map_err(|e| Error::new(E_READ, e.to_string()))
+        })();
+        let _ = std::fs::remove_file(head);
+        let skeleton = skeleton?;
+        let bad = || Error::new(E_LABEL, "media foundation's mp4 has no moov to start from");
+        let top = boxes(&skeleton).ok_or_else(bad)?;
+        let ftyp = top.iter().find(|(kind, _)| kind == b"ftyp").ok_or_else(bad)?.1;
+        let moov = top.iter().find(|(kind, _)| kind == b"moov").ok_or_else(bad)?.1;
+        let (moov, tracks) = emptied(moov).ok_or_else(bad)?;
+        if tracks.len() != lanes + 1 {
+            return Err(bad());
+        }
+        let start = [boxed(b"ftyp", ftyp), boxed(b"moov", &moov)].concat();
+        let file = std::fs::File::create(partial).and_then(|mut file| file.write_all(&start).map(|()| file));
+        let file = file.map_err(|e| {
+            let _ = std::fs::remove_file(partial);
+            Error::new(E_WRITE, e.to_string())
+        })?;
+        Ok(Self { file, sequence: 0, tracks })
+    }
+
+    fn write(&mut self, packets: &[Arc<Packet>], audio: &[Vec<Arc<Packet>>], base: i64) -> std::io::Result<()> {
+        let fresh = std::iter::once(packets).chain(audio.iter().map(Vec::as_slice));
+        let mut runs = Vec::new();
+        for (n, (track, packets)) in self.tracks.iter_mut().zip(fresh).enumerate() {
+            let mut run = Vec::new();
+            for p in packets.iter().filter(|p| p.pts >= base) {
+                let data = match n {
+                    0 => length_prefixed(&p.data),
+                    _ => p.data.clone(),
+                };
+                let next = Pending { pts: p.pts - base, duration: p.duration, key: p.key, data };
+                if let Some(done) = track.held.replace(next) {
+                    let duration = track.at(p.pts - base).saturating_sub(track.at(done.pts));
+                    run.push((done, duration as u32));
+                }
+            }
+            runs.push(run);
+        }
+        self.fragment(runs)
+    }
+
+    /// Writes the samples still held, each lasting as long as its packet said.
+    fn flush(&mut self) -> std::io::Result<()> {
+        let runs: Vec<Vec<_>> = (self.tracks.iter_mut())
+            .map(|track| {
+                let done = track.held.take()?;
+                let duration = track.at(done.pts + done.duration) - track.at(done.pts);
+                Some((done, duration as u32))
+            })
+            .map(|done| done.into_iter().collect())
+            .collect();
+        self.fragment(runs)?;
+        self.file.sync_data()
+    }
+
+    fn fragment(&mut self, runs: Vec<Vec<(Pending, u32)>>) -> std::io::Result<()> {
+        if runs.iter().all(Vec::is_empty) {
+            return Ok(());
+        }
+        self.sequence += 1;
+        let full = |kind: &[u8; 4], head: [u8; 4], body: &[u8]| boxed(kind, &[&head[..], body].concat());
+        let moof = |data: u64| {
+            let mut at = data;
+            let mut trafs = Vec::new();
+            for (track, run) in self.tracks.iter().zip(&runs).filter(|(_, run)| !run.is_empty()) {
+                // an absolute base offset and every sample's duration, size and flags
+                let tfhd = full(b"tfhd", [0, 0, 0, 1], &[&track.id.to_be_bytes()[..], &at.to_be_bytes()].concat());
+                let tfdt = full(b"tfdt", [1, 0, 0, 0], &track.decoded.to_be_bytes());
+                let mut trun = (run.len() as u32).to_be_bytes().to_vec();
+                for (sample, duration) in run {
+                    // a keyframe depends on nothing, any other frame is no sync sample
+                    let flags: u32 = if sample.key { 0x0200_0000 } else { 0x0101_0000 };
+                    trun.extend([*duration, sample.data.len() as u32, flags].iter().flat_map(|v| v.to_be_bytes()));
+                    at += sample.data.len() as u64;
+                }
+                trafs.push(boxed(b"traf", &[tfhd, tfdt, full(b"trun", [0, 0, 7, 0], &trun)].concat()));
+            }
+            boxed(b"moof", &[full(b"mfhd", [0; 4], &self.sequence.to_be_bytes()), trafs.concat()].concat())
+        };
+        let start = self.file.seek(SeekFrom::End(0))?;
+        let size = moof(0).len() as u64;
+        let media: Vec<u8> = runs.iter().flatten().flat_map(|(sample, _)| sample.data.iter().copied()).collect();
+        // one write, so a crash leaves at most one cut off fragment, which a rebuild leaves out
+        self.file.write_all(&[moof(start + size + 8), boxed(b"mdat", &media)].concat())?;
+        for (track, run) in self.tracks.iter_mut().zip(&runs) {
+            track.decoded += run.iter().map(|&(_, duration)| duration as u64).sum::<u64>();
+        }
+        Ok(())
+    }
+}
+
+impl Track {
+    /// Media time at `pts` in 100 ns units since the first frame. Every sample's time is rounded on
+    /// its own, so the durations add up to the recording's length and no frame drifts off its pts.
+    fn at(&self, pts: i64) -> u64 {
+        ((pts.max(0) as u128 * self.scale as u128 + 5_000_000) / 10_000_000) as u64
+    }
+}
+
+/// An Annex B access unit as an mp4 sample: each NAL unit after its length. The parameter sets stay
+/// in the sample entry's hvcC alone, as media foundation's writer leaves them.
+fn length_prefixed(access_unit: &[u8]) -> Vec<u8> {
+    let units = nal_units(access_unit).into_iter().filter(|unit| !is_hevc_parameter_set(unit));
+    units.flat_map(|unit| [&(unit.len() as u32).to_be_bytes()[..], unit].concat()).collect()
+}
+
+/// The moov body of a plain mp4 with its samples taken out and an mvex added, ready for fragments,
+/// with its tracks.
+fn emptied(moov: &[u8]) -> Option<(Vec<u8>, Vec<Track>)> {
+    let u32_at = |data: &[u8], at: usize| Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?));
+    let (mut out, mut tracks) = (Vec::new(), Vec::new());
+    for (kind, body) in boxes(moov)? {
+        if &kind != b"trak" {
+            out.extend(boxed(&kind, body));
+            continue;
+        }
+        let tkhd = child(body, &[b"tkhd"])?;
+        let mdhd = child(body, &[b"mdia", b"mdhd"])?;
+        let long = |header: &[u8]| header.first() == Some(&1);
+        tracks.push(Track {
+            id: u32_at(tkhd, if long(tkhd) { 20 } else { 12 })?,
+            scale: u32_at(mdhd, if long(mdhd) { 20 } else { 12 })?.max(1) as u64,
+            decoded: 0,
+            held: None,
+        });
+        let stsd = child(body, &[b"mdia", b"minf", b"stbl", b"stsd"])?.to_vec();
+        // the first sample's edit no longer applies, the fragments hold every sample from time 0
+        let trak: Vec<u8> = boxes(body)?
+            .into_iter()
+            .filter(|(kind, _)| kind != b"edts")
+            .flat_map(|(kind, body)| boxed(&kind, body))
+            .collect();
+        let empty = |kind: &[u8; 4], words: usize| boxed(kind, &vec![0; 4 * words]);
+        let stbl = [boxed(b"stsd", &stsd), empty(b"stts", 2), empty(b"stsc", 2), empty(b"stsz", 3), empty(b"stco", 2)];
+        out.extend(boxed(b"trak", &edit(&trak, &[b"mdia", b"minf", b"stbl"], &mut |_| stbl.concat())?));
+    }
+    // trex: version and flags, track id, sample description 1, then no default duration, size or flags
+    let trex = |track: &Track| {
+        boxed(b"trex", &[[0; 4], track.id.to_be_bytes(), 1u32.to_be_bytes(), [0; 4], [0; 4], [0; 4]].concat())
+    };
+    out.extend(boxed(b"mvex", &tracks.iter().flat_map(trex).collect::<Vec<u8>>()));
+    Some((out, tracks))
 }
 
 impl Drop for Writer {
@@ -282,23 +493,31 @@ fn top(file: &mut std::fs::File, at: u64, len: u64) -> std::io::Result<Option<([
 }
 
 /// Rebuilds a fragmented recording a crash cut off, see [`defragment`], and gives its tracks the
-/// names [`Writer::keep_names`] left beside it.
+/// names and hdr10 screen [`Writer::keep`] left beside it.
 pub fn recover(path: &Path) -> std::io::Result<()> {
     defragment(path)?;
-    let beside = names_beside(path);
-    if let Ok(names) = std::fs::read_to_string(&beside) {
+    let screen = std::fs::read(beside(path, SCREEN)).ok();
+    let mastering = screen.as_deref().and_then(|m| read_mastering(child(m, &[b"mdcv"])?, child(m, &[b"clli"])?));
+    if let Ok(names) = std::fs::read_to_string(beside(path, NAMES)) {
         let names: Vec<&str> = names.split('\n').collect();
         // a recording that plays without names beats none
-        let _ = label(path, &names, None);
-        let _ = std::fs::remove_file(&beside);
+        let _ = label(path, &names, mastering);
+    }
+    for kept in [NAMES, SCREEN] {
+        let _ = std::fs::remove_file(beside(path, kept));
     }
     Ok(())
 }
 
+/// the track names, one a line
+const NAMES: &str = "names";
+/// an hdr10 recording's mdcv and clli boxes
+const SCREEN: &str = "mastering";
+
 /// An alternate data stream, which moves and goes away with its file.
-fn names_beside(path: &Path) -> PathBuf {
+fn beside(path: &Path, kept: &str) -> PathBuf {
     let mut stream = path.as_os_str().to_owned();
-    stream.push(":clip-names");
+    stream.push(format!(":clip-{kept}"));
     stream.into()
 }
 
@@ -453,7 +672,9 @@ fn plain(moov: &[u8], moofs: &[(u64, Vec<u8>)]) -> Option<Vec<u8>> {
             continue;
         }
         let tkhd = child(trak, &[b"tkhd"])?;
-        let samples = tracks.get(&u32_at(tkhd, if tkhd.first()? == &1 { 20 } else { 12 })?)?;
+        // a lane that never got a packet before a crash plays as a silent track
+        let id = u32_at(tkhd, if tkhd.first()? == &1 { 20 } else { 12 })?;
+        let samples = tracks.get(&id).map_or(&[][..], Vec::as_slice);
         let mdhd = child(trak, &[b"mdia", b"mdhd"])?;
         let media: u64 = samples.iter().map(|s| s.duration as u64).sum();
         let shown = (media as u128 * scale / scale_of(mdhd)?) as u64;
@@ -958,10 +1179,82 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), data, "the next start finishes freeing them");
 
         std::fs::write(&path, &file).unwrap();
-        std::fs::write(names_beside(&path), "game").unwrap();
+        std::fs::write(beside(&path, NAMES), "game").unwrap();
         recover(&path).unwrap();
         assert_eq!(super::probe(&path).unwrap().tracks, ["game"]);
-        assert!(!names_beside(&path).exists(), "the names go once they're in the moov");
+        assert!(!beside(&path, NAMES).exists(), "the names go once they're in the moov");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn own_fragments_rebuild_into_the_samples_written() {
+        let be = |v: u32| v.to_be_bytes();
+        let full = |kind: &[u8; 4], body: &[u8]| boxed(kind, &[&[0; 4][..], body].concat());
+        let hdlr = |kind: &[u8; 4]| boxed(b"hdlr", &[&[0; 8][..], kind, &[0; 12], b"Handler\0"].concat());
+        // as media foundation leaves a plain mp4 of one frame
+        let trak = |id: u32, kind: &[u8; 4], entry: &[u8; 4], scale: u32| {
+            let tkhd = full(b"tkhd", &[&[0; 8][..], &be(id), &[0; 68]].concat());
+            let edts = boxed(b"edts", &full(b"elst", &[0; 16]));
+            let mdhd = full(b"mdhd", &[&[0; 8][..], &be(scale), &[0; 8]].concat());
+            let stsd = full(b"stsd", &[&be(1)[..], &boxed(entry, &[0; 78])].concat());
+            let stts = full(b"stts", &[be(1), be(1), be(1000)].concat());
+            let minf = boxed(b"minf", &boxed(b"stbl", &[stsd, stts].concat()));
+            boxed(b"trak", &[tkhd, edts, boxed(b"mdia", &[mdhd, hdlr(kind), minf].concat())].concat())
+        };
+        let mvhd = full(b"mvhd", &[&[0; 8][..], &be(1000), &[0; 84]].concat());
+        let moov = [mvhd, trak(1, b"vide", b"hvc1", 30_000), trak(2, b"soun", b"mp4a", 48_000)].concat();
+        let moov = [moov, trak(3, b"soun", b"mp4a", 48_000)].concat();
+        let (moov, tracks) = emptied(&moov).unwrap();
+        let found: Vec<(u32, u64)> = tracks.iter().map(|t| (t.id, t.scale)).collect();
+        assert_eq!(found, [(1, 30_000), (2, 48_000), (3, 48_000)]);
+        assert!(child(&moov, &[b"trak", b"edts"]).is_none());
+        assert_eq!(child(&moov, &[b"mvex", b"trex"]).unwrap()[4..8], be(1));
+
+        let path = std::env::temp_dir().join(format!("clip-fragments-{}.mp4", std::process::id()));
+        std::fs::write(&path, [boxed(b"ftyp", b"isom"), boxed(b"moov", &moov)].concat()).unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut own = Fragments { file, sequence: 0, tracks };
+        let (frame, tick) = (333_334, 213_333);
+        let packet = |pts: i64, duration: i64, key: bool, data: &[u8]| {
+            Arc::new(Packet { pts: 1_000 + pts, duration, key, data: data.to_vec() })
+        };
+        // the vps leaves the keyframe, the access unit delimiter and slices stay
+        let video = [
+            packet(0, frame, true, &[0, 0, 0, 1, 0x40, 1, 7, 0, 0, 0, 1, 0x46, 1, 0x50, 0, 0, 1, 0x26, 1, 5, 5]),
+            packet(frame, frame, false, &[0, 0, 0, 1, 0x02, 1, 9]),
+            packet(2 * frame, frame, false, &[0, 0, 1, 0x02, 1, 8, 8]),
+        ];
+        let sound: Vec<_> = (0..5).map(|i| packet(i * tick, tick, true, &vec![i as u8; 6 + i as usize])).collect();
+        own.write(&video[..2], &[sound[..2].to_vec(), Vec::new()], 1_000).unwrap();
+        own.write(&video[2..], &[sound[2..4].to_vec(), Vec::new()], 1_000).unwrap();
+
+        let crashed = path.with_extension("crashed.mp4");
+        std::fs::copy(&path, &crashed).unwrap();
+        std::fs::write(beside(&crashed, NAMES), "game\nvoice").unwrap();
+        std::fs::write(beside(&crashed, SCREEN), [mdcv(PANEL), clli(PANEL)].concat()).unwrap();
+        recover(&crashed).unwrap();
+        let probe = super::probe(&crashed).unwrap();
+        assert_eq!((probe.tracks, probe.fps), (vec!["game".to_string(), "voice".to_string()], 30.0));
+        assert!((probe.mastering.unwrap().max - PANEL.max).abs() < 0.01);
+        assert_eq!(frame_sizes(&crashed).unwrap(), [vec![6, 7, 8], vec![]], "the newest sample waits for the next");
+        std::fs::remove_file(&crashed).unwrap();
+
+        own.write(&[], &[sound[4..].to_vec(), Vec::new()], 1_000).unwrap();
+        own.flush().unwrap();
+        drop(own);
+        defragment(&path).unwrap();
+        assert_eq!(frame_sizes(&path).unwrap(), [vec![6, 7, 8, 9, 10], vec![]]);
+        let moov = moov_of(&path).unwrap();
+        let stbl = child(&moov, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]).unwrap();
+        let words = |kind: &[u8; 4]| -> Vec<u32> {
+            child(stbl, &[kind]).unwrap()[4..].chunks(4).map(|w| u32::from_be_bytes(w.try_into().unwrap())).collect()
+        };
+        assert_eq!(words(b"stts"), [1, 3, 1000], "a frame is 1000 units at 30000 a second");
+        assert_eq!(words(b"stss"), [1, 1]);
+        assert_eq!(words(b"stsz"), [0, 3, 15, 7, 8]);
+        let data = std::fs::read(&path).unwrap();
+        let at = words(b"stco")[1] as usize;
+        assert_eq!(data[at..at + 15], [0, 0, 0, 3, 0x46, 1, 0x50, 0, 0, 0, 4, 0x26, 1, 5, 5], "length prefixed");
         std::fs::remove_file(&path).unwrap();
     }
 }

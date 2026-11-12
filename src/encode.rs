@@ -500,6 +500,15 @@ pub fn packet(sample: &IMFSample, frame: i64) -> Result<Packet> {
 /// Parameter set NAL units (h.264 sps and pps, hevc vps sps and pps), start codes included,
 /// from an Annex B access unit.
 pub fn parameter_sets(codec: Codec, access_unit: &[u8]) -> Vec<u8> {
+    let wanted = |unit: &&[u8]| match codec {
+        Codec::H264 => matches!(unit[0] & 0x1f, 7 | 8),
+        Codec::Hdr10 => is_hevc_parameter_set(unit),
+    };
+    nal_units(access_unit).into_iter().filter(wanted).flat_map(|unit| [&[0, 0, 0, 1][..], unit].concat()).collect()
+}
+
+/// The NAL units of an Annex B access unit, without their start codes.
+pub fn nal_units(access_unit: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 <= access_unit.len() {
@@ -510,23 +519,22 @@ pub fn parameter_sets(codec: Codec, access_unit: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
-    let mut out = Vec::new();
+    let mut units = Vec::new();
     for (n, &start) in starts.iter().enumerate() {
         let mut end = starts.get(n + 1).map_or(access_unit.len(), |&next| next - 3);
         while n + 1 < starts.len() && end > start && access_unit[end - 1] == 0 {
             end -= 1;
         }
-        let header = access_unit.get(start).copied().unwrap_or(0);
-        let wanted = match codec {
-            Codec::H264 => matches!(header & 0x1f, 7 | 8),
-            Codec::Hdr10 => matches!((header >> 1) & 0x3f, 32..=34),
-        };
-        if start < end && wanted {
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&access_unit[start..end]);
+        if start < end {
+            units.push(&access_unit[start..end]);
         }
     }
-    out
+    units
+}
+
+/// A vps, sps or pps.
+pub fn is_hevc_parameter_set(unit: &[u8]) -> bool {
+    matches!((unit[0] >> 1) & 0x3f, 32..=34)
 }
 
 #[cfg(test)]

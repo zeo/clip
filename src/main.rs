@@ -392,7 +392,7 @@ impl Session {
         let first = first.load().map_err(|e| format!("can't read the buffer back: {e}"))?;
         let writer = save::Writer::open(out, &first, self.format, self.rings.len(), true)
             .map_err(|e| format!("can't start the recording: {e}"))?;
-        writer.keep_names(&self.names);
+        writer.keep(&self.names, self.mastering);
         Ok(Tape {
             writer,
             ring: self.ring.clone(),
@@ -747,11 +747,13 @@ fn self_test(mut say: impl FnMut(String)) -> Result<()> {
             }
         }
     }
-    match check_tape(&gpu, &lanes, &dir) {
-        Ok(report) => say!("ok   tape: {report}"),
-        Err(e) => {
-            failures += 1;
-            say!("FAIL tape: {}", e.message())
+    for codec in [Codec::H264, Codec::Hdr10] {
+        match check_tape(&gpu, &lanes, &dir, codec) {
+            Ok(report) => say!("ok   tape {codec:?}: {report}"),
+            Err(e) => {
+                failures += 1;
+                say!("FAIL tape {codec:?}: {}", e.message())
+            }
         }
     }
     match check_png(&dir) {
@@ -770,20 +772,27 @@ fn self_test(mut say: impl FnMut(String)) -> Result<()> {
 
 /// Feeds rings a few frames at a time while a tape pulls from them, the way a long recording runs,
 /// and checks the file holds every packet once.
-fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::path::Path) -> Result<String> {
+fn check_tape(
+    gpu: &capture::Gpu,
+    lanes: &[Vec<Arc<ring::Packet>>],
+    dir: &std::path::Path,
+    codec: Codec,
+) -> Result<String> {
     let fail = |what: String| windows::core::Error::new(E_SELF_TEST, what);
-    let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec: Codec::H264 };
-    let choice = encode::encoders(Codec::H264, Some(gpu.adapter))?
+    let format = Format { width: 1280, height: 720, fps: 30, bitrate: 4_000_000, codec };
+    let choice = encode::encoders(codec, Some(gpu.adapter))?
         .into_iter()
         .next()
-        .ok_or_else(|| fail("no h.264 encoder".into()))?;
-    let mut pipeline = capture::Pipeline::new(gpu, SDR_DISPLAY, format, hdr::Filter::Area).map_err(at("pipeline"))?;
+        .ok_or_else(|| fail(format!("no {codec:?} encoder")))?;
+    let hdr = codec == Codec::Hdr10;
+    let display = if hdr { TEST_DISPLAY } else { SDR_DISPLAY };
+    let mut pipeline = capture::Pipeline::new(gpu, display, format, hdr::Filter::Area).map_err(at("pipeline"))?;
     let mut encoder =
         encode::Encoder::open(&choice, &gpu.device, format, encode::Purpose::Capture).map_err(at("open"))?;
     let mut video = Vec::new();
     let frames = 3 * format.fps as i64;
     for i in 0..frames {
-        let source = pattern(&gpu.device, 800, 600, i as u32, false).map_err(at("pattern"))?;
+        let source = pattern(&gpu.device, 800, 600, i as u32, hdr).map_err(at("pattern"))?;
         let frame = pipeline.convert(&source, (800, 600), format.fps).map_err(at("convert"))?;
         video.extend(encoder.encode(&frame, format.time(i)).map_err(at("encode"))?);
     }
@@ -791,7 +800,7 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
     // a short ring, so the tape has to keep up for nothing to fall out of it
     let ring = Arc::new(Mutex::new(Ring::new(SECOND)));
     let rings: Vec<_> = lanes.iter().map(|_| Arc::new(Mutex::new(Ring::new(SECOND)))).collect();
-    let path = dir.join("tape.mp4");
+    let path = dir.join(format!("tape-{codec:?}.mp4"));
     let mut sent = vec![0; lanes.len()];
     let mut feed = |upto: usize| {
         let mut ring = ring.lock().expect("ring poisoned");
@@ -814,14 +823,15 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
         .load()
         .map_err(|e| windows::core::Error::new(E_SELF_TEST, e.to_string()))?;
     let names: Vec<String> = vec!["tone 440".into(), "tone 660".into()];
+    let mastering = hdr.then_some(TEST_PANEL);
     let writer = save::Writer::open(&path, &first, format, rings.len(), true).map_err(at("open tape"))?;
-    writer.keep_names(&names);
+    writer.keep(&names, mastering);
     let mut tape = Tape {
         writer,
         ring: ring.clone(),
         rings: rings.clone(),
         names: names.clone(),
-        mastering: None,
+        mastering,
         video: first.pts - 1,
         audio: vec![first.pts - 1; rings.len()],
         start: first.pts,
@@ -836,7 +846,7 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
         tape.pull().map_err(fail)?;
     }
     // what a crash right now would leave, rebuilt the way the next start does
-    let crashed = dir.join("crashed.mp4");
+    let crashed = dir.join(format!("crashed-{codec:?}.mp4"));
     let mut partial = path.clone().into_os_string();
     partial.push(library::PART);
     // windows' writer reaches the disk a little behind, so the first fragments can still be on their way
@@ -850,8 +860,16 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
         }
     }
     let kept = read_back(&crashed).map_err(at("read back the unfinished tape"))?;
-    let named = save::probe(&crashed).map_err(|e| fail(format!("probe the unfinished tape: {e}")))?.tracks;
+    let probe = |path: &std::path::Path| save::probe(path).map_err(|e| fail(format!("probe {}: {e}", path.display())));
+    let recovered = probe(&crashed)?;
+    let named = recovered.tracks;
     let saved = tape.finish().map_err(fail)?;
+    // the screen an hdr10 recording was mastered on, after a crash and after a finish
+    let screens = [recovered.mastering, probe(&path)?.mastering];
+    let same = |m: Option<hdr::Mastering>| match (m, mastering) {
+        (Some(m), Some(want)) => (m.max - want.max).abs() < 0.01 && (m.average - want.average).abs() < 0.5,
+        (m, want) => m.is_none() && want.is_none(),
+    };
     let streams = read_back(&path).map_err(at("read back"))?;
     let end = format.time(frames - 1);
     let sound: Vec<usize> = lanes.iter().map(|lane| lane.iter().filter(|p| p.pts <= end).count()).collect();
@@ -863,7 +881,8 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
                 && heard.iter().map(|s| s.0 as usize).eq(sound.iter().copied())
                 && kept.len() == streams.len()
                 && kept.iter().all(|s| s.0 > 0)
-                && named == names =>
+                && named == names
+                && screens.into_iter().all(same) =>
         {
             let kept: Vec<u32> = kept.iter().map(|s| s.0).collect();
             Ok(format!(
@@ -871,7 +890,7 @@ fn check_tape(gpu: &capture::Gpu, lanes: &[Vec<Arc<ring::Packet>>], dir: &std::p
             ))
         }
         other => Err(fail(format!(
-            "want {frames} frames to {end} and aac packets {sound:?}, got {other:?}, and {kept:?} named {named:?} cut off before the end"
+            "want {frames} frames to {end} and aac packets {sound:?}, got {other:?}, and {kept:?} named {named:?} cut off before the end, screens {screens:?}"
         ))),
     }
 }
