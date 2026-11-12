@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,40 +22,41 @@ use crate::sync::each_sample;
 
 /// Every audio track of a clip as 16 bit stereo pcm at `RATE` from the clip's start, with its name.
 pub fn tracks(path: &Path) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
-    let names = crate::save::probe(path).map(|probe| probe.tracks).unwrap_or_default();
-    decode_tracks(path)
-        .map(|tracks| {
-            tracks
-                .into_iter()
-                .enumerate()
-                .map(|(i, pcm)| {
-                    let name = names.get(i).filter(|name| !name.is_empty()).cloned();
-                    (name.unwrap_or_else(|| format!("track {}", i + 1)), pcm)
-                })
-                .collect()
-        })
-        .map_err(|e| format!("can't read the clip's audio: {}", e.message()))
+    let mut all = Vec::new();
+    each_track(path, |name, pcm| {
+        all.push((name, pcm));
+        Ok(())
+    })?;
+    Ok(all)
 }
 
-fn decode_tracks(path: &Path) -> Result<Vec<Vec<u8>>> {
-    unsafe {
-        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
-        audio_streams(&reader, path)?
-            .iter()
-            .map(|&stream| {
-                reader.SetCurrentMediaType(stream, None, &audio_type(MFAudioFormat_PCM)?)?;
-                let mut pcm = Vec::new();
-                each_sample(&reader, stream, |time, data| {
-                    let at = (time.max(0) * RATE as i64 / SECOND) as usize * BLOCK;
-                    if pcm.len() < at {
-                        pcm.resize(at, 0);
-                    }
-                    pcm.extend_from_slice(data);
-                })?;
-                Ok(pcm)
-            })
-            .collect()
+/// Hands `each` the audio tracks of a clip one at a time, like `tracks`, so only one is held at once.
+pub fn each_track(
+    path: &Path,
+    mut each: impl FnMut(String, Vec<u8>) -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
+    let names = crate::save::probe(path).map(|probe| probe.tracks).unwrap_or_default();
+    let unreadable = |e: windows::core::Error| format!("can't read the clip's audio: {}", e.message());
+    let reader = unsafe { MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None) }.map_err(unreadable)?;
+    for (i, stream) in unsafe { audio_streams(&reader, path) }.map_err(unreadable)?.into_iter().enumerate() {
+        let pcm = decode(&reader, stream).map_err(unreadable)?;
+        let name = names.get(i).filter(|name| !name.is_empty()).cloned();
+        each(name.unwrap_or_else(|| format!("track {}", i + 1)), pcm)?;
     }
+    Ok(())
+}
+
+fn decode(reader: &IMFSourceReader, stream: u32) -> Result<Vec<u8>> {
+    unsafe { reader.SetCurrentMediaType(stream, None, &audio_type(MFAudioFormat_PCM)?)? };
+    let mut pcm = Vec::new();
+    each_sample(reader, stream, |time, data| {
+        let at = (time.max(0) * RATE as i64 / SECOND) as usize * BLOCK;
+        if pcm.len() < at {
+            pcm.resize(at, 0);
+        }
+        pcm.extend_from_slice(data);
+    })?;
+    Ok(pcm)
 }
 
 /// The reader's audio streams in the file's track order. The mpeg-4 source numbers its streams in
@@ -133,7 +135,7 @@ fn in_track_order(streams: &[u32], seen: &[Vec<u32>], tracks: &[Vec<u32>]) -> Ve
 
 pub fn write_wav(path: &Path, pcm: &[u8]) -> std::io::Result<()> {
     let size = pcm.len() as u32;
-    let mut wav = Vec::with_capacity(44 + pcm.len());
+    let mut wav = Vec::with_capacity(44);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36 + size).to_le_bytes());
     wav.extend_from_slice(b"WAVEfmt ");
@@ -146,8 +148,21 @@ pub fn write_wav(path: &Path, pcm: &[u8]) -> std::io::Result<()> {
     wav.extend_from_slice(&16u16.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&size.to_le_bytes());
-    wav.extend_from_slice(pcm);
-    std::fs::write(path, wav)
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&wav)?;
+    file.write_all(pcm)
+}
+
+/// The loudest sample in each of `count` equal stretches of 16 bit stereo pcm, from 0 to 1, padded with
+/// silence when there are fewer frames than stretches.
+pub fn peaks(pcm: &[u8], count: usize) -> Vec<f32> {
+    let per = (pcm.len() / BLOCK / count).max(1) * BLOCK;
+    let loudest = |part: &[u8]| part.as_chunks::<2>().0.iter().map(|&s| i16::from_le_bytes(s).unsigned_abs()).max();
+    pcm.chunks(per)
+        .map(|part| f32::from(loudest(part).unwrap_or(0)) / 32768.0)
+        .chain(std::iter::repeat(0.0))
+        .take(count)
+        .collect()
 }
 
 /// How an export is shaped beyond the cut: a size to fit under, a 9:16 window, and a way to hear
@@ -619,6 +634,14 @@ mod tests {
         assert_eq!(kept.len(), second * 3 / 2);
         assert!(kept[..second].iter().all(|&b| b == 2));
         assert!(kept[second..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn peaks_take_the_loudest_sample_of_each_stretch_and_pad_a_short_track() {
+        let pcm = |samples: &[i16]| samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        let frames = pcm(&[0, 16384, -100, 50, i16::MIN, 0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(peaks(&frames, 3), [0.5, 1.0, 6.0 / 32768.0]);
+        assert_eq!(peaks(&frames[..8], 3), [0.5, 100.0 / 32768.0, 0.0]);
     }
 
     #[test]

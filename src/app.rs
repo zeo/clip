@@ -1792,7 +1792,12 @@ struct Track {
     name: String,
     /// a wav file in the cache
     path: PathBuf,
+    /// the loudest sample of each of `PEAKS` equal stretches, from 0 to 1
+    peaks: Vec<f32>,
 }
+
+/// How many bars the editor draws a track's sound in.
+const PEAKS: usize = 800;
 
 /// Decodes every audio track of a clip to its own wav, since the webview only plays the first.
 #[tauri::command]
@@ -1800,20 +1805,18 @@ async fn track_audio(shared: State<'_, Shared>, path: PathBuf) -> Result<Vec<Tra
     listed(&shared, &path)?;
     let audio = shared.cache.join("audio");
     blocking(move || {
-        let tracks = crate::export::tracks(&path)?;
         // only the clip open now keeps its decoded audio
         let _ = std::fs::remove_dir_all(&audio);
         std::fs::create_dir_all(&audio).map_err(|e| e.to_string())?;
         let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-        tracks
-            .into_iter()
-            .enumerate()
-            .map(|(i, (name, pcm))| {
-                let wav = audio.join(format!("{stem} {i}.wav"));
-                crate::export::write_wav(&wav, &pcm).map_err(|e| e.to_string())?;
-                Ok(Track { name, path: wav })
-            })
-            .collect()
+        let mut tracks = Vec::new();
+        crate::export::each_track(&path, |name, pcm| {
+            let wav = audio.join(format!("{stem} {}.wav", tracks.len()));
+            crate::export::write_wav(&wav, &pcm).map_err(|e| e.to_string())?;
+            tracks.push(Track { name, path: wav, peaks: crate::export::peaks(&pcm, PEAKS) });
+            Ok(())
+        })?;
+        Ok(tracks)
     })
     .await
 }

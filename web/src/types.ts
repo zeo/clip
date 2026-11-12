@@ -156,7 +156,7 @@ export type Clip = {
 
 export type Game = { app: string; icon: string | null; clips: Clip[]; bytes: number };
 
-export type Track = { name: string; path: string };
+export type Track = { name: string; path: string; peaks: number[] };
 
 // a longer buffer goes to a hidden folder in the clips folder instead of memory
 export const IN_MEMORY = 600;

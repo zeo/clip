@@ -26,9 +26,10 @@
     onmoved: (path: string) => void;
   } = $props();
 
-  type Lane = { name: string; buffer: AudioBuffer; peaks: string; muted: boolean; solo: boolean };
+  type Lane = { name: string; audio: HTMLAudioElement; peaks: string; muted: boolean; solo: boolean };
+  // as many as track_audio sends
   const PEAKS = 800;
-  // past this the tracks are restarted where the video is
+  // past this a track is moved back to where the video is
   const DRIFT = 0.04;
   const RATES = [0.25, 0.5, 1, 1.5, 2];
   // the upload limits people meet most, in the bytes the sites count
@@ -104,17 +105,10 @@
   const unready = $derived(!animated && (loading || listed === null));
   const pct = (t: number) => `${(100 * t) / (duration || 1)}%`;
 
-  const context = new AudioContext();
-  const master = context.createGain();
-  master.connect(context.destination);
-  let playing: AudioBufferSourceNode[] = [];
-  // where the video was and what the audio clock read when the tracks last started
-  let from = 0;
-  let started = 0;
   let frame = 0;
 
   $effect(() => {
-    master.gain.value = view.volume;
+    for (const lane of lanes) lane.audio.volume = view.volume;
   });
 
   $effect(() => {
@@ -127,8 +121,7 @@
     load();
     return () => {
       cancelAnimationFrame(frame);
-      silence();
-      context.close();
+      release(lanes.map((lane) => lane.audio));
       // stepping to the next clip keeps the screen filled, anything else gives the window back
       if (full) setTimeout(() => document.querySelector('.theater.full') || getCurrentWindow().setFullscreen(false));
     };
@@ -136,20 +129,23 @@
 
   async function load() {
     const ticket = ++loads;
-    silence();
+    // the cached wavs are about to be written again, so nothing may hold them open
+    release(lanes.map((lane) => lane.audio));
     [lanes, listed, audioError, loading] = [[], null, '', true];
     try {
       const tracks = await invoke<Track[]>('track_audio', { path: clip.path });
       if (ticket !== loads) return;
       listed = tracks.length;
-      const read = await Promise.all(
-        tracks.map(async (track) => {
-          const data = await (await fetch(`${convertFileSrc(track.path)}?v=${ticket}`)).arrayBuffer();
-          const buffer = await context.decodeAudioData(data);
-          return { name: track.name, buffer, peaks: peaks(buffer), muted: false, solo: false };
-        })
-      );
-      if (ticket === loads) lanes = read;
+      // streamed from the cache, since a long clip's tracks decoded whole run to gigabytes
+      const made = tracks.map((track) => Object.assign(new Audio(), { preload: 'auto', src: `${convertFileSrc(track.path)}?v=${ticket}` }));
+      try {
+        await Promise.all(made.map(ready));
+      } catch (e) {
+        release(made);
+        throw e;
+      }
+      if (ticket !== loads) return release(made);
+      lanes = tracks.map((track, i) => ({ name: track.name, audio: made[i], peaks: outline(track.peaks), muted: false, solo: false }));
     } catch (e) {
       if (ticket === loads) audioError = String(e);
     } finally {
@@ -157,43 +153,36 @@
     }
   }
 
-  function peaks(buffer: AudioBuffer): string {
-    const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c));
-    const per = Math.max(1, Math.floor(buffer.length / PEAKS));
-    let path = '';
-    for (let i = 0; i < PEAKS; i++) {
-      let peak = 0;
-      for (const data of channels) {
-        for (let n = i * per, last = Math.min(n + per, data.length); n < last; n++) peak = Math.max(peak, Math.abs(data[n]));
-      }
-      const h = Math.max(0.5, Math.sqrt(peak) * 48);
-      path += `M${i} ${50 - h}V${50 + h}`;
+  const ready = (audio: HTMLAudioElement) =>
+    new Promise((resolve, reject) => {
+      audio.onloadedmetadata = resolve;
+      audio.onerror = () => reject(audio.error?.message || "the webview can't play it");
+    });
+
+  const outline = (peaks: number[]) =>
+    peaks.map((peak, i) => ((h) => `M${i} ${50 - h}V${50 + h}`)(Math.max(0.5, Math.sqrt(peak) * 48))).join('');
+
+  function release(tracks: HTMLAudioElement[]) {
+    for (const audio of tracks) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
     }
-    return path;
   }
 
   function silence() {
-    for (const source of playing) {
-      source.stop();
-      source.disconnect();
-    }
-    playing = [];
+    for (const lane of lanes) lane.audio.pause();
   }
 
   function sound() {
     silence();
     if (!video || video.paused) return;
-    from = video.currentTime;
-    started = context.currentTime;
     for (const i of audible) {
-      const buffer = lanes[i].buffer;
-      if (from >= buffer.duration) continue;
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.playbackRate.value = rate;
-      source.connect(master);
-      source.start(0, from);
-      playing.push(source);
+      const audio = lanes[i].audio;
+      if (video.currentTime >= audio.duration) continue;
+      audio.currentTime = video.currentTime;
+      audio.playbackRate = rate;
+      audio.play().catch((e) => e.name === 'AbortError' || say(`Can't play the sound: ${e.message ?? e}`, true));
     }
   }
 
@@ -202,13 +191,18 @@
     now = video.currentTime;
     const [a, b] = ahead(now);
     if (loop && (now < a || now >= b)) seek(a);
-    else if (playing.length > 0 && Math.abs(from + (context.currentTime - started) * rate - now) > DRIFT) sound();
+    else {
+      for (const i of audible) {
+        const audio = lanes[i].audio;
+        if (!audio.paused && !audio.seeking && Math.abs(audio.currentTime - now) > DRIFT) audio.currentTime = now;
+      }
+    }
     if (!video.paused) frame = requestAnimationFrame(follow);
   }
 
   function played() {
     paused = false;
-    context.resume().then(sound, (e) => say(`Can't play the sound: ${e}`, true));
+    sound();
     frame = requestAnimationFrame(follow);
   }
 
