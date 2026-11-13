@@ -886,6 +886,15 @@ fn record(
     let media = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }
         .and_then(|()| unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) })
         .map_err(|e| e.to_string());
+    // the icon only dresses up the library, a game without one still records. listing clips drops
+    // the icon and art of an app with no clip, so a session coming back within its grace needs them again
+    let dress = |recording: &Recording| {
+        let pid = focus::pid(recording.window);
+        let _ = focus::save_icon(pid, &library::icon(thumbs, &recording.app));
+        if let Some(exe) = focus::exe(pid) {
+            let _ = art::remember(&exe, &art::dir(thumbs, &recording.app));
+        }
+    };
     let begin = |window: HWND| -> Result<Rc<Recording>, String> {
         media.clone()?;
         let current = settings.lock().expect("settings poisoned").clone();
@@ -894,13 +903,10 @@ fn record(
         let lanes = crate::audio::lanes(Some(pid), &current.apps, mic, &current.volumes);
         let session = Session::start(&current.options(), Target::Window(window), &lanes)?;
         let app = focus::app_name(pid);
-        // the icon only dresses up the library, a game without one still records
-        let _ = focus::save_icon(pid, &library::icon(thumbs, &app));
-        if let Some(exe) = focus::exe(pid) {
-            let _ = art::remember(&exe, &art::dir(thumbs, &app));
-        }
         let exe = focus::exe_name(pid).unwrap_or_default();
-        Ok(Rc::new(Recording { session, window, app, exe }))
+        let recording = Recording { session, window, app, exe };
+        dress(&recording);
+        Ok(Rc::new(recording))
     };
     let focused = || {
         let settings = settings.lock().expect("settings poisoned");
@@ -1353,7 +1359,7 @@ fn record(
                 let seconds = pressed(&msg).map(|(_, seconds)| seconds).filter(|&seconds| seconds > 0);
                 // pressed straight after coming back to an app, the clip is of that app
                 if let Some(back) = back.filter(|&back| focused() == Some(back)) {
-                    if switch(back, &mut current, &mut previous, &begin).is_ok() {
+                    if switch(back, &mut current, &mut previous, &begin, &dress).is_ok() {
                         report(&current);
                     }
                 }
@@ -1373,7 +1379,7 @@ fn record(
             _ => None,
         };
         if let Some(window) = next {
-            match switch(window, &mut current, &mut previous, &begin) {
+            match switch(window, &mut current, &mut previous, &begin, &dress) {
                 Ok(()) => refused = None,
                 Err(e) => {
                     refused = Some(window);
@@ -1405,9 +1411,13 @@ fn switch(
     current: &mut Result<Rc<Recording>, String>,
     previous: &mut Option<(Rc<Recording>, Instant)>,
     begin: &impl Fn(HWND) -> Result<Rc<Recording>, String>,
+    dress: &impl Fn(&Recording),
 ) -> Result<(), String> {
     let next = match previous.take() {
-        Some((recording, _)) if recording.window == window => recording,
+        Some((recording, _)) if recording.window == window => {
+            dress(&recording);
+            recording
+        }
         // two sessions at most, so the older one goes first
         _ => begin(window)?,
     };

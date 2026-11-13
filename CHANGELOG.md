@@ -2,6 +2,11 @@
 
 dates are release-tag dates.
 
+## [0.1.4] - 2026-11-13
+
+### fixes
+- a game you alt-tab back to within a minute keeps its icon and art in the library; before, it could lose them if its first clip came after another game's
+
 ## [0.1.3] - 2026-11-12
 
 ### fixes
