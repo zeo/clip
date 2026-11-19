@@ -53,6 +53,18 @@ clip uninstall";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // the runtime reads its own switches from the command line, such as
+    // --remote-debugging-port, so a launch of only those starts the tray app like no
+    // arguments do
+    let runtime_switch = |arg: &str| arg.starts_with("--remote-debugging-port");
+    let runtime_launch = match &args[..] {
+        [arg] => runtime_switch(arg),
+        [switch, value] => switch == "--remote-debugging-port" && !value.starts_with('-'),
+        _ => false,
+    };
+    if runtime_launch {
+        return app::run(false);
+    }
     match &args[..] {
         [] => return app::run(false),
         [restarted, pid] if restarted == crash::RESTARTED => {
