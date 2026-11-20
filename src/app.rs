@@ -2139,13 +2139,16 @@ fn hold_hotkeys(shared: &Shared, on: bool) {
 
 /// What the punctuation keys print on this keyboard layout, which differs from the us names.
 fn key_names() -> BTreeMap<u32, String> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, MapVirtualKeyExW, MAPVK_VK_TO_CHAR};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    // a command runs on a thread of its own, whose layout is not the one being typed in
+    let layout = unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None)) };
     (0xba..=0xc0)
         .chain(0xdb..=0xdf)
         .chain([0xe2])
         .filter_map(|vk| {
             // a dead key sets the top bit, and its low bits still hold the accent
-            let printed = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) } & 0xffff;
+            let printed = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, Some(layout)) } & 0xffff;
             char::from_u32(printed).filter(|c| !c.is_control()).map(|c| (vk, c.to_uppercase().collect()))
         })
         .collect()
