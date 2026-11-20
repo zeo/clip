@@ -330,9 +330,9 @@ fn serve(restarted: bool) -> Result<(), String> {
         .assets(ceri::embedded_assets!())
         // a debug build loads the pages from `npm run dev` so edits show up live
         .dev_url("http://localhost:1420")
-        // a release build serves the devtools port too, when asked to on the command
-        // line, so a shipped clip can still be inspected and driven over loopback
-        .devtools(true)
+        // the devtools port drives every command, so only a separate profile serves it, as
+        // chrome refuses remote debugging on the default profile
+        .devtools(!suffix.is_empty())
         .content_security_policy(
             "default-src 'self'; media-src 'self' https://files.ceri.invalid; \
              img-src 'self' data: https://files.ceri.invalid; \
