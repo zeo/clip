@@ -2,6 +2,13 @@
 
 dates are release-tag dates.
 
+## [0.1.5] - 2026-11-22
+
+### changes
+- clip runs on [ceri](https://github.com/zeo/ceri) instead of tauri: its own engine draws the app, so it no longer needs WebView2 and runs as one process instead of seven, with about half the memory (179 MB working set against 376 MB) and no CPU at all while idle. every screen looks the same as before at 100%, 150% and 200% scaling
+- your view settings carry over from the tauri build on the first start
+- double clicking the tray icon shows the window, as a single click does
+
 ## [0.1.4] - 2026-11-13
 
 ### fixes
