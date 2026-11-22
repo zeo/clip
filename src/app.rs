@@ -351,7 +351,7 @@ fn serve(restarted: bool) -> Result<(), String> {
         .tray(
             TrayConfig { tooltip: "clip: starting".into(), menu, ..TrayConfig::default() },
             |app, event| match event {
-                TrayEvent::Click => show(app),
+                TrayEvent::Click | TrayEvent::DoubleClick => show(app),
                 TrayEvent::Menu(id) => chosen(app, &id),
             },
         )
