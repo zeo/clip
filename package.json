@@ -8,7 +8,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings"
   },
   "dependencies": {
-    "@ceri/app": "file:../../hAugust/ceri/sdk"
+    "@ceri/app": "https://github.com/zeo/ceri/releases/download/v0.1.0/ceri-app-0.1.0.tgz"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
