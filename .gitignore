@@ -2,4 +2,3 @@
 /web/dist/
 node_modules/
 *.log
-/gen/

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use ceri::{AppHandle, CommandCall, MenuItem, NativeHandle, TrayConfig, TrayEvent, WindowConfig, WindowControl};
 use serde::{Deserialize, Serialize};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, WPARAM};
 use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT};
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
@@ -316,7 +316,7 @@ fn serve(restarted: bool) -> Result<(), String> {
         MenuItem::Separator,
         MenuItem::new("quit", "quit"),
     ];
-    // the tauri build kept the view settings in webview2's storage, under the same identifier
+    // older releases kept view settings in webview2 storage under the same identifier
     let webview_storage = ceri::dirs::local_data()
         .ok_or("there's no folder for app data")?
         .join(&identifier)
@@ -580,6 +580,7 @@ fn chosen(app: &AppHandle, id: &str) {
 /// Brings the window up, opening it if it was closed.
 fn show(app: &AppHandle) {
     let Some(windows) = app.windows() else { return };
+    ceri::warm_video();
     let mut config = WindowConfig {
         label: "main".into(),
         title: "clip".into(),
@@ -2395,7 +2396,15 @@ fn mics() -> Result<Vec<Mic>, String> {
 
 /// How loud a microphone is right now, 0 to 1, from an empty id's default one.
 fn mic_level(device: String) -> Result<f32, String> {
-    blocking(move || crate::audio::mic_peak(&device).map_err(|e| e.to_string()))
+    blocking(move || {
+        crate::audio::mic_peak(&device).map_err(|e| {
+            if e.code() == ERROR_NOT_FOUND.to_hresult() {
+                "no microphone is available".into()
+            } else {
+                e.to_string()
+            }
+        })
+    })
 }
 
 fn windowed_apps() -> Vec<String> {

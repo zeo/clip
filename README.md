@@ -17,7 +17,7 @@ Alt+F9 saves the last 30 seconds. Alt+F10 marks a moment and saves the clip arou
 
 ## install
 
-Run `clip-<version>-online-setup.exe` from the [releases page](https://github.com/zeo/clip/releases). The setup isn't code signed, so SmartScreen may stop it: click More info, then Run anyway. It downloads clip, checks the download's signature, installs WebView2 if Windows has none, and adds a Start menu entry and an uninstaller. clip looks for an update every 6 hours and says so in Settings, under About, where one click installs it. Updating restarts clip, which drops what the buffer holds. Uninstalling takes away the start with Windows value and the auto clips files in game folders, and leaves clips, settings and the cache folder where they are.
+Run `clip-<version>-online-setup.exe` from the [releases page](https://github.com/zeo/clip/releases). The setup isn't code signed, so SmartScreen may stop it: click More info, then Run anyway. It downloads clip, checks the download's signature, and adds a Start menu entry and an uninstaller. clip looks for an update every 6 hours and says so in Settings, under About, where one click installs it. Updating restarts clip, which drops what the buffer holds. Uninstalling takes away the start with Windows value and the auto clips files in game folders, and leaves clips, settings and the cache folder where they are.
 
 The first start walks through the two hotkeys, the microphone and where clips go, then clip sits in the tray.
 
@@ -102,7 +102,7 @@ Steam games get their cover, banner and logo from Steam's store CDN, with no key
 
 ## staying out of the game's way
 
-The tray app runs at below normal CPU priority and sets its GPU thread priority to -3 on the -7 to 7 scale, so a saturated GPU schedules the game's work ahead of clip's. It stays out of background mode, which would also let Windows page out the buffer. Closing the window destroys its WebView2 instead of hiding it.
+The tray app runs at below normal CPU priority and sets its GPU thread priority to -3 on the -7 to 7 scale, so a saturated GPU schedules the game's work ahead of clip's. It stays out of background mode, which would also let Windows page out the buffer. Closing the window destroys it and its engine instead of hiding it.
 
 ## hdr
 
@@ -134,7 +134,7 @@ npm run build
 cargo build --release
 ```
 
-Needs Rust 1.93 or newer, Node 24 and a ceri checkout at `../../hAugust/ceri`. The exe lands in `target\release\clip.exe` with the built page compiled in. A debug build loads the page from the Vite dev server instead, so run `npm run dev` next to `cargo run` and page edits apply without a rebuild. Only Windows 11 build 26340 with an NVIDIA GPU is tested.
+Needs Rust 1.93 or newer and Node 24. The exe lands in `target\release\clip.exe` with the built page compiled in. A debug build loads the page from the Vite dev server instead, so run `npm run dev` next to `cargo run` and page edits apply without a rebuild. Only Windows 11 build 26340 with an NVIDIA GPU is tested.
 
 ## tests
 

@@ -16,7 +16,7 @@ The font license texts are in `web/public/fonts`.
 
 | Component | License | Source |
 |---|---|---|
-| ceri, the window, web engine and desktop runtime | MIT or Apache-2.0 | not published |
+| ceri, the window, web engine and desktop runtime | MIT or Apache-2.0 | https://github.com/zeo/ceri |
 | windows-rs | MIT or Apache-2.0 | https://github.com/microsoft/windows-rs |
 | winit | Apache-2.0 | https://github.com/rust-windowing/winit |
 | hdrkit shaders | MIT or Apache-2.0 | https://github.com/zeo/hdrkit |
