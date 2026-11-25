@@ -622,7 +622,7 @@
               </div>
               <div class="row">
                 <span class="row-label">Space used<small>{count} {count === 1 ? 'clip' : 'clips'}{disk ? `, ${size(disk.free)} free of ${size(disk.total)} on this drive` : ''}</small></span>
-                {#if disk}<span class="meter"><span style:width="{Math.min(100, ((disk.total - disk.free) / disk.total) * 100)}%"></span><span class="ours" style:width="{Math.min(100, (used / disk.total) * 100)}%"></span></span>{/if}
+                {#if disk}<span class="meter"><span class="used" style:width="{Math.min(100, ((disk.total - disk.free) / disk.total) * 100)}%"></span><span class="ours" style:width="{Math.min(100, (used / disk.total) * 100)}%"></span></span>{/if}
                 <span class="mono">{size(used)}</span>
               </div>
             </div>

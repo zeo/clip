@@ -104,6 +104,24 @@
   const pct = (t: number) => `${(100 * t) / (duration || 1)}%`;
 
   let frame = 0;
+  let videoFrame = 0;
+
+  function scheduleFollow() {
+    if (!video || video.paused) return;
+    if ('requestVideoFrameCallback' in video) videoFrame = video.requestVideoFrameCallback(follow);
+    else frame = requestAnimationFrame(follow);
+  }
+
+  function cancelFollow() {
+    if (videoFrame && video && 'cancelVideoFrameCallback' in video) {
+      video.cancelVideoFrameCallback(videoFrame);
+      videoFrame = 0;
+    }
+    if (frame) {
+      cancelAnimationFrame(frame);
+      frame = 0;
+    }
+  }
 
   $effect(() => {
     for (const lane of lanes) lane.audio.volume = view.volume;
@@ -118,7 +136,7 @@
   onMount(() => {
     load();
     return () => {
-      cancelAnimationFrame(frame);
+      cancelFollow();
       release(lanes.map((lane) => lane.audio));
       // stepping to the next clip keeps the screen filled, anything else gives the window back
       if (full) setTimeout(() => document.querySelector('.theater.full') || appWindow.setFullscreen(false));
@@ -185,6 +203,8 @@
   }
 
   function follow() {
+    frame = 0;
+    videoFrame = 0;
     if (!video) return;
     now = video.currentTime;
     const [a, b] = ahead(now);
@@ -195,19 +215,19 @@
         if (!audio.paused && !audio.seeking && Math.abs(audio.currentTime - now) > DRIFT) audio.currentTime = now;
       }
     }
-    if (!video.paused) frame = requestAnimationFrame(follow);
+    scheduleFollow();
   }
 
   function played() {
     paused = false;
     sound();
-    frame = requestAnimationFrame(follow);
+    scheduleFollow();
   }
 
   function stopped() {
     paused = true;
     silence();
-    cancelAnimationFrame(frame);
+    cancelFollow();
     if (video) now = video.currentTime;
   }
 
