@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{implement, Interface, Ref, Result, HRESULT, HSTRING};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, FILETIME, S_OK};
+use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_FOUND, E_FAIL, FILETIME, S_OK};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -415,28 +415,29 @@ struct Feed {
 }
 
 impl Channel {
-    /// The microphone opens here so a missing one stops the recording before it starts.
     fn new(source: Source, gain: u32) -> Result<Self> {
-        let feeds = match source {
-            Source::Microphone { .. } => {
-                vec![Feed { pid: MIC, input: Input::open(&source, MIC)?, timeline: Timeline::at(0) }]
-            }
-            _ => Vec::new(),
-        };
-        Ok(Self { source, feeds, failed: Vec::new(), position: 0, gain, aac: Aac::new()? })
+        Ok(Self { source, feeds: Vec::new(), failed: Vec::new(), position: 0, gain, aac: Aac::new()? })
     }
 
     fn retarget(&mut self, pids: &[u32]) {
+        self.retarget_with(pids, Input::open);
+    }
+
+    fn retarget_with(&mut self, pids: &[u32], mut open: impl FnMut(&Source, u32) -> Result<Input>) {
         self.feeds.retain(|feed| pids.contains(&feed.pid));
         self.failed.retain(|(pid, at)| pids.contains(pid) && at.elapsed() < RETRY);
         for &pid in pids {
             if self.feeds.iter().any(|f| f.pid == pid) || self.failed.iter().any(|f| f.0 == pid) {
                 continue;
             }
-            match Input::open(&self.source, pid) {
+            match open(&self.source, pid) {
                 Ok(input) => self.feeds.push(Feed { pid, input, timeline: Timeline::at(self.position) }),
                 Err(e) => {
-                    crate::log::write(format_args!("can't record audio from process {pid} ({e})"));
+                    if pid == MIC {
+                        crate::log::write(format_args!("can't record microphone ({e})"));
+                    } else {
+                        crate::log::write(format_args!("can't record audio from process {pid} ({e})"));
+                    }
                     self.failed.push((pid, Instant::now()));
                 }
             }
@@ -450,7 +451,11 @@ impl Channel {
         self.feeds.retain_mut(|feed| match feed.input.drain(clock, &mut feed.timeline) {
             Ok(()) => true,
             Err(e) => {
-                crate::log::write(format_args!("audio from process {} lost ({e})", feed.pid));
+                if feed.pid == MIC {
+                    crate::log::write(format_args!("microphone lost ({e})"));
+                } else {
+                    crate::log::write(format_args!("audio from process {} lost ({e})", feed.pid));
+                }
                 false
             }
         });
@@ -489,7 +494,7 @@ impl Input {
                         .filter(|chosen| chosen.GetState().is_ok_and(|state| state == DEVICE_STATE_ACTIVE));
                     let device = match chosen {
                         Some(chosen) => chosen,
-                        None => devices.GetDefaultAudioEndpoint(eCapture, eConsole)?,
+                        None => default_capture(|role| devices.GetDefaultAudioEndpoint(eCapture, role))?,
                     };
                     (device.Activate(CLSCTX_ALL, None)?, false)
                 }
@@ -538,6 +543,13 @@ impl Drop for Input {
     }
 }
 
+fn default_capture<T>(mut get: impl FnMut(ERole) -> Result<T>) -> Result<T> {
+    match get(eConsole) {
+        Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => get(eCommunications),
+        other => other,
+    }
+}
+
 /// The processes holding audio sessions on any active output, with `changed` raised whenever an
 /// app opens a new session, so its sound is picked up as it starts rather than at the next rescan.
 struct Sessions {
@@ -569,34 +581,55 @@ impl Sessions {
         unsafe {
             let endpoints = self.devices.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
             for i in 0..endpoints.GetCount()? {
-                let device = endpoints.Item(i)?;
-                let id = device.GetId()?;
-                let key = id.to_string();
-                CoTaskMemFree(Some(id.0 as _));
-                let key = key?;
-                let manager = match self.managers.iter().find(|(k, _)| *k == key) {
-                    Some((_, manager)) => manager.clone(),
-                    None => {
-                        let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
-                        manager.RegisterSessionNotification(&self.watch)?;
-                        self.managers.push((key, manager.clone()));
-                        manager
-                    }
-                };
-                // counting the sessions is also what switches notifications on
-                let sessions = manager.GetSessionEnumerator()?;
-                for j in 0..sessions.GetCount()? {
-                    let control: IAudioSessionControl2 = sessions.GetSession(j)?.cast()?;
-                    if control.IsSystemSoundsSession() == S_OK || control.GetState()? == AudioSessionStateExpired {
-                        continue;
-                    }
-                    if let Ok(pid) = control.GetProcessId() {
-                        pids.push(pid);
-                    }
+                if let Err(e) = self.endpoint_pids(&endpoints, i, &mut pids) {
+                    crate::log::write(format_args!("couldn't read audio sessions on output {i} ({e})"));
                 }
             }
         }
         Ok(pids)
+    }
+
+    unsafe fn endpoint_pids(&mut self, endpoints: &IMMDeviceCollection, index: u32, pids: &mut Vec<u32>) -> Result<()> {
+        unsafe {
+            let device = endpoints.Item(index)?;
+            let id = device.GetId()?;
+            let key = id.to_string();
+            CoTaskMemFree(Some(id.0 as _));
+            let key = key?;
+            let manager = match self.managers.iter().find(|(k, _)| *k == key) {
+                Some((_, manager)) => manager.clone(),
+                None => {
+                    let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+                    manager.RegisterSessionNotification(&self.watch)?;
+                    self.managers.push((key.clone(), manager.clone()));
+                    manager
+                }
+            };
+            // counting the sessions is also what switches notifications on
+            let sessions = match manager.GetSessionEnumerator() {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    if let Some(pos) = self.managers.iter().position(|(k, _)| *k == key) {
+                        let (_, stale) = self.managers.remove(pos);
+                        let _ = stale.UnregisterSessionNotification(&self.watch);
+                    }
+                    return Err(e);
+                }
+            };
+            for j in 0..sessions.GetCount()? {
+                let Ok(session) = sessions.GetSession(j) else { continue };
+                let Ok(control) = session.cast::<IAudioSessionControl2>() else { continue };
+                if control.IsSystemSoundsSession() == S_OK
+                    || !matches!(control.GetState(), Ok(state) if state != AudioSessionStateExpired)
+                {
+                    continue;
+                }
+                if let Ok(pid) = control.GetProcessId() {
+                    pids.push(pid);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1078,5 +1111,73 @@ mod tests {
     fn a_game_that_exits_leaves_its_lane_empty() {
         let running = processes(&[(1, 0, "explorer.exe"), (40, 1, "chrome.exe")]);
         assert_eq!(assign(&[Source::Process(20), Source::Rest], &running, &[40], 7), vec![vec![], vec![40]]);
+    }
+
+    #[test]
+    fn a_missing_microphone_starts_silent_and_retries_after_cooldown() {
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.unwrap();
+        let mut channel = Channel::new(Source::Microphone { device: String::new(), hold: 0 }, 100).unwrap();
+        assert!(channel.feeds.is_empty());
+
+        let mut attempts = 0;
+        let fail = |_: &Source, pid: u32| -> Result<Input> {
+            assert_eq!(pid, MIC);
+            attempts += 1;
+            Err(ERROR_NOT_FOUND.into())
+        };
+        channel.retarget_with(&[MIC], fail);
+        assert_eq!(attempts, 1);
+        assert!(channel.feeds.is_empty());
+        assert_eq!(channel.failed.len(), 1);
+        assert_eq!(channel.failed[0].0, MIC);
+
+        // retry is suppressed during the cooldown window
+        channel.retarget_with(&[MIC], |_, _| {
+            attempts += 1;
+            Err(ERROR_NOT_FOUND.into())
+        });
+        assert_eq!(attempts, 1);
+
+        // polling without a feed still advances the timeline with silence
+        let clock = Clock::start();
+        std::thread::sleep(Duration::from_millis(160));
+        let (mut packets, lost) = channel.poll(&clock).unwrap();
+        assert!(!lost);
+        assert!(channel.position > 0);
+
+        // once cooldown elapses, retarget retries opening the microphone
+        channel.failed[0].1 -= RETRY;
+        channel.retarget_with(&[MIC], |_, _| {
+            attempts += 1;
+            Err(ERROR_NOT_FOUND.into())
+        });
+        assert_eq!(attempts, 2);
+
+        packets.extend(channel.aac.finish().unwrap());
+        assert!(!packets.is_empty());
+    }
+
+    #[test]
+    fn default_capture_falls_back_to_communications_only_on_not_found() {
+        let mut roles = Vec::new();
+        let picked = default_capture(|role| {
+            roles.push(role);
+            if role == eConsole {
+                Err(ERROR_NOT_FOUND.into())
+            } else {
+                Ok("comm")
+            }
+        });
+        assert_eq!(picked.unwrap(), "comm");
+        assert_eq!(roles, vec![eConsole, eCommunications]);
+
+        let mut roles = Vec::new();
+        let err = default_capture::<&str>(|role| {
+            roles.push(role);
+            Err(E_FAIL.into())
+        });
+        assert_eq!(err.unwrap_err().code(), E_FAIL);
+        assert_eq!(roles, vec![eConsole]);
     }
 }
